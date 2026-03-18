@@ -50,7 +50,9 @@ public class DirectoryV2Controller {
   @Produces(MediaType.APPLICATION_JSON)
   public Response getAuthToken(final @ReadOnly @Auth AuthenticatedAccount auth) {
     final UUID uuid = auth.getAccount().getUuid();
+	log.debug("uuid={}", uuid);
     final ExternalServiceCredentials credentials = directoryServiceTokenGenerator.generateForUuid(uuid);
+	log.debug("credentials={}", credentials);
     return Response.ok().entity(credentials).build();
   }
 }

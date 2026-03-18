@@ -68,7 +68,7 @@ import software.amazon.awssdk.utils.CompletableFutureUtils;
  * "Accounts" DDB table's structure doesn't match 1:1 the {@link Account} class: most of the class fields are serialized
  * and stored in the {@link Accounts#ATTR_ACCOUNT_DATA} attribute, however there are certain fields that are stored only as DDB attributes
  * (e.g. if indexing or lookup by field is required), and there are also fields that stored in both places.
- * This class contains all the logic that decides whether or not a field of the {@link Account} class should be
+ * This class contains all the logic that decides whether or not a field of the {@l, keyValue={}ink Account} class should be
  * added as an attribute, serialized as a part of {@link Accounts#ATTR_ACCOUNT_DATA}, or both. To skip serialization,
  * make sure attribute name is listed in {@link Accounts#ACCOUNT_FIELDS_TO_EXCLUDE_FROM_SERIALIZATION}. If serialization is skipped,
  * make sure the field is stored in a DDB attribute and then put back into the account object in {@link Accounts#fromItem(Map)}.
@@ -213,29 +213,39 @@ public class Accounts extends AbstractDynamoDbStore {
       final AttributeValue uuidAttr = AttributeValues.fromUUID(account.getUuid());
       final AttributeValue numberAttr = AttributeValues.fromString(account.getNumber());
       final AttributeValue pniUuidAttr = AttributeValues.fromUUID(account.getPhoneNumberIdentifier());
+      log.error("uuidAttr={}, numberAttr={}, pniUuidAttr={}", uuidAttr, numberAttr, pniUuidAttr);
 
+
+      log.error("buildConstrainTablePutIfAbsent() - phoneNumberConstraintTableName={}, uuidAttr={}, ATTR_ACCOUNT_E164={}, numberAttra={}", phoneNumberConstraintTableName, uuidAttr, ATTR_ACCOUNT_E164, numberAttr);
       final TransactWriteItem phoneNumberConstraintPut = buildConstraintTablePutIfAbsent(
           phoneNumberConstraintTableName, uuidAttr, ATTR_ACCOUNT_E164, numberAttr);
 
+      log.error("buildConstrainTablePutIfAbsent() - phoneNumberIdentifierConstraintTableName={}, uuidAttr={}, ATTR_PNI_UUID={}, pniUuidAttr={}", phoneNumberIdentifierConstraintTableName, uuidAttr, ATTR_PNI_UUID, pniUuidAttr);
       final TransactWriteItem phoneNumberIdentifierConstraintPut = buildConstraintTablePutIfAbsent(
           phoneNumberIdentifierConstraintTableName, uuidAttr, ATTR_PNI_UUID, pniUuidAttr);
 
+      log.error("buildAccountPut() - account={}, uuidAttr={}, numberAttr={}, pniUuidAttr={}", account, uuidAttr, numberAttr, pniUuidAttr);
       final TransactWriteItem accountPut = buildAccountPut(account, uuidAttr, numberAttr, pniUuidAttr);
 
       // Clear any "recently deleted account" record for this number since, if it existed, we've used its old ACI for
       // the newly-created account.
+      log.error("buildRemoveDeletedAccount() - account.getNumber()={}", account.getNumber());
       final TransactWriteItem deletedAccountDelete = buildRemoveDeletedAccount(account.getNumber());
 
       final Collection<TransactWriteItem> writeItems = new ArrayList<>(
           List.of(phoneNumberConstraintPut, phoneNumberIdentifierConstraintPut, accountPut, deletedAccountDelete));
+      log.error("writItems={}", writeItems);
 
+      log.error("additionalWritItems={}", additionalWriteItems);
       writeItems.addAll(additionalWriteItems);
 
+      log.error("writItems={}", writeItems);
       final TransactWriteItemsRequest request = TransactWriteItemsRequest.builder()
           .transactItems(writeItems)
           .build();
 
       try {
+        log.error("transactWriteItems() - writItems={}", request);
         db().transactWriteItems(request);
       } catch (final TransactionCanceledException e) {
 
@@ -467,7 +477,7 @@ public class Accounts extends AbstractDynamoDbStore {
             throw new ContestedOptimisticLockException();
           }
         } else {
-          log.warn("Unexpected cancellation reasons: {}", e.cancellationReasons());
+          log.warn("Unexpected cancellation reasons: {}, keyValue={}", e.cancellationReasons());
 
         }
         throw e;
@@ -1020,7 +1030,7 @@ public class Accounts extends AbstractDynamoDbStore {
 
       // if we otherwise somehow got a wrapped checked exception,
       // rethrow the checked exception wrapped by the original CompletionException
-      log.error("Unexpected checked exception thrown from dynamo update", e);
+      log.error("Unexpected checked exception thrown, keyValue={} from dynamo update", e);
       throw e;
     }
   }
@@ -1272,6 +1282,7 @@ public class Accounts extends AbstractDynamoDbStore {
 
   @Nonnull
   private Optional<Map<String, AttributeValue>> itemByKey(final String table, final String keyName, final AttributeValue keyValue) {
+    log.info("itemByKey: table={}, keyName={}, keyValue={}", table, keyName, keyValue);
     final GetItemResponse response = db().getItem(GetItemRequest.builder()
         .tableName(table)
         .key(Map.of(keyName, keyValue))
@@ -1450,6 +1461,8 @@ public class Accounts extends AbstractDynamoDbStore {
 
   @Nonnull
   private static String extractCancellationReasonCodes(final TransactionCanceledException exception) {
+	//log.error("Exception: message={} - trace={}", exception.getMessage(), exception.getStackTrace());
+	exception.cancellationReasons().stream().forEach(reason -> log.error("reason={}, code={}, message={}", reason, reason.code(), reason.message()));
     return exception.cancellationReasons().stream()
         .map(CancellationReason::code)
         .collect(Collectors.joining(", "));
@@ -1473,7 +1486,7 @@ public class Accounts extends AbstractDynamoDbStore {
       if (account.getPhoneNumberIdentifier() == null || phoneNumberIdentifierFromAttribute == null ||
           !Objects.equals(account.getPhoneNumberIdentifier(), phoneNumberIdentifierFromAttribute)) {
 
-        log.warn("Missing or mismatched PNIs for account {}. From JSON: {}; from attribute: {}",
+        log.warn("Missing or mismatched PNIs for account {}. From JS, keyValue={}ON: {}; from attribute: {}",
             accountIdentifier, account.getPhoneNumberIdentifier(), phoneNumberIdentifierFromAttribute);
       }
 
