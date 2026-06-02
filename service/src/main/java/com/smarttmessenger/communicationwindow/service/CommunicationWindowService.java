@@ -170,7 +170,7 @@ public class CommunicationWindowService {
         return ZoneOffset.UTC;
       }
       return ZoneId.of(zones.get(zones.size() / 2));
-    } catch (NumberParseException | Exception e) {
+    } catch (Exception e) {
       return ZoneOffset.UTC;
     }
   }

@@ -6,11 +6,12 @@ package org.whispersystems.textsecuregcm.workers;
 import com.smarttmessenger.communicationwindow.scheduler.HeldMessageDeliveryScheduler;
 import com.smarttmessenger.communicationwindow.storage.HeldMessagesTable;
 import org.whispersystems.textsecuregcm.WhisperServerConfiguration;
+import org.whispersystems.textsecuregcm.metrics.MicrometerAwsSdkMetricPublisher;
 import org.whispersystems.textsecuregcm.push.MessageSender;
 import org.whispersystems.textsecuregcm.scheduler.JobScheduler;
-import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
 import java.time.Clock;
+import java.util.concurrent.Executors;
 
 public class SmarttHeldMessageDeliverySchedulerFactory implements JobSchedulerFactory {
 
@@ -18,10 +19,11 @@ public class SmarttHeldMessageDeliverySchedulerFactory implements JobSchedulerFa
   public JobScheduler buildJobScheduler(final CommandDependencies deps,
       final WhisperServerConfiguration configuration) {
 
-    final DynamoDbClient dynamoDbClient = DynamoDbClient.builder()
-        .region(Region.of(configuration.getDynamoDbClientConfiguration().getRegion()))
-        .credentialsProvider(configuration.getAwsCredentialsConfiguration().build())
-        .build();
+    final DynamoDbClient dynamoDbClient = configuration.getDynamoDbClientConfiguration()
+        .buildSyncClient(
+            configuration.getAwsCredentialsConfiguration().build(),
+            new MicrometerAwsSdkMetricPublisher(
+                Executors.newSingleThreadExecutor(), "dynamoDbSmarttCommand"));
 
     final HeldMessagesTable heldMessagesTable = new HeldMessagesTable(
         dynamoDbClient,

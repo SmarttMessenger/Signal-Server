@@ -276,6 +276,7 @@ import org.whispersystems.textsecuregcm.workers.IdleDeviceNotificationSchedulerF
 import org.whispersystems.textsecuregcm.workers.MessagePersisterServiceCommand;
 import org.whispersystems.textsecuregcm.workers.NotifyIdleDevicesCommand;
 import org.whispersystems.textsecuregcm.workers.ProcessScheduledJobsServiceCommand;
+import org.whispersystems.textsecuregcm.workers.SmarttHeldMessageDeliverySchedulerFactory; // [Smartt]
 import org.whispersystems.textsecuregcm.workers.RegenerateSecondaryDynamoDbTableDataCommand;
 import org.whispersystems.textsecuregcm.workers.RemoveExpiredAccountsCommand;
 import org.whispersystems.textsecuregcm.workers.RemoveExpiredBackupsCommand;
