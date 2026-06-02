@@ -69,6 +69,19 @@ import org.whispersystems.websocket.configuration.WebSocketConfiguration;
 /** @noinspection MismatchedQueryAndUpdateOfCollection, WeakerAccess */
 public class WhisperServerConfiguration extends Configuration {
 
+  // [Smartt] Communication window configuration
+  @Valid
+  @JsonProperty
+  private com.smarttmessenger.communicationwindow.configuration.SmarttCommunicationWindowConfiguration
+      smarttCommunicationWindow =
+      new com.smarttmessenger.communicationwindow.configuration.SmarttCommunicationWindowConfiguration();
+
+  public com.smarttmessenger.communicationwindow.configuration.SmarttCommunicationWindowConfiguration
+      getSmarttCommunicationWindow() {
+    return smarttCommunicationWindow;
+  }
+  // [/Smartt]
+
   @NotNull
   @Valid
   @JsonProperty

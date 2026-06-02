@@ -345,6 +345,12 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
         "Processes scheduled jobs to send notifications to idle devices",
         new IdleDeviceNotificationSchedulerFactory()));
 
+    // [Smartt] Communication window: deliver held messages when window opens
+    bootstrap.addCommand(new ProcessScheduledJobsServiceCommand("process-smartt-window-delivery-jobs",
+        "Processes scheduled jobs to deliver messages held by communication windows",
+        new SmarttHeldMessageDeliverySchedulerFactory()));
+    // [/Smartt]
+
     bootstrap.addCommand(new RegenerateSecondaryDynamoDbTableDataCommand());
   }
 
@@ -1075,6 +1081,30 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
 
     final PhoneVerificationTokenManager phoneVerificationTokenManager = new PhoneVerificationTokenManager(
         phoneNumberIdentifiers, registrationServiceClient, registrationRecoveryPasswordsManager, registrationRecoveryChecker);
+    // [Smartt] Communication window setup
+    final com.smarttmessenger.communicationwindow.storage.CommunicationWindowsTable communicationWindowsTable =
+        new com.smarttmessenger.communicationwindow.storage.CommunicationWindowsTable(
+            dynamoDbClient, config.getSmarttCommunicationWindow().getWindowsTableName());
+    final com.smarttmessenger.communicationwindow.storage.HeldMessagesTable heldMessagesTable =
+        new com.smarttmessenger.communicationwindow.storage.HeldMessagesTable(
+            dynamoDbClient, config.getSmarttCommunicationWindow().getHeldMessagesTableName());
+    final com.smarttmessenger.communicationwindow.scheduler.HeldMessageDeliveryScheduler heldMessageDeliveryScheduler =
+        new com.smarttmessenger.communicationwindow.scheduler.HeldMessageDeliveryScheduler(
+            accountsManager, messageSender, heldMessagesTable, dynamoDbAsyncClient,
+            config.getDynamoDbTables().getScheduledJobs().getTableName(),
+            config.getDynamoDbTables().getScheduledJobs().getExpiration(), clock);
+    final com.smarttmessenger.communicationwindow.service.CommunicationWindowService communicationWindowService =
+        new com.smarttmessenger.communicationwindow.service.CommunicationWindowService(
+            accountsManager, communicationWindowsTable, heldMessagesTable, heldMessageDeliveryScheduler, clock);
+    final org.whispersystems.textsecuregcm.controllers.MessageController messageController =
+        new org.whispersystems.textsecuregcm.controllers.MessageController(rateLimiters,
+            messageByteLimitCardinalityEstimator, messageSender, receiptSender, accountsManager, messagesManager,
+            phoneNumberIdentifiers, pushNotificationManager, pushNotificationScheduler, reportMessageManager,
+            messageDeliveryScheduler, clientReleaseManager, zkSecretParams, spamChecker, messageMetrics,
+            messageDeliveryLoopMonitor, Clock.systemUTC());
+    messageController.setCommunicationWindowService(communicationWindowService);
+    // [/Smartt]
+
     final List<Object> commonControllers = Lists.newArrayList(
         new AccountController(accountsManager, rateLimiters, registrationRecoveryPasswordsManager,
             usernameHashZkProofVerifier),
@@ -1098,11 +1128,9 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
             ReceiptCredentialPresentation::new),
         new KeysController(rateLimiters, keysManager, accountsManager, zkSecretParams, Clock.systemUTC()),
         new KeyTransparencyController(keyTransparencyServiceClient),
-        new MessageController(rateLimiters, messageByteLimitCardinalityEstimator, messageSender, receiptSender,
-            accountsManager, messagesManager, phoneNumberIdentifiers, pushNotificationManager, pushNotificationScheduler,
-            reportMessageManager, messageDeliveryScheduler, clientReleaseManager,
-            zkSecretParams, spamChecker, messageMetrics, messageDeliveryLoopMonitor,
-            Clock.systemUTC()),
+        messageController, // [Smartt] pre-constructed above with communicationWindowService injected
+        new com.smarttmessenger.communicationwindow.controller.CommunicationWindowController(
+            communicationWindowService, accountsManager),
         new PaymentsController(currencyManager, paymentsCredentialsGenerator),
         new ProfileController(clock, rateLimiters, accountsManager, profilesManager, dynamicConfigurationManager,
             profileBadgeConverter, config.getBadges(), profileCdnPolicyGenerator, profileCdnPolicySigner,

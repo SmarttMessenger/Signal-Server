@@ -139,6 +139,15 @@ public class MessageController {
   private final MessageDeliveryLoopMonitor messageDeliveryLoopMonitor;
   private final Clock clock;
 
+  // [Smartt] Communication window support
+  @Nullable private com.smarttmessenger.communicationwindow.service.CommunicationWindowService communicationWindowService;
+
+  public void setCommunicationWindowService(
+      com.smarttmessenger.communicationwindow.service.CommunicationWindowService svc) {
+    this.communicationWindowService = svc;
+  }
+  // [/Smartt]
+
   private static final CompletableFuture<?>[] EMPTY_FUTURE_ARRAY = new CompletableFuture<?>[0];
 
   private static final String OUTGOING_MESSAGE_LIST_SIZE_BYTES_DISTRIBUTION_NAME = name(MessageController.class, "outgoingMessageListSizeBytes");
@@ -281,6 +290,17 @@ public class MessageController {
           sendSyncMessage(source.get(), account, destinationIdentifier, messages, context);
         } else {
           needsSync = account.getDevices().size() > 1;
+          // [Smartt] Communication window check
+          if (communicationWindowService != null) {
+            final java.util.Optional<com.smarttmessenger.communicationwindow.model.WindowHoldResult> holdResult =
+                communicationWindowService.checkAndHold(destinationIdentifier,
+                    authenticatedDevice.accountIdentifier(), authenticatedDevice.deviceId(), messages);
+            if (holdResult.isPresent()) {
+              return Response.ok(new com.smarttmessenger.communicationwindow.entities.SmarttSendMessageResponse(
+                  needsSync, true, holdResult.get().windowOpensAt().toEpochMilli())).build();
+            }
+          }
+          // [/Smartt]
           sendIdentifiedSenderIndividualMessage(authenticatedDevice, destinationIdentifier, messages, context);
         }
       } else {
