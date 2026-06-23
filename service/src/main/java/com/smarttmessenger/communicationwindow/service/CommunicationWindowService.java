@@ -79,10 +79,10 @@ public class CommunicationWindowService {
       HeldMessageData messageData = buildHeldMessageData(
           destinationIdentifier, senderAci, senderDeviceId, messages);
 
-      heldMessagesTable.store(recipientUuid, opensAt, messageData);
+      String sortKey = heldMessagesTable.store(recipientUuid, opensAt, messageData);
 
       try {
-        deliveryScheduler.scheduleDelivery(recipientUuid, opensAt);
+        deliveryScheduler.scheduleDelivery(recipientUuid, sortKey, opensAt);
       } catch (Exception e) {
         logger.warn("Failed to schedule delivery for held message (recipient={})", recipientUuid, e);
       }
@@ -93,8 +93,12 @@ public class CommunicationWindowService {
     return Optional.empty();
   }
 
-  /** Returns the active window metadata visible to senders. */
-  public Optional<CommunicationWindow> getActiveWindowForSender(ServiceIdentifier destinationIdentifier) {
+  /**
+   * Returns the currently-active window for a sender to display, evaluated entirely in the
+   * recipient's timezone. The returned start/end belong to the schedule that is active *now*,
+   * so callers must not re-evaluate the schedule in a different timezone.
+   */
+  public Optional<ActiveWindowInfo> getActiveWindowForSender(ServiceIdentifier destinationIdentifier) {
     Account recipient = accountsManager.getByServiceIdentifier(destinationIdentifier).orElse(null);
     if (recipient == null) return Optional.empty();
 
@@ -104,10 +108,19 @@ public class CommunicationWindowService {
     ZoneId timezone = deriveTimezone(recipient);
     ZonedDateTime now = ZonedDateTime.now(clock.withZone(timezone));
 
-    return windows.stream()
-        .filter(w -> w.activeSchedule(now).isPresent())
-        .findFirst();
+    for (CommunicationWindow window : windows) {
+      Optional<CommunicationWindowSchedule> active = window.activeSchedule(now);
+      if (active.isPresent()) {
+        CommunicationWindowSchedule schedule = active.get();
+        return Optional.of(new ActiveWindowInfo(
+            window.getName(), schedule.getStart(), schedule.getEnd(), window.getExpectations()));
+      }
+    }
+    return Optional.empty();
   }
+
+  /** Sender-visible snapshot of the recipient's currently-active window (times in recipient tz). */
+  public record ActiveWindowInfo(String name, int startMinutes, int endMinutes, WindowExpectations expectations) {}
 
   // --- Window CRUD ---
 
@@ -119,8 +132,9 @@ public class CommunicationWindowService {
 
   public Optional<CommunicationWindow> updateWindow(String accountUuid, String windowId,
       CommunicationWindow updated) {
-    Optional<CommunicationWindow> existing = windowsTable.get(accountUuid, windowId);
-    if (existing.isEmpty()) return Optional.empty();
+    // [Smartt] Upsert: the client owns the windowId (local-first, like notification profiles),
+    // so a PUT creates the window if it does not exist yet rather than 404ing. This lets the
+    // Android client write locally and push in the background with its own client-generated id.
     updated.setWindowId(windowId);
     windowsTable.put(accountUuid, updated);
     return Optional.of(updated);

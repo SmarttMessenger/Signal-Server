@@ -37,7 +37,7 @@ public class HeldMessageDeliveryScheduler extends JobScheduler {
   private final Clock clock;
 
   @VisibleForTesting
-  record JobDescriptor(String recipientUuid, long deliverAtMs) {}
+  record JobDescriptor(String recipientUuid, String sortKey) {}
 
   public HeldMessageDeliveryScheduler(AccountsManager accountsManager,
       MessageSender messageSender,
@@ -68,38 +68,36 @@ public class HeldMessageDeliveryScheduler extends JobScheduler {
     }
 
     return accountsManager.getByAccountIdentifierAsync(UUID.fromString(descriptor.recipientUuid()))
-        .thenCompose(maybeRecipient -> {
+        .thenApply(maybeRecipient -> {
           if (maybeRecipient.isEmpty()) {
-            return CompletableFuture.completedFuture("recipientNotFound");
+            return "recipientNotFound";
           }
 
-          Account recipient = maybeRecipient.get();
-          List<HeldMessagesTable.HeldMessageEntry> entries = heldMessagesTable
-              .getMessagesForDelivery(descriptor.recipientUuid(), Instant.ofEpochMilli(descriptor.deliverAtMs()));
+          // Exactly one job per held message, keyed by sort key — no draining, so concurrent
+          // jobs can never deliver the same message twice.
+          Optional<HeldMessagesTable.HeldMessageEntry> maybeEntry =
+              heldMessagesTable.getEntry(descriptor.recipientUuid(), descriptor.sortKey());
 
-          if (entries.isEmpty()) {
-            return CompletableFuture.completedFuture("noMessages");
+          if (maybeEntry.isEmpty()) {
+            return "noMessage";
           }
 
-          int delivered = 0;
-          for (HeldMessagesTable.HeldMessageEntry entry : entries) {
-            try {
-              deliverEntry(recipient, entry);
-              heldMessagesTable.delete(descriptor.recipientUuid(), entry.sortKey());
-              delivered++;
-            } catch (Exception e) {
-              logger.warn("Failed to deliver held message for recipient={}", descriptor.recipientUuid(), e);
-            }
+          try {
+            deliverEntry(maybeRecipient.get(), maybeEntry.get());
+            heldMessagesTable.delete(descriptor.recipientUuid(), descriptor.sortKey());
+            return "delivered";
+          } catch (Exception e) {
+            // Throw so the job is NOT deleted and is retried on the next sweep (entry stays put).
+            logger.warn("Failed to deliver held message for recipient={}", descriptor.recipientUuid(), e);
+            throw new RuntimeException(e);
           }
-
-          return CompletableFuture.completedFuture("delivered:" + delivered);
         });
   }
 
-  public CompletableFuture<Void> scheduleDelivery(String recipientUuid, Instant deliverAt) {
+  public CompletableFuture<Void> scheduleDelivery(String recipientUuid, String sortKey, Instant deliverAt) {
     try {
       return scheduleJob(deliverAt, SystemMapper.jsonMapper().writeValueAsBytes(
-          new JobDescriptor(recipientUuid, deliverAt.toEpochMilli())));
+          new JobDescriptor(recipientUuid, sortKey)));
     } catch (JsonProcessingException e) {
       throw new AssertionError(e);
     }

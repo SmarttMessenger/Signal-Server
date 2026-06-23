@@ -4,7 +4,6 @@ import com.smarttmessenger.communicationwindow.entities.CommunicationWindowReque
 import com.smarttmessenger.communicationwindow.entities.CommunicationWindowResponse;
 import com.smarttmessenger.communicationwindow.entities.WindowMetadataResponse;
 import com.smarttmessenger.communicationwindow.model.CommunicationWindow;
-import com.smarttmessenger.communicationwindow.model.CommunicationWindowSchedule;
 import com.smarttmessenger.communicationwindow.service.CommunicationWindowService;
 import io.dropwizard.auth.Auth;
 import jakarta.validation.Valid;
@@ -14,12 +13,8 @@ import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import org.whispersystems.textsecuregcm.auth.AuthenticatedDevice;
 import org.whispersystems.textsecuregcm.identity.AciServiceIdentifier;
-import org.whispersystems.textsecuregcm.identity.IdentityType;
 import org.whispersystems.textsecuregcm.storage.AccountsManager;
 
-import java.time.ZoneId;
-import java.time.ZoneOffset;
-import java.time.ZonedDateTime;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -84,22 +79,11 @@ public class CommunicationWindowController {
   public WindowMetadataResponse getMetadata(@Auth AuthenticatedDevice auth,
       @PathParam("recipientAci") UUID recipientAci) {
     AciServiceIdentifier identifier = new AciServiceIdentifier(recipientAci);
-    Optional<CommunicationWindow> active = service.getActiveWindowForSender(identifier);
 
-    return active.map(window -> {
-      CommunicationWindowSchedule schedule = window.getSchedules().stream()
-          .filter(s -> {
-            ZonedDateTime now = ZonedDateTime.now(ZoneOffset.UTC);
-            return s.isCurrentlyActive(now);
-          })
-          .findFirst()
-          .orElse(null);
-
-      int start = schedule != null ? schedule.getStart() : 0;
-      int end = schedule != null ? schedule.getEnd() : 0;
-
-      return WindowMetadataResponse.active(start, end, window.getName(), window.getExpectations());
-    }).orElseGet(WindowMetadataResponse::inactive);
+    return service.getActiveWindowForSender(identifier)
+        .map(info -> WindowMetadataResponse.active(
+            info.startMinutes(), info.endMinutes(), info.name(), info.expectations()))
+        .orElseGet(WindowMetadataResponse::inactive);
   }
 
   private CommunicationWindow fromRequest(CommunicationWindowRequest r) {
