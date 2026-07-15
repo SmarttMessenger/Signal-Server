@@ -6,6 +6,7 @@ import org.whispersystems.textsecuregcm.util.SystemMapper;
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
 import software.amazon.awssdk.services.dynamodb.model.*;
 import java.io.IOException;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.Map;
 import java.util.Optional;
@@ -18,7 +19,7 @@ import java.util.UUID;
  *   PK (R): recipient account UUID string
  *   SK (M): "{deliverAtMs}#{messageUuid}" — unique per held message; one delivery job per key
  *   D:      JSON-serialized HeldMessageData
- *   E:      TTL (epoch seconds, 7-day fallback)
+ *   E:      TTL (epoch seconds) — reuses Signal's offline-message retention (dynamoDbTables.messages.expiration)
  */
 public class HeldMessagesTable {
 
@@ -27,20 +28,20 @@ public class HeldMessagesTable {
   private static final String ATTR_DATA = "D";
   private static final String ATTR_TTL = "E";
 
-  private static final long TTL_SECONDS = 7 * 24 * 60 * 60; // 7 days
-
   private final DynamoDbClient dynamoDbClient;
   private final String tableName;
+  private final Duration timeToLive;
 
-  public HeldMessagesTable(DynamoDbClient dynamoDbClient, String tableName) {
+  public HeldMessagesTable(DynamoDbClient dynamoDbClient, String tableName, Duration timeToLive) {
     this.dynamoDbClient = dynamoDbClient;
     this.tableName = tableName;
+    this.timeToLive = timeToLive;
   }
 
   /** Stores a held message and returns its generated sort key, which keys the delivery job. */
   public String store(String recipientUuid, Instant deliverAt, HeldMessageData messageData) {
     String sortKey = buildSortKey(deliverAt, UUID.randomUUID().toString());
-    long ttl = Instant.now().getEpochSecond() + TTL_SECONDS;
+    long ttl = Instant.now().getEpochSecond() + timeToLive.getSeconds();
 
     try {
       dynamoDbClient.putItem(PutItemRequest.builder()

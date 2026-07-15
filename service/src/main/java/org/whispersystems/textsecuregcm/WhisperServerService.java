@@ -1088,7 +1088,8 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
             dynamoDbClient, config.getSmarttCommunicationWindow().getWindowsTableName());
     final com.smarttmessenger.communicationwindow.storage.HeldMessagesTable heldMessagesTable =
         new com.smarttmessenger.communicationwindow.storage.HeldMessagesTable(
-            dynamoDbClient, config.getSmarttCommunicationWindow().getHeldMessagesTableName());
+            dynamoDbClient, config.getSmarttCommunicationWindow().getHeldMessagesTableName(),
+            config.getDynamoDbTables().getMessages().getExpiration());
     final com.smarttmessenger.communicationwindow.scheduler.HeldMessageDeliveryScheduler heldMessageDeliveryScheduler =
         new com.smarttmessenger.communicationwindow.scheduler.HeldMessageDeliveryScheduler(
             accountsManager, messageSender, heldMessagesTable, dynamoDbAsyncClient,

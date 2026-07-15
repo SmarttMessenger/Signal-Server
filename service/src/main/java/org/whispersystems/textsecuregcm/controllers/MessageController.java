@@ -375,6 +375,23 @@ public class MessageController {
 
     final Account destination = maybeDestination.orElseThrow(NotFoundException::new);
 
+    // [Smartt] Communication window check for sealed sender, AFTER access verification. The server
+    // can't read the sender here, so: active window + exception contacts -> 401 (client retries as
+    // an identified sender so exceptions can be honored); active window + no exceptions -> hold
+    // anonymously (200 with held response); otherwise deliver normally.
+    if (communicationWindowService != null) {
+      final com.smarttmessenger.communicationwindow.service.CommunicationWindowService.SealedSenderOutcome sealedOutcome =
+          communicationWindowService.checkAndHoldSealedSender(destinationIdentifier, messages);
+      switch (sealedOutcome.action()) {
+        case REQUIRE_IDENTIFIED -> throw new WebApplicationException(Status.UNAUTHORIZED);
+        case HELD -> throw new WebApplicationException(Response.ok(
+            new com.smarttmessenger.communicationwindow.entities.SmarttSendMessageResponse(
+                false, true, sealedOutcome.holdResult().get().windowOpensAt().toEpochMilli())).build());
+        case DELIVER -> { /* fall through to normal sealed-sender delivery */ }
+      }
+    }
+    // [/Smartt]
+
     sendIndividualMessage(destination,
         destinationIdentifier,
         null,

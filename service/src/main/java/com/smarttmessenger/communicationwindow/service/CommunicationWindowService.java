@@ -73,25 +73,53 @@ public class CommunicationWindowService {
         return Optional.empty();
       }
 
-      Instant opensAt = window.windowOpensAt(timezone, clock)
-          .orElse(clock.instant().plusSeconds(3600));
-
-      HeldMessageData messageData = buildHeldMessageData(
-          destinationIdentifier, senderAci, senderDeviceId, messages);
-
-      String sortKey = heldMessagesTable.store(recipientUuid, opensAt, messageData);
-
-      try {
-        deliveryScheduler.scheduleDelivery(recipientUuid, sortKey, opensAt);
-      } catch (Exception e) {
-        logger.warn("Failed to schedule delivery for held message (recipient={})", recipientUuid, e);
-      }
-
-      return Optional.of(new WindowHoldResult(window.getWindowId(), opensAt));
+      return Optional.of(holdAndSchedule(recipientUuid, window, timezone,
+          destinationIdentifier, senderAci.toString(), senderDeviceId, messages));
     }
 
     return Optional.empty();
   }
+
+  /**
+   * Sealed-sender variant. The server can't read the sender in this path, so the decision is based on
+   * the recipient's window alone:
+   *  - window active AND exception contacts defined -> REQUIRE_IDENTIFIED (we can't honor exceptions
+   *    anonymously, so the client is asked to resend as an identified sender via a 401 retry),
+   *  - window active with NO exceptions -> HELD (held anonymously; sender identity not needed),
+   *  - otherwise -> DELIVER (send normally, still sealed).
+   */
+  public SealedSenderOutcome checkAndHoldSealedSender(ServiceIdentifier destinationIdentifier,
+      IncomingMessageList messages) {
+
+    Account recipient = accountsManager.getByServiceIdentifier(destinationIdentifier).orElse(null);
+    if (recipient == null) return new SealedSenderOutcome(SealedSenderAction.DELIVER, Optional.empty());
+
+    String recipientUuid = recipient.getIdentifier(IdentityType.ACI).toString();
+    List<CommunicationWindow> windows = windowsTable.getAll(recipientUuid);
+    if (windows.isEmpty()) return new SealedSenderOutcome(SealedSenderAction.DELIVER, Optional.empty());
+
+    ZoneId timezone = deriveTimezone(recipient);
+    ZonedDateTime now = ZonedDateTime.now(clock.withZone(timezone));
+
+    for (CommunicationWindow window : windows) {
+      if (window.activeSchedule(now).isEmpty()) continue;
+
+      Set<String> exceptions = window.getExceptionContacts();
+      if (exceptions != null && !exceptions.isEmpty()) {
+        return new SealedSenderOutcome(SealedSenderAction.REQUIRE_IDENTIFIED, Optional.empty());
+      }
+
+      WindowHoldResult result = holdAndSchedule(recipientUuid, window, timezone,
+          destinationIdentifier, null, (byte) 0, messages);
+      return new SealedSenderOutcome(SealedSenderAction.HELD, Optional.of(result));
+    }
+
+    return new SealedSenderOutcome(SealedSenderAction.DELIVER, Optional.empty());
+  }
+
+  public enum SealedSenderAction { DELIVER, REQUIRE_IDENTIFIED, HELD }
+
+  public record SealedSenderOutcome(SealedSenderAction action, Optional<WindowHoldResult> holdResult) {}
 
   /**
    * Returns the currently-active window for a sender to display, evaluated entirely in the
@@ -152,7 +180,29 @@ public class CommunicationWindowService {
 
   // --- Helpers ---
 
-  private HeldMessageData buildHeldMessageData(ServiceIdentifier destination, UUID senderAci,
+  /** Stores a held message and schedules its delivery at the window's opening time. Shared by the
+   *  identified-sender and sealed-sender paths; {@code senderAci} is null for sealed sender. */
+  private WindowHoldResult holdAndSchedule(String recipientUuid, CommunicationWindow window, ZoneId timezone,
+      ServiceIdentifier destinationIdentifier, String senderAci, byte senderDeviceId, IncomingMessageList messages) {
+
+    Instant opensAt = window.windowOpensAt(timezone, clock)
+        .orElse(clock.instant().plusSeconds(3600));
+
+    HeldMessageData messageData = buildHeldMessageData(
+        destinationIdentifier, senderAci, senderDeviceId, messages);
+
+    String sortKey = heldMessagesTable.store(recipientUuid, opensAt, messageData);
+
+    try {
+      deliveryScheduler.scheduleDelivery(recipientUuid, sortKey, opensAt);
+    } catch (Exception e) {
+      logger.warn("Failed to schedule delivery for held message (recipient={})", recipientUuid, e);
+    }
+
+    return new WindowHoldResult(window.getWindowId(), opensAt);
+  }
+
+  private HeldMessageData buildHeldMessageData(ServiceIdentifier destination, String senderAci,
       byte senderDeviceId, IncomingMessageList messages) {
 
     List<HeldIncomingMessage> heldMessages = messages.messages().stream()
@@ -164,11 +214,11 @@ public class CommunicationWindowService {
 
     return new HeldMessageData(
         destination.toServiceIdentifierString(),
-        senderAci.toString(),
+        senderAci, // null for sealed sender (anonymous)
         senderDeviceId,
         clientTimestamp,
         messages.urgent(),
-        false, // isStory: only identified-sender non-story messages reach this path
+        false, // isStory: story messages are not held
         messages.online(),
         heldMessages
     );

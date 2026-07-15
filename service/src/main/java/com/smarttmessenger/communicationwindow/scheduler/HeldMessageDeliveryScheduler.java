@@ -108,23 +108,29 @@ public class HeldMessageDeliveryScheduler extends JobScheduler {
 
     HeldMessageData data = entry.data();
     ServiceIdentifier destinationId = ServiceIdentifier.valueOf(data.getDestinationServiceId());
-    AciServiceIdentifier senderAci = new AciServiceIdentifier(UUID.fromString(data.getSenderAci()));
+    final String senderAciString = data.getSenderAci();
 
     Map<Byte, MessageProtos.Envelope> messagesByDeviceId = data.getMessages().stream()
         .collect(Collectors.toMap(
             HeldIncomingMessage::getDestinationDeviceId,
-            msg -> MessageProtos.Envelope.newBuilder()
-                .setType(MessageProtos.Envelope.Type.forNumber(msg.getType()))
-                .setClientTimestamp(data.getClientTimestamp())
-                .setServerTimestamp(clock.millis())
-                .setDestinationServiceId(destinationId.toServiceIdentifierString())
-                .setSourceServiceId(senderAci.toServiceIdentifierString())
-                .setSourceDevice(data.getSenderDeviceId())
-                .setContent(ByteString.copyFrom(msg.getContent()))
-                .setStory(data.isStory())
-                .setEphemeral(data.isOnline())
-                .setUrgent(data.isUrgent())
-                .build()
+            msg -> {
+              MessageProtos.Envelope.Builder builder = MessageProtos.Envelope.newBuilder()
+                  .setType(MessageProtos.Envelope.Type.forNumber(msg.getType()))
+                  .setClientTimestamp(data.getClientTimestamp())
+                  .setServerTimestamp(clock.millis())
+                  .setDestinationServiceId(destinationId.toServiceIdentifierString())
+                  .setContent(ByteString.copyFrom(msg.getContent()))
+                  .setStory(data.isStory())
+                  .setEphemeral(data.isOnline())
+                  .setUrgent(data.isUrgent());
+              // Identified sender: set the source. Sealed sender (senderAci null) stays anonymous.
+              if (senderAciString != null && !senderAciString.isBlank()) {
+                AciServiceIdentifier senderAci = new AciServiceIdentifier(UUID.fromString(senderAciString));
+                builder.setSourceServiceId(senderAci.toServiceIdentifierString())
+                    .setSourceDevice(data.getSenderDeviceId());
+              }
+              return builder.build();
+            }
         ));
 
     Map<Byte, Integer> registrationIdsByDeviceId = data.getMessages().stream()

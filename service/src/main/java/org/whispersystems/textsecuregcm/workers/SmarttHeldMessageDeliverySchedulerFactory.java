@@ -27,7 +27,8 @@ public class SmarttHeldMessageDeliverySchedulerFactory implements JobSchedulerFa
 
     final HeldMessagesTable heldMessagesTable = new HeldMessagesTable(
         dynamoDbClient,
-        configuration.getSmarttCommunicationWindow().getHeldMessagesTableName());
+        configuration.getSmarttCommunicationWindow().getHeldMessagesTableName(),
+        configuration.getDynamoDbTables().getMessages().getExpiration());
 
     final MessageSender messageSender = new MessageSender(
         deps.messagesManager(),
