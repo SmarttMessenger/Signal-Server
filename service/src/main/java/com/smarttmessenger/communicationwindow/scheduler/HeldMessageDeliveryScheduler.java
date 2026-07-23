@@ -60,14 +60,28 @@ public class HeldMessageDeliveryScheduler extends JobScheduler {
 
   @Override
   protected CompletableFuture<String> processJob(@Nullable byte[] jobData) {
-    final JobDescriptor descriptor;
-    try {
-      descriptor = SystemMapper.jsonMapper().readValue(jobData, JobDescriptor.class);
-    } catch (Exception e) {
-      return CompletableFuture.failedFuture(e);
+    final JobDescriptor descriptor = parseJobDescriptor(jobData);
+
+    // Malformed or legacy pre-sortKey payloads can never succeed; complete the job so it gets
+    // deleted instead of being retried on every sweep until its TTL.
+    if (descriptor == null
+        || descriptor.recipientUuid() == null || descriptor.recipientUuid().isBlank()
+        || descriptor.sortKey() == null || descriptor.sortKey().isBlank()) {
+      logger.warn("Discarding malformed held-message delivery job: {}",
+          jobData == null ? "null" : new String(jobData, java.nio.charset.StandardCharsets.UTF_8));
+      return CompletableFuture.completedFuture("malformedJob");
     }
 
-    return accountsManager.getByAccountIdentifierAsync(UUID.fromString(descriptor.recipientUuid()))
+    final UUID recipientUuid;
+    try {
+      recipientUuid = UUID.fromString(descriptor.recipientUuid());
+    } catch (IllegalArgumentException e) {
+      logger.warn("Discarding held-message delivery job with invalid recipient UUID: {}",
+          descriptor.recipientUuid());
+      return CompletableFuture.completedFuture("malformedJob");
+    }
+
+    return accountsManager.getByAccountIdentifierAsync(recipientUuid)
         .thenApply(maybeRecipient -> {
           if (maybeRecipient.isEmpty()) {
             return "recipientNotFound";
@@ -92,6 +106,18 @@ public class HeldMessageDeliveryScheduler extends JobScheduler {
             throw new RuntimeException(e);
           }
         });
+  }
+
+  @Nullable
+  private static JobDescriptor parseJobDescriptor(@Nullable final byte[] jobData) {
+    if (jobData == null) {
+      return null;
+    }
+    try {
+      return SystemMapper.jsonMapper().readValue(jobData, JobDescriptor.class);
+    } catch (Exception e) {
+      return null;
+    }
   }
 
   public CompletableFuture<Void> scheduleDelivery(String recipientUuid, String sortKey, Instant deliverAt) {
