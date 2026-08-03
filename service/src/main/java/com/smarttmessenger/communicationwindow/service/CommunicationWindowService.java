@@ -165,41 +165,13 @@ public class CommunicationWindowService {
     // Android client write locally and push in the background with its own client-generated id.
     updated.setWindowId(windowId);
     windowsTable.put(accountUuid, updated);
-    releaseHeldMessagesIfNoActiveWindow(accountUuid);
     return Optional.of(updated);
   }
 
   public boolean deleteWindow(String accountUuid, String windowId) {
     if (windowsTable.get(accountUuid, windowId).isEmpty()) return false;
     windowsTable.delete(accountUuid, windowId);
-    releaseHeldMessagesIfNoActiveWindow(accountUuid);
     return true;
-  }
-
-  /**
-   * When a window edit or delete leaves the account with no currently-active window (e.g. the user
-   * manually deactivated it), messages that were already held must not wait for the original
-   * window-open time — reschedule each one for immediate delivery. Double-scheduling is safe: the
-   * delivery job deletes the held entry on first success and any later job for the same sort key
-   * finds nothing and completes as a no-op.
-   */
-  private void releaseHeldMessagesIfNoActiveWindow(String accountUuid) {
-    try {
-      Account account = accountsManager.getByAccountIdentifier(UUID.fromString(accountUuid)).orElse(null);
-      if (account == null) return;
-
-      ZoneId timezone = deriveTimezone(account);
-      ZonedDateTime now = ZonedDateTime.now(clock.withZone(timezone));
-      boolean anyActive = windowsTable.getAll(accountUuid).stream()
-          .anyMatch(w -> w.activeSchedule(now).isPresent());
-      if (anyActive) return;
-
-      for (String sortKey : heldMessagesTable.getSortKeys(accountUuid)) {
-        deliveryScheduler.scheduleDelivery(accountUuid, sortKey, clock.instant());
-      }
-    } catch (Exception e) {
-      logger.warn("Failed to release held messages for account={}", accountUuid, e);
-    }
   }
 
   public List<CommunicationWindow> getWindows(String accountUuid) {

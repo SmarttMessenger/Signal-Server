@@ -82,31 +82,6 @@ public class HeldMessagesTable {
     }
   }
 
-  /** Returns the sort keys of all messages currently held for the recipient. */
-  public java.util.List<String> getSortKeys(String recipientUuid) {
-    final java.util.List<String> sortKeys = new java.util.ArrayList<>();
-    Map<String, AttributeValue> lastEvaluatedKey = null;
-
-    do {
-      QueryRequest.Builder builder = QueryRequest.builder()
-          .tableName(tableName)
-          .keyConditionExpression("#r = :r")
-          .expressionAttributeNames(Map.of("#r", ATTR_RECIPIENT_UUID, "#m", ATTR_SORT_KEY))
-          .expressionAttributeValues(Map.of(":r", AttributeValue.fromS(recipientUuid)))
-          .projectionExpression("#m");
-      if (lastEvaluatedKey != null) {
-        builder.exclusiveStartKey(lastEvaluatedKey);
-      }
-
-      QueryResponse response = dynamoDbClient.query(builder.build());
-      response.items().forEach(item -> sortKeys.add(item.get(ATTR_SORT_KEY).s()));
-      lastEvaluatedKey = response.hasLastEvaluatedKey() && !response.lastEvaluatedKey().isEmpty()
-          ? response.lastEvaluatedKey() : null;
-    } while (lastEvaluatedKey != null);
-
-    return sortKeys;
-  }
-
   public void delete(String recipientUuid, String sortKey) {
     dynamoDbClient.deleteItem(DeleteItemRequest.builder()
         .tableName(tableName)
