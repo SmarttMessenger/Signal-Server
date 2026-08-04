@@ -5,6 +5,7 @@ import com.google.i18n.phonenumbers.NumberParseException;
 import com.google.i18n.phonenumbers.PhoneNumberToTimeZonesMapper;
 import com.google.i18n.phonenumbers.PhoneNumberUtil;
 import com.google.i18n.phonenumbers.Phonenumber;
+import com.smarttmessenger.communicationwindow.cache.WindowPresenceCache;
 import com.smarttmessenger.communicationwindow.model.*;
 import com.smarttmessenger.communicationwindow.scheduler.HeldMessageDeliveryScheduler;
 import com.smarttmessenger.communicationwindow.storage.CommunicationWindowsTable;
@@ -30,18 +31,37 @@ public class CommunicationWindowService {
   private final CommunicationWindowsTable windowsTable;
   private final HeldMessagesTable heldMessagesTable;
   private final HeldMessageDeliveryScheduler deliveryScheduler;
+  private final WindowPresenceCache windowPresenceCache;
   private final Clock clock;
 
   public CommunicationWindowService(AccountsManager accountsManager,
       CommunicationWindowsTable windowsTable,
       HeldMessagesTable heldMessagesTable,
       HeldMessageDeliveryScheduler deliveryScheduler,
+      WindowPresenceCache windowPresenceCache,
       Clock clock) {
     this.accountsManager = accountsManager;
     this.windowsTable = windowsTable;
     this.heldMessagesTable = heldMessagesTable;
     this.deliveryScheduler = deliveryScheduler;
+    this.windowPresenceCache = windowPresenceCache;
     this.clock = clock;
+  }
+
+  /**
+   * Loads the recipient's windows, skipping the DynamoDB query entirely when we already know the
+   * account has none. This runs on the send hot path for every identified-sender message, so the
+   * common case (no windows at all) must not cost a query.
+   */
+  private List<CommunicationWindow> loadWindows(String accountUuid) {
+    // Only a definite "no windows" short-circuits; a cache miss falls through to the query.
+    if (!windowPresenceCache.hasWindows(accountUuid).orElse(true)) {
+      return List.of();
+    }
+
+    List<CommunicationWindow> windows = windowsTable.getAll(accountUuid);
+    windowPresenceCache.set(accountUuid, !windows.isEmpty());
+    return windows;
   }
 
   /**
@@ -59,7 +79,7 @@ public class CommunicationWindowService {
     if (recipient == null) return Optional.empty();
 
     String recipientUuid = recipient.getIdentifier(IdentityType.ACI).toString();
-    List<CommunicationWindow> windows = windowsTable.getAll(recipientUuid);
+    List<CommunicationWindow> windows = loadWindows(recipientUuid);
     if (windows.isEmpty()) return Optional.empty();
 
     ZoneId timezone = deriveTimezone(recipient);
@@ -95,7 +115,7 @@ public class CommunicationWindowService {
     if (recipient == null) return new SealedSenderOutcome(SealedSenderAction.DELIVER, Optional.empty());
 
     String recipientUuid = recipient.getIdentifier(IdentityType.ACI).toString();
-    List<CommunicationWindow> windows = windowsTable.getAll(recipientUuid);
+    List<CommunicationWindow> windows = loadWindows(recipientUuid);
     if (windows.isEmpty()) return new SealedSenderOutcome(SealedSenderAction.DELIVER, Optional.empty());
 
     ZoneId timezone = deriveTimezone(recipient);
@@ -131,7 +151,8 @@ public class CommunicationWindowService {
     if (recipient == null) return Optional.empty();
 
     String recipientUuid = recipient.getIdentifier(IdentityType.ACI).toString();
-    List<CommunicationWindow> windows = windowsTable.getAll(recipientUuid);
+    // Must use the same view as checkAndHold, or the banner could contradict the hold decision.
+    List<CommunicationWindow> windows = loadWindows(recipientUuid);
 
     ZoneId timezone = deriveTimezone(recipient);
     ZonedDateTime now = ZonedDateTime.now(clock.withZone(timezone));
@@ -155,6 +176,9 @@ public class CommunicationWindowService {
   public CommunicationWindow createWindow(String accountUuid, CommunicationWindow window) {
     window.setWindowId(UUID.randomUUID().toString());
     windowsTable.put(accountUuid, window);
+    // Write the new value rather than deleting the key, so a window change never sends every
+    // subsequent message for this account back to DynamoDB.
+    windowPresenceCache.set(accountUuid, true);
     return window;
   }
 
@@ -165,12 +189,16 @@ public class CommunicationWindowService {
     // Android client write locally and push in the background with its own client-generated id.
     updated.setWindowId(windowId);
     windowsTable.put(accountUuid, updated);
+    windowPresenceCache.set(accountUuid, true);
     return Optional.of(updated);
   }
 
   public boolean deleteWindow(String accountUuid, String windowId) {
     if (windowsTable.get(accountUuid, windowId).isEmpty()) return false;
     windowsTable.delete(accountUuid, windowId);
+    // Other windows may remain, so the flag has to be recomputed rather than simply cleared.
+    // Deletes are rare, so the extra query costs nothing at the volumes that matter.
+    windowPresenceCache.set(accountUuid, !windowsTable.getAll(accountUuid).isEmpty());
     return true;
   }
 

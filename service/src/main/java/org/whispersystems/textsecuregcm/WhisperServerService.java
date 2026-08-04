@@ -1095,9 +1095,12 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
             accountsManager, messageSender, heldMessagesTable, dynamoDbAsyncClient,
             config.getDynamoDbTables().getScheduledJobs().getTableName(),
             config.getDynamoDbTables().getScheduledJobs().getExpiration(), clock);
+    final com.smarttmessenger.communicationwindow.cache.WindowPresenceCache windowPresenceCache =
+        new com.smarttmessenger.communicationwindow.cache.WindowPresenceCache(cacheCluster);
     final com.smarttmessenger.communicationwindow.service.CommunicationWindowService communicationWindowService =
         new com.smarttmessenger.communicationwindow.service.CommunicationWindowService(
-            accountsManager, communicationWindowsTable, heldMessagesTable, heldMessageDeliveryScheduler, clock);
+            accountsManager, communicationWindowsTable, heldMessagesTable, heldMessageDeliveryScheduler,
+            windowPresenceCache, clock);
     final org.whispersystems.textsecuregcm.controllers.MessageController messageController =
         new org.whispersystems.textsecuregcm.controllers.MessageController(rateLimiters,
             messageByteLimitCardinalityEstimator, messageSender, receiptSender, accountsManager, messagesManager,
