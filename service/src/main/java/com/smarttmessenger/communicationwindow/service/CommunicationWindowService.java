@@ -90,6 +90,8 @@ public class CommunicationWindowService {
       if (activeSchedule.isEmpty()) continue;
 
       if (window.isSenderException(senderAci.toString())) {
+        logger.debug("Not holding message: recipient={} windowId={} sender is an exception contact",
+            recipientUuid, window.getWindowId());
         return Optional.empty();
       }
 
@@ -126,6 +128,9 @@ public class CommunicationWindowService {
 
       Set<String> exceptions = window.getExceptionContacts();
       if (exceptions != null && !exceptions.isEmpty()) {
+        logger.debug("Requiring identified resend for sealed-sender message: recipient={} windowId={} "
+                + "exceptionContacts={}",
+            recipientUuid, window.getWindowId(), exceptions.size());
         return new SealedSenderOutcome(SealedSenderAction.REQUIRE_IDENTIFIED, Optional.empty());
       }
 
@@ -213,8 +218,15 @@ public class CommunicationWindowService {
   private WindowHoldResult holdAndSchedule(String recipientUuid, CommunicationWindow window, ZoneId timezone,
       ServiceIdentifier destinationIdentifier, String senderAci, byte senderDeviceId, IncomingMessageList messages) {
 
-    Instant opensAt = window.windowOpensAt(timezone, clock)
-        .orElse(clock.instant().plusSeconds(3600));
+    Optional<Instant> scheduledOpensAt = window.windowOpensAt(timezone, clock);
+    Instant opensAt = scheduledOpensAt.orElseGet(() -> clock.instant().plusSeconds(3600));
+
+    if (scheduledOpensAt.isEmpty()) {
+      // Otherwise this presents as an unexplained one-hour delay with nothing in the log to explain it.
+      logger.warn("No window opening time could be derived: recipient={} windowId={} timezone={}; "
+              + "using fallback deliverAt={}",
+          recipientUuid, window.getWindowId(), timezone, opensAt.toEpochMilli());
+    }
 
     HeldMessageData messageData = buildHeldMessageData(
         destinationIdentifier, senderAci, senderDeviceId, messages);
@@ -222,15 +234,28 @@ public class CommunicationWindowService {
     // heldAt orders the backlog on release, so it comes from the server clock, never the sender's.
     heldMessagesTable.store(recipientUuid, opensAt, clock.instant(), messageData);
 
+    boolean drainScheduled = false;
     try {
       // One drain job per window opening, not one per held message: whoever creates the marker
       // schedules it, and every later message for the same opening rides that same job.
       if (heldMessagesTable.tryCreateDrainMarker(recipientUuid, opensAt.toEpochMilli())) {
         deliveryScheduler.scheduleDrain(recipientUuid, opensAt.toEpochMilli(), opensAt);
+        drainScheduled = true;
       }
     } catch (Exception e) {
-      logger.warn("Failed to schedule delivery for held message (recipient={})", recipientUuid, e);
+      // A hold with no drain job is the worst failure mode this feature has, so log everything needed
+      // to find and re-drive it.
+      logger.warn("Failed to schedule delivery for held message: recipient={} windowId={} deliverAt={}",
+          recipientUuid, window.getWindowId(), opensAt.toEpochMilli(), e);
     }
+
+    // drainScheduled=false is normal for the 2nd..Nth message of the same opening: they ride the job
+    // the first message created.
+    logger.info("Held message: recipient={} windowId={} deliverAt={} inMs={} messages={} "
+            + "sealedSender={} drainScheduled={}",
+        recipientUuid, window.getWindowId(), opensAt.toEpochMilli(),
+        opensAt.toEpochMilli() - clock.millis(), messageData.getMessages().size(),
+        senderAci == null, drainScheduled);
 
     return new WindowHoldResult(window.getWindowId(), opensAt);
   }
