@@ -219,10 +219,15 @@ public class CommunicationWindowService {
     HeldMessageData messageData = buildHeldMessageData(
         destinationIdentifier, senderAci, senderDeviceId, messages);
 
-    String sortKey = heldMessagesTable.store(recipientUuid, opensAt, messageData);
+    // heldAt orders the backlog on release, so it comes from the server clock, never the sender's.
+    heldMessagesTable.store(recipientUuid, opensAt, clock.instant(), messageData);
 
     try {
-      deliveryScheduler.scheduleDelivery(recipientUuid, sortKey, opensAt);
+      // One drain job per window opening, not one per held message: whoever creates the marker
+      // schedules it, and every later message for the same opening rides that same job.
+      if (heldMessagesTable.tryCreateDrainMarker(recipientUuid, opensAt.toEpochMilli())) {
+        deliveryScheduler.scheduleDrain(recipientUuid, opensAt.toEpochMilli(), opensAt);
+      }
     } catch (Exception e) {
       logger.warn("Failed to schedule delivery for held message (recipient={})", recipientUuid, e);
     }
