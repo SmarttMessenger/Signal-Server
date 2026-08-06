@@ -59,7 +59,13 @@ public class ProcessScheduledJobsServiceCommand extends ServerCommand<WhisperSer
 
     @Override
     public void start() {
-      processJobsFuture = scheduledExecutorService.scheduleWithFixedDelay(() -> {
+      // [Smartt] Sweep on wall-clock boundaries of the period (e.g. every minute at :00). The epoch is
+      // minute-aligned, so `now % period` is the wait to the next boundary; fixed *rate* then holds that
+      // phase, where fixed *delay* would drift forward by each sweep's own duration.
+      final long periodMs = TimeUnit.SECONDS.toMillis(fixedDelaySeconds);
+      final long initialDelayMs = periodMs - (System.currentTimeMillis() % periodMs);
+
+      processJobsFuture = scheduledExecutorService.scheduleAtFixedRate(() -> {
         final CountDownLatch latch = new CountDownLatch(1);
 
         synchronized (this) {
@@ -82,7 +88,7 @@ public class ProcessScheduledJobsServiceCommand extends ServerCommand<WhisperSer
         } catch (final InterruptedException e) {
           log.warn("Failed to process available jobs for scheduler: {}", jobScheduler.getSchedulerName(), e);
         }
-      }, 0, fixedDelaySeconds, TimeUnit.SECONDS);
+      }, initialDelayMs, periodMs, TimeUnit.MILLISECONDS);
     }
 
     @Override
