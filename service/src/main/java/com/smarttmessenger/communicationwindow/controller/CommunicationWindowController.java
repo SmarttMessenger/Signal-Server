@@ -12,12 +12,11 @@ import jakarta.ws.rs.*;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import org.whispersystems.textsecuregcm.auth.AuthenticatedDevice;
-import org.whispersystems.textsecuregcm.identity.AciServiceIdentifier;
+import org.whispersystems.textsecuregcm.identity.ServiceIdentifier;
 import org.whispersystems.textsecuregcm.storage.AccountsManager;
 
 import java.util.List;
 import java.util.Optional;
-import java.util.UUID;
 import java.util.stream.Collectors;
 
 @Path("/v1/smartt/communication-windows")
@@ -73,12 +72,25 @@ public class CommunicationWindowController {
         : Response.status(Response.Status.NOT_FOUND).build();
   }
 
-  /** Called by the sender's app to show the window banner in a conversation. */
+  /**
+   * Called by the sender's app to show the window banner in a conversation.
+   *
+   * Takes any service identifier — a bare UUID for an ACI, or a {@code PNI:}-prefixed one — because
+   * a sender does not always know the recipient's ACI. On a fresh install contacts are frequently
+   * PNI-only until a profile fetch or the first exchanged message, and requiring an ACI here meant
+   * the client could not ask at all and silently showed no banner. The service normalizes to the
+   * recipient's ACI internally, exactly as the send path does, so the answer is identical either way.
+   */
   @GET
-  @Path("/metadata/{recipientAci}")
+  @Path("/metadata/{recipientServiceId}")
   public WindowMetadataResponse getMetadata(@Auth AuthenticatedDevice auth,
-      @PathParam("recipientAci") UUID recipientAci) {
-    AciServiceIdentifier identifier = new AciServiceIdentifier(recipientAci);
+      @PathParam("recipientServiceId") String recipientServiceId) {
+    final ServiceIdentifier identifier;
+    try {
+      identifier = ServiceIdentifier.valueOf(recipientServiceId);
+    } catch (final IllegalArgumentException e) {
+      throw new WebApplicationException(Response.Status.BAD_REQUEST);
+    }
 
     return service.getActiveWindowForSender(identifier)
         .map(info -> WindowMetadataResponse.active(
