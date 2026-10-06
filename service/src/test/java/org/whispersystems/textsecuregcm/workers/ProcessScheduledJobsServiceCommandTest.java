@@ -36,10 +36,8 @@ class ProcessScheduledJobsServiceCommandTest {
     final TestPublisher<Integer> testPublisher = TestPublisher.create();
     final TestJobScheduler testJobScheduler = new TestJobScheduler(testPublisher);
 
-    // [Smartt] Processing starts on the next wall-clock boundary of this period, so keep it short enough
-    // that the first run lands well inside the test timeout.
     final ProcessScheduledJobsServiceCommand.ScheduledJobProcessor scheduledJobProcessor =
-        new ProcessScheduledJobsServiceCommand.ScheduledJobProcessor(testJobScheduler, scheduledExecutorService, 1);
+        new ProcessScheduledJobsServiceCommand.ScheduledJobProcessor(testJobScheduler, scheduledExecutorService, 60);
 
     scheduledJobProcessor.start();
     testJobScheduler.getStartLatch().await();
@@ -60,9 +58,8 @@ class ProcessScheduledJobsServiceCommandTest {
 
     final TestJobScheduler testJobScheduler = new TestJobScheduler(testPublisher);
 
-    // [Smartt] See the note above on the short period.
     final ProcessScheduledJobsServiceCommand.ScheduledJobProcessor scheduledJobProcessor =
-        new ProcessScheduledJobsServiceCommand.ScheduledJobProcessor(testJobScheduler, scheduledExecutorService, 1);
+        new ProcessScheduledJobsServiceCommand.ScheduledJobProcessor(testJobScheduler, scheduledExecutorService, 60);
 
     scheduledJobProcessor.start();
     testJobScheduler.getStartLatch().await();

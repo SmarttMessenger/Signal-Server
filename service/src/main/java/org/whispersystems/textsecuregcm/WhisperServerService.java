@@ -346,10 +346,11 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
         "Processes scheduled jobs to send notifications to idle devices",
         new IdleDeviceNotificationSchedulerFactory()));
 
-    // [Smartt] Communication window: deliver held messages when window opens
+    // [Smartt: comm-window] Deliver held messages when a closed period ends. alignToPeriod=true sweeps
+    // every minute at :00 so releases aren't up to a minute late; upstream's workers keep their timing.
     bootstrap.addCommand(new ProcessScheduledJobsServiceCommand("process-smartt-window-delivery-jobs",
         "Processes scheduled jobs to deliver messages held by communication windows",
-        new SmarttHeldMessageDeliverySchedulerFactory()));
+        new SmarttHeldMessageDeliverySchedulerFactory(), true));
     // [/Smartt]
 
     bootstrap.addCommand(new RegenerateSecondaryDynamoDbTableDataCommand());
