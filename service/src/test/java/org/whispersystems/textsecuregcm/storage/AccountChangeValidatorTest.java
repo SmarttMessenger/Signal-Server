@@ -10,6 +10,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
+import com.google.i18n.phonenumbers.PhoneNumberUtil;
 import java.util.Base64;
 import java.util.Optional;
 import java.util.UUID;
@@ -21,8 +22,11 @@ import org.junit.jupiter.params.provider.MethodSource;
 
 class AccountChangeValidatorTest {
 
-  private static final String ORIGINAL_NUMBER = "+18005551234";
-  private static final String CHANGED_NUMBER = "+18005559876";
+  private static final String ORIGINAL_NUMBER = PhoneNumberUtil.getInstance().format(
+      PhoneNumberUtil.getInstance().getExampleNumber("US"), PhoneNumberUtil.PhoneNumberFormat.E164);
+
+  private static final String CHANGED_NUMBER = PhoneNumberUtil.getInstance().format(
+      PhoneNumberUtil.getInstance().getExampleNumber("FR"), PhoneNumberUtil.PhoneNumberFormat.E164);
 
   private static final UUID ORIGINAL_PNI = UUID.randomUUID();
   private static final UUID CHANGED_PNI = UUID.randomUUID();
@@ -50,24 +54,29 @@ class AccountChangeValidatorTest {
 
   private static Stream<Arguments> validateChange() {
     final Account originalAccount = mock(Account.class);
-    when(originalAccount.getNumber()).thenReturn(ORIGINAL_NUMBER);
-    when(originalAccount.getPhoneNumberIdentifier()).thenReturn(ORIGINAL_PNI);
+    when(originalAccount.getNumber()).thenReturn(Optional.of(ORIGINAL_NUMBER));
+    when(originalAccount.getPhoneNumberIdentifier()).thenReturn(Optional.of(ORIGINAL_PNI));
     when(originalAccount.getUsernameHash()).thenReturn(Optional.of(ORIGINAL_USERNAME_HASH));
 
     final Account unchangedAccount = mock(Account.class);
-    when(unchangedAccount.getNumber()).thenReturn(ORIGINAL_NUMBER);
-    when(unchangedAccount.getPhoneNumberIdentifier()).thenReturn(ORIGINAL_PNI);
+    when(unchangedAccount.getNumber()).thenReturn(Optional.of(ORIGINAL_NUMBER));
+    when(unchangedAccount.getPhoneNumberIdentifier()).thenReturn(Optional.of(ORIGINAL_PNI));
     when(unchangedAccount.getUsernameHash()).thenReturn(Optional.of(ORIGINAL_USERNAME_HASH));
 
     final Account changedNumberAccount = mock(Account.class);
-    when(changedNumberAccount.getNumber()).thenReturn(CHANGED_NUMBER);
-    when(changedNumberAccount.getPhoneNumberIdentifier()).thenReturn(CHANGED_PNI);
+    when(changedNumberAccount.getNumber()).thenReturn(Optional.of(CHANGED_NUMBER));
+    when(changedNumberAccount.getPhoneNumberIdentifier()).thenReturn(Optional.of(CHANGED_PNI));
     when(changedNumberAccount.getUsernameHash()).thenReturn(Optional.of(ORIGINAL_USERNAME_HASH));
 
     final Account changedUsernameAccount = mock(Account.class);
-    when(changedUsernameAccount.getNumber()).thenReturn(ORIGINAL_NUMBER);
-    when(changedUsernameAccount.getPhoneNumberIdentifier()).thenReturn(ORIGINAL_PNI);
+    when(changedUsernameAccount.getNumber()).thenReturn(Optional.of(ORIGINAL_NUMBER));
+    when(changedUsernameAccount.getPhoneNumberIdentifier()).thenReturn(Optional.of(ORIGINAL_PNI));
     when(changedUsernameAccount.getUsernameHash()).thenReturn(Optional.of(CHANGED_USERNAME_HASH));
+
+    final Account numberlessAccount = mock(Account.class);
+    when(numberlessAccount.getNumber()).thenReturn(Optional.empty());
+    when(numberlessAccount.getPhoneNumberIdentifier()).thenReturn(Optional.empty());
+    when(numberlessAccount.getUsernameHash()).thenReturn(Optional.of(ORIGINAL_USERNAME_HASH));
 
     return Stream.of(
         Arguments.of(originalAccount, unchangedAccount, AccountChangeValidator.GENERAL_CHANGE_VALIDATOR, true),
@@ -80,7 +89,15 @@ class AccountChangeValidatorTest {
 
         Arguments.of(originalAccount, changedUsernameAccount, AccountChangeValidator.GENERAL_CHANGE_VALIDATOR, false),
         Arguments.of(originalAccount, changedUsernameAccount, AccountChangeValidator.NUMBER_CHANGE_VALIDATOR, false),
-        Arguments.of(originalAccount, changedUsernameAccount, AccountChangeValidator.USERNAME_CHANGE_VALIDATOR, true)
+        Arguments.of(originalAccount, changedUsernameAccount, AccountChangeValidator.USERNAME_CHANGE_VALIDATOR, true),
+
+        Arguments.of(originalAccount, numberlessAccount, AccountChangeValidator.GENERAL_CHANGE_VALIDATOR, false),
+        Arguments.of(originalAccount, numberlessAccount, AccountChangeValidator.NUMBER_CHANGE_VALIDATOR, true),
+        Arguments.of(originalAccount, numberlessAccount, AccountChangeValidator.USERNAME_CHANGE_VALIDATOR, false),
+
+        Arguments.of(numberlessAccount, originalAccount, AccountChangeValidator.GENERAL_CHANGE_VALIDATOR, false),
+        Arguments.of(numberlessAccount, originalAccount, AccountChangeValidator.NUMBER_CHANGE_VALIDATOR, true),
+        Arguments.of(numberlessAccount, originalAccount, AccountChangeValidator.USERNAME_CHANGE_VALIDATOR, false)
     );
   }
 }

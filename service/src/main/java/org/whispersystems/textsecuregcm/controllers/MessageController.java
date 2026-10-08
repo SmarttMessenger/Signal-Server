@@ -4,8 +4,6 @@
  */
 package org.whispersystems.textsecuregcm.controllers;
 
-import static com.codahale.metrics.MetricRegistry.name;
-
 import com.google.common.net.HttpHeaders;
 import io.dropwizard.auth.Auth;
 import io.micrometer.core.instrument.Metrics;
@@ -21,9 +19,7 @@ import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotNull;
 import jakarta.ws.rs.BadRequestException;
 import jakarta.ws.rs.Consumes;
-import jakarta.ws.rs.DELETE;
 import jakarta.ws.rs.DefaultValue;
-import jakarta.ws.rs.GET;
 import jakarta.ws.rs.HeaderParam;
 import jakarta.ws.rs.InternalServerErrorException;
 import jakarta.ws.rs.NotAuthorizedException;
@@ -34,6 +30,7 @@ import jakarta.ws.rs.Path;
 import jakarta.ws.rs.PathParam;
 import jakarta.ws.rs.Produces;
 import jakarta.ws.rs.QueryParam;
+import jakarta.ws.rs.ServiceUnavailableException;
 import jakarta.ws.rs.WebApplicationException;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.core.Context;
@@ -41,7 +38,6 @@ import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import jakarta.ws.rs.core.Response.Status;
 import java.time.Clock;
-import java.time.Duration;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
@@ -52,7 +48,6 @@ import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.stream.Collectors;
-import java.util.stream.Stream;
 import javax.annotation.Nullable;
 import org.glassfish.jersey.server.ManagedAsync;
 import org.signal.libsignal.protocol.SealedSenderMultiRecipientMessage;
@@ -74,10 +69,7 @@ import org.whispersystems.textsecuregcm.entities.AccountStaleDevices;
 import org.whispersystems.textsecuregcm.entities.IncomingMessage;
 import org.whispersystems.textsecuregcm.entities.IncomingMessageList;
 import org.whispersystems.textsecuregcm.entities.MessageProtos.Envelope;
-import org.whispersystems.textsecuregcm.entities.MessageProtos.Envelope.Type;
 import org.whispersystems.textsecuregcm.entities.MismatchedDevicesResponse;
-import org.whispersystems.textsecuregcm.entities.OutgoingMessageEntity;
-import org.whispersystems.textsecuregcm.entities.OutgoingMessageEntityList;
 import org.whispersystems.textsecuregcm.entities.SendMessageResponse;
 import org.whispersystems.textsecuregcm.entities.SendMultiRecipientMessageResponse;
 import org.whispersystems.textsecuregcm.entities.SpamReport;
@@ -86,33 +78,22 @@ import org.whispersystems.textsecuregcm.identity.AciServiceIdentifier;
 import org.whispersystems.textsecuregcm.identity.IdentityType;
 import org.whispersystems.textsecuregcm.identity.ServiceIdentifier;
 import org.whispersystems.textsecuregcm.limits.CardinalityEstimator;
-import org.whispersystems.textsecuregcm.limits.MessageDeliveryLoopMonitor;
 import org.whispersystems.textsecuregcm.limits.RateLimiters;
-import org.whispersystems.textsecuregcm.metrics.MessageMetrics;
 import org.whispersystems.textsecuregcm.metrics.MetricsUtil;
 import org.whispersystems.textsecuregcm.metrics.UserAgentTagUtil;
 import org.whispersystems.textsecuregcm.providers.MultiRecipientMessageProvider;
 import org.whispersystems.textsecuregcm.push.MessageSender;
 import org.whispersystems.textsecuregcm.push.MessageTooLargeException;
 import org.whispersystems.textsecuregcm.push.MessageUtil;
-import org.whispersystems.textsecuregcm.push.PushNotificationManager;
-import org.whispersystems.textsecuregcm.push.PushNotificationScheduler;
-import org.whispersystems.textsecuregcm.push.ReceiptSender;
 import org.whispersystems.textsecuregcm.spam.MessageType;
 import org.whispersystems.textsecuregcm.spam.SpamCheckResult;
 import org.whispersystems.textsecuregcm.spam.SpamChecker;
 import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.storage.AccountsManager;
-import org.whispersystems.textsecuregcm.storage.ClientReleaseManager;
-import org.whispersystems.textsecuregcm.storage.Device;
-import org.whispersystems.textsecuregcm.storage.MessagesManager;
 import org.whispersystems.textsecuregcm.storage.PhoneNumberIdentifiers;
+import org.whispersystems.textsecuregcm.storage.ReportMessageHelper;
 import org.whispersystems.textsecuregcm.storage.ReportMessageManager;
 import org.whispersystems.textsecuregcm.util.HeaderUtils;
-import org.whispersystems.textsecuregcm.util.Util;
-import org.whispersystems.textsecuregcm.websocket.WebSocketConnection;
-import org.whispersystems.websocket.WebsocketHeaders;
-import reactor.core.scheduler.Scheduler;
 
 @SuppressWarnings("OptionalUsedAsFieldOrParameterType")
 @Path("/v1/messages")
@@ -124,19 +105,11 @@ public class MessageController {
   private final RateLimiters rateLimiters;
   private final CardinalityEstimator messageByteLimitEstimator;
   private final MessageSender messageSender;
-  private final ReceiptSender receiptSender;
   private final AccountsManager accountsManager;
-  private final MessagesManager messagesManager;
   private final PhoneNumberIdentifiers phoneNumberIdentifiers;
-  private final PushNotificationManager pushNotificationManager;
-  private final PushNotificationScheduler pushNotificationScheduler;
   private final ReportMessageManager reportMessageManager;
-  private final Scheduler messageDeliveryScheduler;
-  private final ClientReleaseManager clientReleaseManager;
   private final ServerSecretParams serverSecretParams;
   private final SpamChecker spamChecker;
-  private final MessageMetrics messageMetrics;
-  private final MessageDeliveryLoopMonitor messageDeliveryLoopMonitor;
   private final Clock clock;
 
   // [Smartt] Communication window support
@@ -150,8 +123,6 @@ public class MessageController {
 
   private static final CompletableFuture<?>[] EMPTY_FUTURE_ARRAY = new CompletableFuture<?>[0];
 
-  private static final String OUTGOING_MESSAGE_LIST_SIZE_BYTES_DISTRIBUTION_NAME = name(MessageController.class, "outgoingMessageListSizeBytes");
-
   private static final Timer INDIVIDUAL_MESSAGE_LATENCY_TIMER;
   private static final Timer MULTI_RECIPIENT_MESSAGE_LATENCY_TIMER;
 
@@ -161,21 +132,23 @@ public class MessageController {
 
     INDIVIDUAL_MESSAGE_LATENCY_TIMER = Timer.builder(timerName)
         .tags(multiRecipientTagName, "false")
-        .publishPercentileHistogram(true)
         .register(Metrics.globalRegistry);
 
     MULTI_RECIPIENT_MESSAGE_LATENCY_TIMER = Timer.builder(timerName)
         .tags(multiRecipientTagName, "true")
-        .publishPercentileHistogram(true)
         .register(Metrics.globalRegistry);
   }
+
+  private static final String INCORRECT_SYNC_MESSAGE_REGISTRATION_IDS_COUNTER_NAME =
+      MetricsUtil.name(MessageController.class, "incorrectSyncMessageRegistrationIds");
+
+  private static final String LEGACY_COMBINED_UAK_COUNTER_NAME =
+      MetricsUtil.name(MessageController.class, "legacyCombinedUak");
 
   // The Signal desktop client (really, JavaScript in general) can handle message timestamps at most 100,000,000 days
   // past the epoch; please see https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Date#the_epoch_timestamps_and_invalid_date
   // for additional details.
   public static final long MAX_TIMESTAMP = 86_400_000L * 100_000_000L;
-
-  private static final Duration NOTIFY_FOR_REMAINING_MESSAGES_DELAY = Duration.ofMinutes(1);
 
   private static final SendMultiRecipientMessageResponse SEND_STORY_RESPONSE =
       new SendMultiRecipientMessageResponse(Collections.emptyList());
@@ -184,36 +157,20 @@ public class MessageController {
       RateLimiters rateLimiters,
       CardinalityEstimator messageByteLimitEstimator,
       MessageSender messageSender,
-      ReceiptSender receiptSender,
       AccountsManager accountsManager,
-      MessagesManager messagesManager,
       PhoneNumberIdentifiers phoneNumberIdentifiers,
-      PushNotificationManager pushNotificationManager,
-      PushNotificationScheduler pushNotificationScheduler,
       ReportMessageManager reportMessageManager,
-      Scheduler messageDeliveryScheduler,
-      final ClientReleaseManager clientReleaseManager,
       final ServerSecretParams serverSecretParams,
       final SpamChecker spamChecker,
-      final MessageMetrics messageMetrics,
-      final MessageDeliveryLoopMonitor messageDeliveryLoopMonitor,
       final Clock clock) {
     this.rateLimiters = rateLimiters;
     this.messageByteLimitEstimator = messageByteLimitEstimator;
     this.messageSender = messageSender;
-    this.receiptSender = receiptSender;
     this.accountsManager = accountsManager;
-    this.messagesManager = messagesManager;
     this.phoneNumberIdentifiers = phoneNumberIdentifiers;
-    this.pushNotificationManager = pushNotificationManager;
-    this.pushNotificationScheduler = pushNotificationScheduler;
     this.reportMessageManager = reportMessageManager;
-    this.messageDeliveryScheduler = messageDeliveryScheduler;
-    this.clientReleaseManager = clientReleaseManager;
     this.serverSecretParams = serverSecretParams;
     this.spamChecker = spamChecker;
-    this.messageMetrics = messageMetrics;
-    this.messageDeliveryLoopMonitor = messageDeliveryLoopMonitor;
     this.clock = clock;
   }
 
@@ -228,7 +185,10 @@ public class MessageController {
           Deliver a message to a single recipient. May be authenticated or unauthenticated; if unauthenticated,
           an unidentifed-access key or group-send endorsement token must be provided, unless the message is a story.
           """)
-  @ApiResponse(responseCode="200", description="Message was successfully sent", useReturnTypeSchema=true)
+  @ApiResponse(
+      responseCode="200", 
+      description="Message was successfully sent",
+      content = @Content(schema = @Schema(implementation = SendMessageResponse.class)))
   @ApiResponse(
       responseCode="401",
       description="The message is not a story and the authorization, unauthorized access key, or group send endorsement token is missing or incorrect")
@@ -254,7 +214,7 @@ public class MessageController {
 
       @HeaderParam(HttpHeaders.USER_AGENT) final String userAgent,
 
-      @Parameter(description="If true, deliver the message only to recipients that are online when it is sent")
+      @Parameter(description="The recipient’s account or phone-number identifier")
       @PathParam("destination") final ServiceIdentifier destinationIdentifier,
 
       @Parameter(description="If true, the message is a story; access tokens are not checked and sending to nonexistent recipients is permitted")
@@ -323,7 +283,7 @@ public class MessageController {
     final Account destination =
         accountsManager.getByServiceIdentifier(destinationIdentifier).orElseThrow(NotFoundException::new);
 
-    rateLimiters.getMessagesLimiter().validate(source.accountIdentifier(), destination.getUuid());
+    rateLimiters.getMessagesLimiter().validate(source.accountIdentifier(), destination.getAccountIdentifier());
 
     sendIndividualMessage(destination,
         destinationIdentifier,
@@ -412,7 +372,7 @@ public class MessageController {
     final Account destination = accountsManager.getByServiceIdentifier(destinationIdentifier).orElseThrow(() ->
         new WebApplicationException(Response.ok(new SendMessageResponse(false)).build()));
 
-    rateLimiters.getStoriesLimiter().validate(destination.getUuid());
+    rateLimiters.getStoriesLimiter().validate(destination.getAccountIdentifier());
 
     sendIndividualMessage(destination,
         destinationIdentifier,
@@ -445,8 +405,8 @@ public class MessageController {
     final String userAgent = context.getHeaderString(HttpHeaders.USER_AGENT);
 
     try {
-      final int totalContentLength =
-          messages.messages().stream().mapToInt(message -> message.content().length).sum();
+      final long totalContentLength =
+          messages.messages().stream().mapToLong(message -> message.content().length).sum();
 
       rateLimiters.getInboundMessageBytes().validate(destinationIdentifier.uuid(), totalContentLength);
     } catch (final RateLimitExceededException e) {
@@ -489,6 +449,12 @@ public class MessageController {
           userAgent);
     } catch (final MismatchedDevicesException e) {
       if (!e.getMismatchedDevices().staleDeviceIds().isEmpty()) {
+        if (messageType == MessageType.SYNC) {
+          Metrics.counter(INCORRECT_SYNC_MESSAGE_REGISTRATION_IDS_COUNTER_NAME,
+              Tags.of(UserAgentTagUtil.getPlatformTag(userAgent)))
+                  .increment();
+        }
+
         throw new WebApplicationException(Response.status(410)
             .type(MediaType.APPLICATION_JSON)
             .entity(new StaleDevicesResponse(e.getMismatchedDevices().staleDeviceIds()))
@@ -502,6 +468,8 @@ public class MessageController {
       }
     } catch (final MessageTooLargeException e) {
       throw new WebApplicationException(Status.REQUEST_ENTITY_TOO_LARGE);
+    } catch (final MessageDeliveryNotAllowedException e) {
+      throw new ServiceUnavailableException();
     }
   }
 
@@ -616,6 +584,8 @@ public class MessageController {
       // Group send endorsements are checked before we even attempt to resolve any accounts, since
       // the lists of service IDs in the envelope are all that we need to check against
       checkGroupSendToken(multiRecipientMessage.getRecipients().keySet(), groupSendTokenHeader);
+    } else {
+      Metrics.counter(LEGACY_COMBINED_UAK_COUNTER_NAME, Tags.of(UserAgentTagUtil.getPlatformTag(context))).increment();
     }
 
     // At this point, the caller has at least superficially provided the information needed to send a multi-recipient
@@ -672,7 +642,7 @@ public class MessageController {
 
     CompletableFuture.allOf(resolvedRecipients.values()
             .stream()
-            .map(account -> account.getIdentifier(IdentityType.ACI))
+            .map(Account::getAccountIdentifier)
             .map(accountIdentifier ->
                 rateLimiters.getStoriesLimiter().validateAsync(accountIdentifier).toCompletableFuture())
             .toList()
@@ -753,6 +723,8 @@ public class MessageController {
           .type(MediaType.APPLICATION_JSON)
           .entity(accountStaleDevices)
           .build());
+    } catch (final MessageDeliveryNotAllowedException e) {
+      throw new ServiceUnavailableException();
     }
   }
 
@@ -791,163 +763,15 @@ public class MessageController {
     }
   }
 
-  @GET
-  @Produces(MediaType.APPLICATION_JSON)
-  public CompletableFuture<OutgoingMessageEntityList> getPendingMessages(@Auth AuthenticatedDevice auth,
-      @HeaderParam(WebsocketHeaders.X_SIGNAL_RECEIVE_STORIES) String receiveStoriesHeader,
-      @HeaderParam(HttpHeaders.USER_AGENT) String userAgent) {
-
-    return accountsManager.getByAccountIdentifierAsync(auth.accountIdentifier())
-        .thenCompose(maybeAccount -> {
-          final Account account = maybeAccount.orElseThrow(() -> new WebApplicationException(Status.UNAUTHORIZED));
-          final Device device = account.getDevice(auth.deviceId())
-              .orElseThrow(() -> new WebApplicationException(Status.UNAUTHORIZED));
-
-          final boolean shouldReceiveStories = WebsocketHeaders.parseReceiveStoriesHeader(receiveStoriesHeader);
-
-          pushNotificationManager.handleMessagesRetrieved(account, device, userAgent);
-
-          return messagesManager.getMessagesForDevice(
-                  auth.accountIdentifier(),
-                  device,
-                  false)
-              .map(messagesAndHasMore -> {
-                Stream<Envelope> envelopes = messagesAndHasMore.first().stream();
-                if (!shouldReceiveStories) {
-                  envelopes = envelopes.filter(e -> !e.getStory());
-                }
-
-          final OutgoingMessageEntityList messages = new OutgoingMessageEntityList(envelopes
-              .map(OutgoingMessageEntity::fromEnvelope)
-              .peek(outgoingMessageEntity -> {
-                messageMetrics.measureAccountOutgoingMessageUuidMismatches(account, outgoingMessageEntity);
-                messageMetrics.measureOutgoingMessageLatency(outgoingMessageEntity.serverTimestamp(),
-                    "rest",
-                    auth.deviceId() == Device.PRIMARY_ID,
-                    outgoingMessageEntity.urgent(),
-                    // Messages fetched via this endpoint (as opposed to WebSocketConnection) are never ephemeral
-                    // because, by definition, the client doesn't have a "live" connection via which to receive
-                    // ephemeral messages.
-                    false,
-                    userAgent,
-                    clientReleaseManager);
-              })
-              .collect(Collectors.toList()),
-              messagesAndHasMore.second());
-
-                Metrics.summary(OUTGOING_MESSAGE_LIST_SIZE_BYTES_DISTRIBUTION_NAME, Tags.of(UserAgentTagUtil.getPlatformTag(userAgent)))
-                    .record(estimateMessageListSizeBytes(messages));
-
-                if (!messages.messages().isEmpty()) {
-                  messageDeliveryLoopMonitor.recordDeliveryAttempt(auth.accountIdentifier(),
-                      auth.deviceId(),
-                      messages.messages().getFirst().guid(),
-                      userAgent,
-                      "rest");
-                }
-
-                if (messagesAndHasMore.second()) {
-                  pushNotificationScheduler.scheduleDelayedNotification(account, device, NOTIFY_FOR_REMAINING_MESSAGES_DELAY);
-                }
-
-                return messages;
-              })
-              .timeout(Duration.ofSeconds(5))
-              .subscribeOn(messageDeliveryScheduler)
-              .toFuture();
-        });
-  }
-
-  private static long estimateMessageListSizeBytes(final OutgoingMessageEntityList messageList) {
-    long size = 0;
-
-    for (final OutgoingMessageEntity message : messageList.messages()) {
-      size += message.content() == null ? 0 : message.content().length;
-      size += message.sourceUuid() == null ? 0 : 36;
-    }
-
-    return size;
-  }
-
-  @DELETE
-  @Path("/uuid/{uuid}")
-  public CompletableFuture<Response> removePendingMessage(@Auth AuthenticatedDevice auth, @PathParam("uuid") UUID uuid) {
-    final Account account = accountsManager.getByAccountIdentifier(auth.accountIdentifier())
-        .orElseThrow(() -> new WebApplicationException(Status.UNAUTHORIZED));
-
-    final Device device = account.getDevice(auth.deviceId())
-        .orElseThrow(() -> new WebApplicationException(Status.UNAUTHORIZED));
-
-    return messagesManager.delete(
-            auth.accountIdentifier(),
-            device,
-            uuid,
-            null)
-        .thenAccept(maybeRemovedMessage -> maybeRemovedMessage.ifPresent(removedMessage -> {
-
-          WebSocketConnection.recordMessageDeliveryDuration(removedMessage.serverTimestamp(), device);
-
-          if (removedMessage.sourceServiceId().isPresent()
-              && removedMessage.envelopeType() != Type.SERVER_DELIVERY_RECEIPT) {
-            if (removedMessage.sourceServiceId().get() instanceof AciServiceIdentifier aciServiceIdentifier) {
-              try {
-                receiptSender.sendReceipt(removedMessage.destinationServiceId(), auth.deviceId(),
-                    aciServiceIdentifier, removedMessage.clientTimestamp());
-              } catch (Exception e) {
-                logger.warn("Failed to send delivery receipt", e);
-              }
-            } else {
-              // If source service ID is present and the envelope type is not a server delivery receipt, then
-              // the source service ID *should always* be an ACI -- PNIs are receive-only, so they can only be the
-              // "source" via server delivery receipts
-              logger.warn("Source service ID unexpectedly a PNI service ID");
-            }
-          }
-        }))
-        .thenApply(Util.ASYNC_EMPTY_RESPONSE);
-  }
-
   @POST
   @Consumes(MediaType.APPLICATION_JSON)
   @Path("/report/{source}/{messageGuid}")
   public Response reportSpamMessage(
       @Auth AuthenticatedDevice auth,
-      @PathParam("source") String source,
+      @PathParam("source") UUID source,
       @PathParam("messageGuid") UUID messageGuid,
       @Nullable SpamReport spamReport,
-      @HeaderParam(HttpHeaders.USER_AGENT) String userAgent
-  ) {
-    final Optional<String> sourceNumber;
-    final Optional<UUID> sourceAci;
-    final Optional<UUID> sourcePni;
-
-    if (source.startsWith("+")) {
-      sourceNumber = Optional.of(source);
-      final Optional<Account> maybeAccount = accountsManager.getByE164(source);
-      if (maybeAccount.isPresent()) {
-        sourceAci = maybeAccount.map(Account::getUuid);
-        sourcePni = maybeAccount.map(Account::getPhoneNumberIdentifier);
-      } else {
-        sourcePni = Optional.ofNullable(phoneNumberIdentifiers.getPhoneNumberIdentifier(source).join());
-        sourceAci = sourcePni.flatMap(accountsManager::findRecentlyDeletedAccountIdentifier);
-      }
-    } else {
-      sourceAci = Optional.of(UUID.fromString(source));
-
-      final Optional<Account> sourceAccount = accountsManager.getByAccountIdentifier(sourceAci.get());
-
-      if (sourceAccount.isEmpty()) {
-        logger.warn("Could not find source: {}", sourceAci.get());
-        sourcePni = accountsManager.findRecentlyDeletedPhoneNumberIdentifier(sourceAci.get());
-        sourceNumber = sourcePni.flatMap(pni ->
-            Util.getCanonicalNumber(phoneNumberIdentifiers.getPhoneNumber(pni).join()));
-      } else {
-        sourceNumber = sourceAccount.map(Account::getNumber);
-        sourcePni = sourceAccount.map(Account::getPhoneNumberIdentifier);
-      }
-    }
-
-    UUID spamReporterUuid = auth.accountIdentifier();
+      @HeaderParam(HttpHeaders.USER_AGENT) String userAgent) {
 
     // spam report token is optional, but if provided ensure it is non-empty.
     final Optional<byte[]> maybeSpamReportToken =
@@ -955,7 +779,14 @@ public class MessageController {
             .flatMap(r -> Optional.ofNullable(r.token()))
             .filter(t -> t.length > 0);
 
-    reportMessageManager.report(sourceNumber, sourceAci, sourcePni, messageGuid, spamReporterUuid, maybeSpamReportToken, userAgent);
+    ReportMessageHelper.reportMessage(new AciServiceIdentifier(source),
+        new AciServiceIdentifier(auth.accountIdentifier()),
+        messageGuid,
+        maybeSpamReportToken.orElse(null),
+        userAgent,
+        accountsManager,
+        phoneNumberIdentifiers,
+        reportMessageManager);
 
     return Response.status(Status.ACCEPTED)
         .build();

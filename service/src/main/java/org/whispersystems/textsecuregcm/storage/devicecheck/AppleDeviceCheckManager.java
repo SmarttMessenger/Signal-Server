@@ -30,12 +30,14 @@ import java.util.Base64;
 import java.util.List;
 import java.util.UUID;
 import javax.annotation.Nullable;
+import io.micrometer.core.instrument.DistributionSummary;
+import io.micrometer.core.instrument.Metrics;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.whispersystems.textsecuregcm.controllers.RateLimitExceededException;
-import org.whispersystems.textsecuregcm.limits.RateLimiters;
+import org.whispersystems.textsecuregcm.metrics.MetricsUtil;
 import org.whispersystems.textsecuregcm.redis.FaultTolerantRedisClusterClient;
 import org.whispersystems.textsecuregcm.storage.Account;
+import org.whispersystems.textsecuregcm.util.ResilienceUtil;
 
 /**
  * Register Apple DeviceCheck App Attestations and verify the corresponding assertions.
@@ -57,13 +59,17 @@ public class AppleDeviceCheckManager {
 
   // How many distinct device keys we're willing to accept for a single Account
   @VisibleForTesting
-  static final int MAX_DEVICE_KEYS = 100;
+  static final int MAX_DEVICE_KEYS = 200;
+
+  private static final String KEY_COUNT_DISTRIBUTION_NAME = MetricsUtil.name(AppleDeviceCheckManager.class, "keyCount");
 
   private final AppleDeviceChecks appleDeviceChecks;
   private final FaultTolerantRedisClusterClient redisClient;
   private final DeviceCheckManager deviceCheckManager;
   private final String teamId;
   private final String bundleId;
+
+  private static final String RETRY_NAME = ResilienceUtil.name(AppleDeviceCheckManager.class);
 
   public AppleDeviceCheckManager(
       AppleDeviceChecks appleDeviceChecks,
@@ -108,14 +114,21 @@ public class AppleDeviceCheckManager {
       return;
     }
 
+    DistributionSummary.builder(KEY_COUNT_DISTRIBUTION_NAME)
+        .register(Metrics.globalRegistry)
+        .record(existingKeys.size());
+
     if (existingKeys.size() >= MAX_DEVICE_KEYS) {
       // This is best-effort, since we don't check the number of keys transactionally. We just don't want to allow
       // the keys for an account to grow arbitrarily large
       throw new TooManyKeysException();
     }
 
-    final String redisChallengeKey = challengeKey(ChallengeType.ATTEST, account.getUuid());
-    final String challenge = redisClient.withCluster(cluster -> cluster.sync().get(redisChallengeKey));
+    final String redisChallengeKey = challengeKey(ChallengeType.ATTEST, account.getAccountIdentifier());
+
+    @Nullable final String challenge = ResilienceUtil.getGeneralRedisRetry(RETRY_NAME)
+        .executeSupplier(() -> redisClient.withCluster(cluster -> cluster.sync().get(redisChallengeKey)));
+
     if (challenge == null) {
       throw new ChallengeNotFoundException();
     }
@@ -171,8 +184,10 @@ public class AppleDeviceCheckManager {
       final byte[] assertion)
       throws ChallengeNotFoundException, DeviceCheckVerificationFailedException, DeviceCheckKeyIdNotFoundException, RequestReuseException {
 
-    final String redisChallengeKey = challengeKey(challengeType, account.getUuid());
-    final String storedChallenge = redisClient.withCluster(cluster -> cluster.sync().get(redisChallengeKey));
+    final String redisChallengeKey = challengeKey(challengeType, account.getAccountIdentifier());
+    @Nullable final String storedChallenge = ResilienceUtil.getGeneralRedisRetry(RETRY_NAME)
+            .executeSupplier(() -> redisClient.withCluster(cluster -> cluster.sync().get(redisChallengeKey)));
+
     if (storedChallenge == null) {
       throw new ChallengeNotFoundException();
     }
@@ -200,7 +215,9 @@ public class AppleDeviceCheckManager {
     }
 
     // Store the updated sign count, so we can check the next assertion (step 6)
-    appleDeviceChecks.updateCounter(account, keyId, appleDevice.getCounter());
+    if (!appleDeviceChecks.updateCounter(account, keyId, appleDevice.getCounter())) {
+      throw new RequestReuseException("Sign count from request less than stored sign count");
+    }
     removeChallenge(redisChallengeKey);
   }
 
@@ -211,29 +228,29 @@ public class AppleDeviceCheckManager {
    * @param account       The account that will use the challenge
    * @return The challenge to be included as part of an attestation or assertion
    */
-  public String createChallenge(final ChallengeType challengeType, final Account account)
-      throws RateLimitExceededException {
-    final UUID accountIdentifier = account.getUuid();
+  public String createChallenge(final ChallengeType challengeType, final Account account) {
+    final UUID accountIdentifier = account.getAccountIdentifier();
 
     final String challengeKey = challengeKey(challengeType, accountIdentifier);
-    return redisClient.withCluster(cluster -> {
-      final RedisAdvancedClusterCommands<String, String> commands = cluster.sync();
+    return ResilienceUtil.getGeneralRedisRetry(RETRY_NAME)
+        .executeSupplier(() -> redisClient.withCluster(cluster -> {
+          final RedisAdvancedClusterCommands<String, String> commands = cluster.sync();
 
-      // Sets the new challenge if and only if there isn't already one stored for the challenge key; returns the existing
-      // challenge if present or null if no challenge was previously set.
-      final String proposedChallenge = generateChallenge();
-      @Nullable final String existingChallenge =
-          commands.setGet(challengeKey, proposedChallenge, SetArgs.Builder.nx().ex(CHALLENGE_TTL));
+          // Sets the new challenge if and only if there isn't already one stored for the challenge key; returns the existing
+          // challenge if present or null if no challenge was previously set.
+          final String proposedChallenge = generateChallenge();
+          @Nullable final String existingChallenge =
+              commands.setGet(challengeKey, proposedChallenge, SetArgs.Builder.nx().ex(CHALLENGE_TTL));
 
-      if (existingChallenge != null) {
-        // If the key was already set, make sure we extend the TTL. This is racy because the key could disappear or have
-        // been updated since the get returned, but it's fine. In the former case, this is a noop. In the latter
-        // case we may slightly extend the TTL from after it was set, but that's also no big deal.
-        commands.expire(challengeKey, CHALLENGE_TTL);
-      }
+          if (existingChallenge != null) {
+            // If the key was already set, make sure we extend the TTL. This is racy because the key could disappear or have
+            // been updated since the get returned, but it's fine. In the former case, this is a noop. In the latter
+            // case we may slightly extend the TTL from after it was set, but that's also no big deal.
+            commands.expire(challengeKey, CHALLENGE_TTL);
+          }
 
-      return existingChallenge != null ? existingChallenge : proposedChallenge;
-    });
+          return existingChallenge != null ? existingChallenge : proposedChallenge;
+        }));
   }
 
   private void removeChallenge(final String challengeKey) {

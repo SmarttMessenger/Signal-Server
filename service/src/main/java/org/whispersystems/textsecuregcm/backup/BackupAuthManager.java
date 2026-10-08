@@ -5,17 +5,22 @@
 
 package org.whispersystems.textsecuregcm.backup;
 
-import io.grpc.Status;
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.security.MessageDigest;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
-import java.util.stream.Stream;
+import java.util.stream.StreamSupport;
 import javax.annotation.Nullable;
 import org.signal.libsignal.zkgroup.GenericServerSecretParams;
 import org.signal.libsignal.zkgroup.InvalidInputException;
@@ -29,14 +34,15 @@ import org.signal.libsignal.zkgroup.receipts.ReceiptSerial;
 import org.signal.libsignal.zkgroup.receipts.ServerZkReceiptOperations;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.whispersystems.textsecuregcm.auth.RedemptionRange;
 import org.whispersystems.textsecuregcm.controllers.RateLimitExceededException;
 import org.whispersystems.textsecuregcm.experiment.ExperimentEnrollmentManager;
+import org.whispersystems.textsecuregcm.limits.RateLimiter;
 import org.whispersystems.textsecuregcm.limits.RateLimiters;
 import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.storage.AccountsManager;
 import org.whispersystems.textsecuregcm.storage.Device;
 import org.whispersystems.textsecuregcm.storage.RedeemedReceiptsManager;
-import org.whispersystems.textsecuregcm.util.Util;
 
 /**
  * Issues ZK backup auth credentials for authenticated accounts
@@ -53,8 +59,6 @@ public class BackupAuthManager {
   private static final Logger logger = LoggerFactory.getLogger(BackupAuthManager.class);
 
 
-  final static Duration MAX_REDEMPTION_DURATION = Duration.ofDays(7);
-  final static String BACKUP_EXPERIMENT_NAME = "backup";
   final static String BACKUP_MEDIA_EXPERIMENT_NAME = "backupMedia";
 
   private final ExperimentEnrollmentManager experimentEnrollmentManager;
@@ -91,51 +95,82 @@ public class BackupAuthManager {
    *                                        message backups
    * @param mediaBackupCredentialRequest    A request containing the blinded backup-id the client will use to upload
    *                                        media backups
-   * @return A future that completes when the credentialRequest has been stored
    * @throws RateLimitExceededException If too many backup-ids have been committed
    */
-  public CompletableFuture<Void> commitBackupId(
+  public void commitBackupId(
       final Account account,
       final Device device,
-      final BackupAuthCredentialRequest messagesBackupCredentialRequest,
-      final BackupAuthCredentialRequest mediaBackupCredentialRequest) {
-    if (configuredBackupLevel(account).isEmpty()) {
-      throw Status.PERMISSION_DENIED.withDescription("Backups not allowed on account").asRuntimeException();
-    }
+      final Optional<BackupAuthCredentialRequest> messagesBackupCredentialRequest,
+      final Optional<BackupAuthCredentialRequest> mediaBackupCredentialRequest)
+      throws RateLimitExceededException, BackupPermissionException, BackupInvalidArgumentException {
     if (!device.isPrimary()) {
-      throw Status.PERMISSION_DENIED.withDescription("Only primary device can set backup-id").asRuntimeException();
+      throw new BackupPermissionException("Only primary device can set backup-id");
     }
-    final byte[] serializedMessageCredentialRequest = messagesBackupCredentialRequest.serialize();
-    final byte[] serializedMediaCredentialRequest = mediaBackupCredentialRequest.serialize();
 
-    final boolean messageCredentialRequestMatches = account.getBackupCredentialRequest(BackupCredentialType.MESSAGES)
-        .map(storedCredentialRequest -> MessageDigest.isEqual(storedCredentialRequest, serializedMessageCredentialRequest))
-        .orElse(false);
+    if (messagesBackupCredentialRequest.isEmpty() && mediaBackupCredentialRequest.isEmpty()) {
+      throw new BackupInvalidArgumentException("Must set at least one of message/media credential requests");
+    }
 
-    final boolean mediaCredentialRequestMatches = account.getBackupCredentialRequest(BackupCredentialType.MEDIA)
-        .map(storedCredentialRequest -> MessageDigest.isEqual(storedCredentialRequest, serializedMediaCredentialRequest))
-        .orElse(false);
+    final byte[] storedMessageCredentialRequest = account.getBackupCredentialRequest(BackupCredentialType.MESSAGES)
+        .orElse(null);
+    final byte[] storedMediaCredentialRequest = account.getBackupCredentialRequest(BackupCredentialType.MEDIA)
+        .orElse(null);
 
-    if (messageCredentialRequestMatches && mediaCredentialRequestMatches) {
+    // If the provided credential request is null, we want to set to the existing request
+    final byte[] targetMessageCredentialRequest = messagesBackupCredentialRequest
+        .map(BackupAuthCredentialRequest::serialize)
+        .orElse(storedMessageCredentialRequest);
+    final byte[] targetMediaCredentialRequest = mediaBackupCredentialRequest
+        .map(BackupAuthCredentialRequest::serialize)
+        .orElse(storedMediaCredentialRequest);
+
+    final boolean requiresMessageRotation =
+        !MessageDigest.isEqual(targetMessageCredentialRequest, storedMessageCredentialRequest);
+    final boolean requiresMediaRotation =
+        !MessageDigest.isEqual(targetMediaCredentialRequest, storedMediaCredentialRequest);
+
+    if (!requiresMessageRotation && !requiresMediaRotation) {
       // No need to update or enforce rate limits, this is the credential that the user has already
       // committed to.
-      return CompletableFuture.completedFuture(null);
+      return;
     }
 
-    CompletionStage<Void> rateLimitFuture = rateLimiters
-        .forDescriptor(RateLimiters.For.SET_BACKUP_ID)
-        .validateAsync(account.getUuid());
-
-    if (!mediaCredentialRequestMatches && hasActiveVoucher(account)) {
-      rateLimitFuture = rateLimitFuture.thenCombine(
-          rateLimiters.forDescriptor(RateLimiters.For.SET_PAID_MEDIA_BACKUP_ID).validateAsync(account.getUuid()),
-          (ignore1, ignore2) -> null);
+    if (requiresMessageRotation) {
+      rateLimiters.forDescriptor(RateLimiters.For.SET_BACKUP_ID).validate(account.getAccountIdentifier());
     }
 
-    return rateLimitFuture.thenCompose(ignored -> this.accountsManager
-            .updateAsync(account, a -> a.setBackupCredentialRequests(serializedMessageCredentialRequest, serializedMediaCredentialRequest))
-            .thenRun(Util.NOOP))
-        .toCompletableFuture();
+    if (requiresMediaRotation && hasActiveVoucher(account)) {
+      rateLimiters.forDescriptor(RateLimiters.For.SET_PAID_MEDIA_BACKUP_ID).validate(account.getAccountIdentifier());
+    }
+
+    this.accountsManager.update(account, a ->
+        a.setBackupCredentialRequests(targetMessageCredentialRequest, targetMediaCredentialRequest));
+  }
+
+  public record BackupIdRotationLimit(boolean hasPermitsRemaining, Duration nextPermitAvailable) {}
+
+  public BackupIdRotationLimit checkBackupIdRotationLimit(final Account account) {
+    final RateLimiter messagesLimiter = rateLimiters.forDescriptor(RateLimiters.For.SET_BACKUP_ID);
+    final RateLimiter mediaLimiter = rateLimiters.forDescriptor(RateLimiters.For.SET_PAID_MEDIA_BACKUP_ID);
+
+    final boolean isPaid = hasActiveVoucher(account);
+
+    final CompletionStage<Boolean> hasSetMessagesPermits =
+        messagesLimiter.hasAvailablePermitsAsync(account.getAccountIdentifier(), 1);
+    final CompletionStage<Boolean> hasSetMediaPermits = isPaid
+        ? mediaLimiter.hasAvailablePermitsAsync(account.getAccountIdentifier(), 1)
+        : CompletableFuture.completedFuture(true);
+
+    return hasSetMessagesPermits.thenCombine(hasSetMediaPermits, (hasMessage, hasMedia) -> {
+      if (hasMedia && hasMessage) {
+        return new BackupIdRotationLimit(true, Duration.ZERO);
+      } else {
+        final Duration timeToNextPermit = Collections.max(Arrays.asList(
+            messagesLimiter.config().permitRegenerationDuration(),
+            isPaid ? mediaLimiter.config().permitRegenerationDuration() : Duration.ZERO));
+        return new BackupIdRotationLimit(false, timeToNextPermit);
+      }
+    }).toCompletableFuture().join();
   }
 
   public record Credential(BackupAuthCredentialResponse credential, Instant redemptionTime) {}
@@ -150,66 +185,53 @@ public class BackupAuthManager {
    * voucher's expiration will include paid backup access. If the BackupVoucher exists but is already expired, this
    * method will also remove the expired voucher from the account.
    *
-   * @param account         The account to create the credentials for
-   * @param credentialType  The type of backup credentials to create
-   * @param redemptionStart The day (must be truncated to a day boundary) the first credential should be valid
-   * @param redemptionEnd   The day (must be truncated to a day boundary) the last credential should be valid
+   * @param originalAccount The account to create the credentials for
+   * @param redemptionRange The time range to return credentials for
    * @return Credentials and the day on which they may be redeemed
    */
-  public CompletableFuture<List<Credential>> getBackupAuthCredentials(
-      final Account account,
-      final BackupCredentialType credentialType,
-      final Instant redemptionStart,
-      final Instant redemptionEnd) {
-
+  public Map<BackupCredentialType, List<Credential>> getBackupAuthCredentials(
+      final Account originalAccount,
+      final RedemptionRange redemptionRange) throws BackupNotFoundException {
     // If the account has an expired payment, clear it before continuing
-    if (hasExpiredVoucher(account)) {
-      return accountsManager.updateAsync(account, a -> {
+    final Account account;
+    if (hasExpiredVoucher(originalAccount)) {
+      account = accountsManager.update(originalAccount, a -> {
         // Re-check in case we raced with an update
         if (hasExpiredVoucher(a)) {
           a.setBackupVoucher(null);
         }
-      }).thenCompose(updated -> getBackupAuthCredentials(updated, credentialType, redemptionStart, redemptionEnd));
+      });
+    } else {
+      account = originalAccount;
     }
 
-    // If this account isn't allowed some level of backup access via configuration, don't continue
-    final BackupLevel configuredBackupLevel = configuredBackupLevel(account).orElseThrow(() ->
-        Status.PERMISSION_DENIED.withDescription("Backups not allowed on account").asRuntimeException());
+    final Map<BackupCredentialType, List<Credential>> credentials = new HashMap<>();
+    for (BackupCredentialType credentialType : BackupCredentialType.values()) {
+      // fetch the blinded backup-id the account should have previously committed to
+      final byte[] committedBytes = account.getBackupCredentialRequest(credentialType)
+          .orElseThrow(() -> new BackupNotFoundException("No blinded backup-id has been added to the account"));
 
-    final Instant startOfDay = clock.instant().truncatedTo(ChronoUnit.DAYS);
-    if (redemptionStart.isAfter(redemptionEnd) ||
-        redemptionStart.isBefore(startOfDay) ||
-        redemptionEnd.isAfter(startOfDay.plus(MAX_REDEMPTION_DURATION)) ||
-        !redemptionStart.equals(redemptionStart.truncatedTo(ChronoUnit.DAYS)) ||
-        !redemptionEnd.equals(redemptionEnd.truncatedTo(ChronoUnit.DAYS))) {
+      try {
+        final BackupLevel defaultBackupLevel = configuredBackupLevel(account);
 
-      throw Status.INVALID_ARGUMENT.withDescription("invalid redemption window").asRuntimeException();
+        // create a credential for every day in the requested period
+        final BackupAuthCredentialRequest credentialReq = new BackupAuthCredentialRequest(committedBytes);
+        final List<Credential> credentialList = StreamSupport.stream(redemptionRange.spliterator(), false)
+            .map(redemptionTime -> {
+              // Check if the account has a voucher that's good for a certain receiptLevel at redemption time, otherwise
+              // use the default receipt level
+              final BackupLevel backupLevel = storedBackupLevel(account, redemptionTime).orElse(defaultBackupLevel);
+              return new Credential(
+                  credentialReq.issueCredential(redemptionTime, backupLevel, credentialType, serverSecretParams),
+                  redemptionTime);
+            })
+            .toList();
+        credentials.put(credentialType, credentialList);
+      } catch (InvalidInputException e) {
+        throw new UncheckedIOException(new IOException("Could not deserialize stored request credential", e));
+      }
     }
-
-    // fetch the blinded backup-id the account should have previously committed to
-    final byte[] committedBytes = account.getBackupCredentialRequest(credentialType)
-        .orElseThrow(() -> Status.NOT_FOUND.withDescription("No blinded backup-id has been added to the account").asRuntimeException());
-
-    try {
-      // create a credential for every day in the requested period
-      final BackupAuthCredentialRequest credentialReq = new BackupAuthCredentialRequest(committedBytes);
-      return CompletableFuture.completedFuture(Stream
-          .iterate(redemptionStart, redemptionTime -> !redemptionTime.isAfter(redemptionEnd), curr -> curr.plus(Duration.ofDays(1)))
-          .map(redemptionTime -> {
-            // Check if the account has a voucher that's good for a certain receiptLevel at redemption time, otherwise
-            // use the default receipt level
-            final BackupLevel backupLevel = storedBackupLevel(account, redemptionTime).orElse(configuredBackupLevel);
-            return new Credential(
-                credentialReq.issueCredential(redemptionTime, backupLevel, credentialType, serverSecretParams),
-                redemptionTime);
-          })
-          .toList());
-    } catch (InvalidInputException e) {
-      throw Status.INTERNAL
-          .withDescription("Could not deserialize stored request credential")
-          .withCause(e)
-          .asRuntimeException();
-    }
+    return credentials;
   }
 
   /**
@@ -217,48 +239,38 @@ public class BackupAuthManager {
    *
    * @param account                       The account to enable backups on
    * @param receiptCredentialPresentation A ZK receipt presentation proving payment
-   * @return A future that completes successfully when the account has been updated
    */
-  public CompletableFuture<Void> redeemReceipt(
+  public void redeemReceipt(
       final Account account,
-      final ReceiptCredentialPresentation receiptCredentialPresentation) {
+      final ReceiptCredentialPresentation receiptCredentialPresentation)
+      throws BackupBadReceiptException, BackupInvalidArgumentException, BackupMissingIdCommitmentException {
     try {
       serverZkReceiptOperations.verifyReceiptCredentialPresentation(receiptCredentialPresentation);
     } catch (VerificationFailedException e) {
-      throw Status.INVALID_ARGUMENT
-          .withDescription("receipt credential presentation verification failed")
-          .asRuntimeException();
+      throw new BackupBadReceiptException("receipt credential presentation verification failed");
     }
     final ReceiptSerial receiptSerial = receiptCredentialPresentation.getReceiptSerial();
     final Instant receiptExpiration = Instant.ofEpochSecond(receiptCredentialPresentation.getReceiptExpirationTime());
     if (clock.instant().isAfter(receiptExpiration)) {
-      throw Status.INVALID_ARGUMENT.withDescription("receipt is already expired").asRuntimeException();
+      throw new BackupBadReceiptException("receipt is already expired");
     }
 
     final long receiptLevel = receiptCredentialPresentation.getReceiptLevel();
 
     if (BackupLevelUtil.fromReceiptLevel(receiptLevel) != BackupLevel.PAID) {
-      throw Status.INVALID_ARGUMENT
-          .withDescription("server does not recognize the requested receipt level")
-          .asRuntimeException();
+      throw new BackupInvalidArgumentException("server does not recognize the requested receipt level");
     }
 
     if (account.getBackupCredentialRequest(BackupCredentialType.MEDIA).isEmpty()) {
-      throw Status.ABORTED
-          .withDescription("account must have a backup-id commitment")
-          .asRuntimeException();
+      throw new BackupMissingIdCommitmentException();
     }
 
-    return redeemedReceiptsManager
-        .put(receiptSerial, receiptExpiration.getEpochSecond(), receiptLevel, account.getUuid())
-        .thenCompose(receiptAllowed -> {
-          if (!receiptAllowed) {
-            throw Status.INVALID_ARGUMENT
-                .withDescription("receipt serial is already redeemed")
-                .asRuntimeException();
-          }
-          return extendBackupVoucher(account, new Account.BackupVoucher(receiptLevel, receiptExpiration));
-        });
+    boolean receiptAllowed = redeemedReceiptsManager
+        .put(receiptSerial, receiptExpiration, receiptLevel, account.getAccountIdentifier());
+    if (!receiptAllowed) {
+      throw new BackupBadReceiptException("receipt serial is already redeemed");
+    }
+    extendBackupVoucher(account, new Account.BackupVoucher(receiptLevel, receiptExpiration));
   }
 
   /**
@@ -266,19 +278,17 @@ public class BackupAuthManager {
    *
    * @param account The account to update
    * @param backupVoucher The backup voucher to apply to this account
-   * @return A future that completes once the account has been updated to have at least the level and expiration
-   * in the provided voucher.
    */
-  public CompletableFuture<Void> extendBackupVoucher(final Account account, final Account.BackupVoucher backupVoucher) {
-    return accountsManager.updateAsync(account, a -> {
+  public void extendBackupVoucher(final Account account, final Account.BackupVoucher backupVoucher) {
+    accountsManager.update(account, a -> {
       // Receipt credential expirations must be day aligned. Make sure any manually set backupVoucher is also day
       // aligned
-      final Account.BackupVoucher newPayment =  new Account.BackupVoucher(
+      final Account.BackupVoucher newPayment = new Account.BackupVoucher(
           backupVoucher.receiptLevel(),
           backupVoucher.expiration().truncatedTo(ChronoUnit.DAYS));
       final Account.BackupVoucher existingPayment = a.getBackupVoucher();
       a.setBackupVoucher(merge(existingPayment, newPayment));
-    }).thenRun(Util.NOOP);
+    });
   }
 
   private static Account.BackupVoucher merge(@Nullable final Account.BackupVoucher prev,
@@ -328,20 +338,12 @@ public class BackupAuthManager {
    * Get the backup receipt level that should be used by default for this account determined via configuration.
    *
    * @param account the account to check
-   * @return If present, the default receipt level that should be used for the account if the account does not have a
-   * BackupVoucher. Empty if the account should never have backup access
+   * @return The default receipt level that should be used for the account if the account does not have a
+   * BackupVoucher.
    */
-  private Optional<BackupLevel> configuredBackupLevel(final Account account) {
-    if (inExperiment(BACKUP_MEDIA_EXPERIMENT_NAME, account)) {
-      return Optional.of(BackupLevel.PAID);
-    }
-    if (inExperiment(BACKUP_EXPERIMENT_NAME, account)) {
-      return Optional.of(BackupLevel.FREE);
-    }
-    return Optional.empty();
-  }
-
-  private boolean inExperiment(final String experimentName, final Account account) {
-    return this.experimentEnrollmentManager.isEnrolled(account.getUuid(), experimentName);
+  private BackupLevel configuredBackupLevel(final Account account) {
+    return this.experimentEnrollmentManager.isEnrolled(account.getAccountIdentifier(), BACKUP_MEDIA_EXPERIMENT_NAME)
+        ? BackupLevel.PAID
+        : BackupLevel.FREE;
   }
 }

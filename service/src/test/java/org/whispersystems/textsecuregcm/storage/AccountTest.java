@@ -16,20 +16,32 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 import static org.whispersystems.textsecuregcm.tests.util.DevicesHelper.createDevice;
 
+import com.eatthepath.otp.HmacOneTimePasswordGenerator;
+import com.eatthepath.otp.TimeBasedOneTimePasswordGenerator;
 import com.fasterxml.jackson.annotation.JsonFilter;
 import java.lang.annotation.Annotation;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.Arrays;
+import java.util.Base64;
 import java.util.Collections;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
+import org.whispersystems.textsecuregcm.auth.StoredRegistrationLock;
 import org.whispersystems.textsecuregcm.tests.util.AccountsHelper;
+import org.whispersystems.textsecuregcm.util.SystemMapper;
 import org.whispersystems.textsecuregcm.util.TestClock;
+import org.whispersystems.textsecuregcm.util.TestRandomUtil;
 
 class AccountTest {
 
@@ -38,8 +50,6 @@ class AccountTest {
   private final Device agingSecondaryDevice = mock(Device.class);
   private final Device recentSecondaryDevice = mock(Device.class);
   private final Device oldSecondaryDevice = mock(Device.class);
-  private final Device deleteSyncCapableDevice = mock(Device.class);
-  private final Device deleteSyncIncapableDevice = mock(Device.class);
 
   @BeforeEach
   void setup() {
@@ -58,12 +68,6 @@ class AccountTest {
 
     when(oldSecondaryDevice.getLastSeen()).thenReturn(System.currentTimeMillis() - TimeUnit.DAYS.toMillis(366));
     when(oldSecondaryDevice.getId()).thenReturn(deviceId2);
-
-    when(deleteSyncCapableDevice.getId()).thenReturn((byte) 1);
-    when(deleteSyncCapableDevice.hasCapability(DeviceCapability.DELETE_SYNC)).thenReturn(true);
-
-    when(deleteSyncIncapableDevice.getId()).thenReturn((byte) 2);
-    when(deleteSyncIncapableDevice.hasCapability(DeviceCapability.DELETE_SYNC)).thenReturn(false);
   }
 
   @Test
@@ -106,6 +110,20 @@ class AccountTest {
   }
 
   @Test
+  void testSetRegistrationLockWithNoPhoneNumber() {
+    final Account numberlessAccount =
+        AccountsHelper.generateTestAccount(null, UUID.randomUUID(), null, List.of(recentPrimaryDevice), null);
+
+    assertThrows(IllegalArgumentException.class, () -> numberlessAccount.setRegistrationLock("hash", "salt"),
+        "Accounts without phone numbers should never have a registration lock");
+
+    assertDoesNotThrow(() -> numberlessAccount.setRegistrationLock(null, null),
+        "Clearing a registration lock an account never had should be a no-op");
+
+    assertEquals(StoredRegistrationLock.Status.ABSENT, numberlessAccount.getRegistrationLock().getStatus());
+  }
+
+  @Test
   void testDiscoverableByPhoneNumber() {
     final Account account = AccountsHelper.generateTestAccount("+14152222222", UUID.randomUUID(), UUID.randomUUID(), List.of(recentPrimaryDevice),
         "1234".getBytes());
@@ -118,18 +136,26 @@ class AccountTest {
 
     account.setDiscoverableByPhoneNumber(true);
     assertTrue(account.isDiscoverableByPhoneNumber());
+
+    final Account numberlessAccount = AccountsHelper.generateTestAccount(null, UUID.randomUUID(), null, List.of(recentPrimaryDevice), null);
+    assertFalse(numberlessAccount.isDiscoverableByPhoneNumber());
+
+    numberlessAccount.setDiscoverableByPhoneNumber(true);
+    assertFalse(numberlessAccount.isDiscoverableByPhoneNumber(),
+        "Accounts without phone numbers should never be discoverable by phone number");
   }
 
   @Test
-  void isDeleteSyncSupported() {
-    assertTrue(AccountsHelper.generateTestAccount("+18005551234", UUID.randomUUID(), UUID.randomUUID(),
-        List.of(deleteSyncCapableDevice),
-        "1234".getBytes(StandardCharsets.UTF_8)).hasCapability(DeviceCapability.DELETE_SYNC));
+  void hardcodedCapabilities() {
+    final Device mockDevice = mock(Device.class);
+    when(mockDevice.getId()).thenReturn(Device.PRIMARY_ID);
+
     assertFalse(AccountsHelper.generateTestAccount("+18005551234", UUID.randomUUID(), UUID.randomUUID(),
-        List.of(deleteSyncIncapableDevice, deleteSyncCapableDevice),
-        "1234".getBytes(StandardCharsets.UTF_8)).hasCapability(DeviceCapability.DELETE_SYNC));
+        List.of(mockDevice),
+        "1234".getBytes(StandardCharsets.UTF_8)).hasCapability(DeviceCapability.TRANSFER));
   }
 
+  @Test
   void stale() {
     final Account account = AccountsHelper.generateTestAccount("+14151234567", UUID.randomUUID(), UUID.randomUUID(), Collections.emptyList(),
         new byte[0]);
@@ -139,7 +165,7 @@ class AccountTest {
     account.markStale();
 
     assertThrows(AssertionError.class, account::getNumber);
-    assertDoesNotThrow(account::getUuid);
+    assertDoesNotThrow(account::getAccountIdentifier);
   }
 
   @Test
@@ -236,5 +262,91 @@ class AccountTest {
     assertTrue(maybeJsonFilterAnnotation.isPresent());
     final JsonFilter jsonFilterAnnotation = (JsonFilter) maybeJsonFilterAnnotation.get();
     assertEquals(Account.class.getSimpleName(), jsonFilterAnnotation.value());
+  }
+
+  @Test
+  public void testProfileVersionRoundTrip() throws Exception {
+    final Account account = AccountsHelper.generateTestAccount("+12345678901", UUID.randomUUID(), UUID.randomUUID(), List.of(createDevice(Device.PRIMARY_ID)), new byte[0]);
+    final byte[] version = TestRandomUtil.nextBytes(32);
+    account.setCurrentProfileVersion(version);
+
+    final String json = SystemMapper.jsonMapper().writeValueAsString(account);
+    final Account deserialized = SystemMapper.jsonMapper().readValue(json, Account.class);
+    assertThat(deserialized.getCurrentProfileVersion()).isPresent().hasValue(version);
+  }
+
+  @Test
+  public void testAuthCredentialSaltRoundTrip() throws Exception {
+    final Account account = AccountsHelper.generateTestAccount("+12345678901", UUID.randomUUID(), UUID.randomUUID(), List.of(createDevice(Device.PRIMARY_ID)), new byte[0]);
+    assertThat(account.getAuthCredentialSalt()).isEmpty();
+
+    final byte[] authCredentialSalt = TestRandomUtil.nextBytes(16);
+    account.setAuthCredentialSalt(authCredentialSalt);
+
+    final String json = SystemMapper.jsonMapper().writeValueAsString(account);
+    final Account deserialized = SystemMapper.jsonMapper().readValue(json, Account.class);
+    assertThat(deserialized.getAuthCredentialSalt()).hasValue(authCredentialSalt);
+  }
+
+  @Test
+  public void testProfileVersionDeserialization() throws Exception {
+      final byte[] version = TestRandomUtil.nextBytes(32);
+      final String jsonTemplate = """
+          {"cpv": "%s"}
+      """;
+
+      final Account deserializedHexCpv = SystemMapper.jsonMapper().readValue(String.format(jsonTemplate, HexFormat.of().formatHex(version)), Account.class);
+      assertThat(deserializedHexCpv.getCurrentProfileVersion()).isPresent().hasValue(version);
+      final Account deserializedBase64Cpv = SystemMapper.jsonMapper().readValue(String.format(jsonTemplate, Base64.getEncoder().encodeToString(version)), Account.class);
+      assertThat(deserializedBase64Cpv.getCurrentProfileVersion()).isPresent().hasValue(version);
+  }
+
+  @ParameterizedTest
+  @MethodSource
+  void getNextTotpKeyId(final List<Byte> existingKeyIds, final byte expectedNextKeyId) {
+    final Account account = new Account();
+    account.setMfaKeys(existingKeyIds.stream()
+        .collect(Collectors.toMap(keyId -> keyId, _ -> new AnnotatedTotpKey(new TotpKey(
+            new TotpParameters(
+                TimeBasedOneTimePasswordGenerator.TOTP_ALGORITHM_HMAC_SHA256,
+                HmacOneTimePasswordGenerator.DEFAULT_PASSWORD_LENGTH,
+                TimeBasedOneTimePasswordGenerator.DEFAULT_TIME_STEP),
+            TestRandomUtil.nextBytes(16)),
+            TestRandomUtil.nextBytes(16)))));
+
+    assertEquals(expectedNextKeyId, account.getNextMfaKeyId());
+  }
+
+  private static List<Arguments> getNextTotpKeyId() {
+    final byte unclaimedId = 17;
+
+    final List<Byte> mostIdsTaken = IntStream.range(0, Account.MAX_MFA_KEY_ID)
+        .filter(i -> i != unclaimedId)
+        .mapToObj(i -> (byte) i)
+        .toList();
+
+    return List.of(
+        Arguments.argumentSet("No existing keys", List.of(), (byte) 0),
+        Arguments.argumentSet("Single existing key", List.of((byte) 0), (byte) 1),
+        Arguments.argumentSet("Multiple existing keys", List.of((byte) 0, (byte) 1), (byte) 2),
+        Arguments.argumentSet("ID wraparound", List.of((byte) 0, (byte) 255), (byte) 1),
+        Arguments.argumentSet("Most IDs taken", mostIdsTaken, unclaimedId)
+    );
+  }
+
+  @Test
+  void getNextTotpKeyNoneAvailable() {
+    final Account account = new Account();
+    account.setMfaKeys(IntStream.range(0, Account.MAX_MFA_KEY_ID + 1)
+        .mapToObj(i -> (byte) i)
+        .collect(Collectors.toMap(keyId -> keyId, _ -> new AnnotatedTotpKey(new TotpKey(
+            new TotpParameters(
+                TimeBasedOneTimePasswordGenerator.TOTP_ALGORITHM_HMAC_SHA1,
+                HmacOneTimePasswordGenerator.DEFAULT_PASSWORD_LENGTH,
+                TimeBasedOneTimePasswordGenerator.DEFAULT_TIME_STEP),
+            TestRandomUtil.nextBytes(16)),
+            TestRandomUtil.nextBytes(16)))));
+
+    assertThrows(IllegalStateException.class, account::getNextMfaKeyId);
   }
 }

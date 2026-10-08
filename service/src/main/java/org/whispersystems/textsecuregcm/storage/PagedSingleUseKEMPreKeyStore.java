@@ -7,6 +7,7 @@ package org.whispersystems.textsecuregcm.storage;
 
 import static org.whispersystems.textsecuregcm.metrics.MetricsUtil.name;
 
+import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.DistributionSummary;
 import io.micrometer.core.instrument.Metrics;
 import io.micrometer.core.instrument.Timer;
@@ -29,6 +30,7 @@ import org.whispersystems.textsecuregcm.entities.KEMSignedPreKey;
 import org.whispersystems.textsecuregcm.util.AttributeValues;
 import org.whispersystems.textsecuregcm.util.ExceptionUtils;
 import org.whispersystems.textsecuregcm.util.Util;
+import org.whispersystems.textsecuregcm.util.logging.ImpossibleEvents;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import software.amazon.awssdk.core.async.AsyncRequestBody;
@@ -51,11 +53,11 @@ import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 import software.amazon.awssdk.services.s3.model.S3Object;
 
 /**
- * @implNote This version of a {@link SingleUsePreKeyStore} store bundles prekeys into "pages", which are stored in on
+ * @implNote This an analog of {@link SingleUseECPreKeyStore} store bundles prekeys into "pages", which are stored in on
  * an object store and referenced via dynamodb. Each device may only have a single active page at a time. Crashes or
  * errors may leave orphaned pages which are no longer referenced by the database. A background process must
  * periodically check for orphaned pages and remove them.
- * @see SingleUsePreKeyStore
+ * @see SingleUseECPreKeyStore
  */
 public class PagedSingleUseKEMPreKeyStore {
 
@@ -71,9 +73,9 @@ public class PagedSingleUseKEMPreKeyStore {
   private final Timer deleteForDeviceTimer = Metrics.timer(name(getClass(), "deleteForDevice"));
   private final Timer deleteForAccountTimer = Metrics.timer(name(getClass(), "deleteForAccount"));
 
+  private final Counter outOfRangeKeysDiscarded = Metrics.counter(name(getClass(), "outOfRangeKeysDiscarded"));
   final DistributionSummary availableKeyCountDistributionSummary = DistributionSummary
       .builder(name(getClass(), "availableKeyCount"))
-      .publishPercentileHistogram()
       .register(Metrics.globalRegistry);
 
   private final String takeKeyTimerName = name(getClass(), "takeKey");
@@ -160,7 +162,14 @@ public class PagedSingleUseKEMPreKeyStore {
    */
   public CompletableFuture<Optional<KEMSignedPreKey>> take(final UUID identifier, final byte deviceId) {
     final Timer.Sample sample = Timer.start();
+    return takeHelper(identifier, deviceId)
+        .whenComplete((maybeKey, throwable) ->
+            sample.stop(Metrics.timer(
+                takeKeyTimerName,
+                KEY_PRESENT_TAG_NAME, String.valueOf(maybeKey != null && maybeKey.isPresent()))));
+  }
 
+  private CompletableFuture<Optional<KEMSignedPreKey>> takeHelper(final UUID identifier, final byte deviceId) {
     return dynamoDbAsyncClient.updateItem(UpdateItemRequest.builder()
             .tableName(tableName)
             .key(Map.of(
@@ -197,10 +206,15 @@ public class PagedSingleUseKEMPreKeyStore {
         .exceptionally(ExceptionUtils.exceptionallyHandler(
             ConditionalCheckFailedException.class,
             e -> Optional.empty()))
-        .whenComplete((maybeKey, throwable) ->
-            sample.stop(Metrics.timer(
-                takeKeyTimerName,
-                KEY_PRESENT_TAG_NAME, String.valueOf(maybeKey != null && maybeKey.isPresent()))));
+        .thenCompose(maybeKey -> {
+          if (!maybeKey.map(KEMSignedPreKey::keyId).map(KeyIdUtil::keyIdValid).orElse(true)) {
+            // At some point we did not validate that keyIds fit in an unsigned 32-bit integer, which clients require.
+            // This keyId was invalid, so just recursively fetch the next key
+            outOfRangeKeysDiscarded.increment();
+            return takeHelper(identifier, deviceId);
+          }
+          return CompletableFuture.completedFuture(maybeKey);
+        });
   }
 
   /**
@@ -232,7 +246,7 @@ public class PagedSingleUseKEMPreKeyStore {
           final int numKeys = AttributeValues.getInt(getResponse.item(), ATTR_PAGE_NUM_KEYS, -1);
           final int index = AttributeValues.getInt(getResponse.item(), ATTR_PAGE_IDX, -1);
           if (numKeys < 0 || index < 0 || index > numKeys) {
-            log.error("unexpected index/length in page descriptor: {}", getResponse.item());
+            ImpossibleEvents.logImpossible(log, "unexpected index/length in page descriptor: {}", getResponse.item());
             return 0;
           }
 
@@ -342,7 +356,7 @@ public class PagedSingleUseKEMPreKeyStore {
           final byte deviceId = (byte) AttributeValues.getInt(item, KEY_DEVICE_ID, -1);
           final UUID pageId = AttributeValues.getUUID(item, ATTR_PAGE_ID, null);
           if (aci == null || deviceId < 0 || pageId == null) {
-            log.error("can't delete page from unexpected page descriptor {}", item);
+            ImpossibleEvents.logImpossible(log, "can't delete page from unexpected page descriptor {}", item);
           }
           return Mono.fromFuture(deleteBundleFromS3(aci, deviceId, pageId))
               .thenReturn(Map.of(
@@ -416,7 +430,7 @@ public class PagedSingleUseKEMPreKeyStore {
         .thenApply(bytes -> {
           final ByteBuffer serialized = bytes.asByteBuffer();
           if (serialized.remaining() != keyLocation.length()) {
-            log.error("Unexpected ranged read response, requested {} got {} for offset {} in page {}",
+            ImpossibleEvents.logImpossible(log, "Unexpected ranged read response, requested {} got {} for offset {} in page {}",
                 keyLocation.length(), serialized.remaining(), keyLocation, s3Key(identifier, deviceId, pageId));
             throw new CompletionException(new IOException("Invalid response to ranged read"));
           }

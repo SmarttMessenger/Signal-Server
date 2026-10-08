@@ -5,14 +5,11 @@
 
 package org.whispersystems.textsecuregcm.grpc.validators;
 
-import static org.whispersystems.textsecuregcm.grpc.validators.ValidatorUtils.invalidArgument;
-
 import com.google.protobuf.Descriptors;
-import io.grpc.StatusException;
 import java.util.Set;
 import org.signal.chat.require.ValueRangeConstraint;
 
-public class RangeFieldValidator extends BaseFieldValidator<Range> {
+public class RangeFieldValidator extends FieldValidator<Range> {
 
   private static final Set<Descriptors.FieldDescriptor.Type> UNSIGNED_TYPES = Set.of(
       Descriptors.FieldDescriptor.Type.FIXED32,
@@ -37,7 +34,7 @@ public class RangeFieldValidator extends BaseFieldValidator<Range> {
   }
 
   @Override
-  protected Range resolveExtensionValue(final Object extensionValue) throws StatusException {
+  protected Range resolveExtensionValue(final Object extensionValue) {
     final ValueRangeConstraint rangeConstraint = (ValueRangeConstraint) extensionValue;
     final long min = rangeConstraint.hasMin() ? rangeConstraint.getMin() : Long.MIN_VALUE;
     final long max = rangeConstraint.hasMax() ? rangeConstraint.getMax() : Long.MAX_VALUE;
@@ -48,13 +45,13 @@ public class RangeFieldValidator extends BaseFieldValidator<Range> {
   protected void validateIntegerNumber(
       final Range range,
       final long fieldValue,
-      final Descriptors.FieldDescriptor.Type type) throws StatusException {
+      final Descriptors.FieldDescriptor.Type type) throws FieldValidationException {
     if (fieldValue < 0 && UNSIGNED_TYPES.contains(type)) {
-      throw invalidArgument("field value is expected to be within the [%d, %d] range".formatted(
+      throw new FieldValidationException("field value is expected to be within the [%d, %d] range".formatted(
           range.min(), range.max()));
     }
     if (fieldValue < range.min() || fieldValue > range.max()) {
-      throw invalidArgument("field value is [%d] but expected to be within the [%d, %d] range".formatted(
+      throw new FieldValidationException("field value is [%d] but expected to be within the [%d, %d] range".formatted(
           fieldValue, range.min(), range.max()));
     }
   }

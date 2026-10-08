@@ -7,6 +7,7 @@ package org.whispersystems.textsecuregcm.push;
 
 import static org.whispersystems.textsecuregcm.metrics.MetricsUtil.name;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.google.auth.oauth2.GoogleCredentials;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
@@ -22,7 +23,9 @@ import io.micrometer.core.instrument.Metrics;
 import io.micrometer.core.instrument.Timer;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
@@ -31,11 +34,15 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.whispersystems.textsecuregcm.util.ExceptionUtils;
 import org.whispersystems.textsecuregcm.util.GoogleApiUtil;
+import org.whispersystems.textsecuregcm.util.SystemMapper;
 
 public class FcmSender implements PushNotificationSender {
 
   private final ExecutorService executor;
   private final FirebaseMessaging firebaseMessagingClient;
+
+  // See https://firebase.google.com/docs/cloud-messaging/customize-messages/setting-message-lifespan
+  private static final long DEFAULT_TTL_MILLIS = Duration.ofDays(28).toMillis();
 
   private static final Timer SEND_NOTIFICATION_TIMER = Metrics.timer(name(FcmSender.class, "sendNotification"));
 
@@ -82,6 +89,7 @@ public class FcmSender implements PushNotificationSender {
         .setToken(pushNotification.deviceToken())
         .setAndroidConfig(AndroidConfig.builder()
             .setPriority(pushNotification.urgent() ? AndroidConfig.Priority.HIGH : AndroidConfig.Priority.NORMAL)
+            .setTtl(pushNotification.ttl() != null ? pushNotification.ttl().toMillis() : DEFAULT_TTL_MILLIS)
             .build());
 
     final String key = switch (pushNotification.notificationType()) {
@@ -89,9 +97,25 @@ public class FcmSender implements PushNotificationSender {
       case ATTEMPT_LOGIN_NOTIFICATION_HIGH_PRIORITY -> "attemptLoginContext";
       case CHALLENGE -> "challenge";
       case RATE_LIMIT_CHALLENGE -> "rateLimitChallenge";
+      case VERIFICATION_CODE_REQUESTED -> "verificationCodeRequested";
     };
 
-    builder.putData(key, pushNotification.data() != null ? pushNotification.data() : "");
+    final String data = switch (pushNotification.notificationType()) {
+      case VERIFICATION_CODE_REQUESTED -> {
+        if (!(pushNotification.data() instanceof VerificationCodeRequestData)) {
+          throw new IllegalArgumentException("Notification did not have VerificationCodeRequestData");
+        }
+
+        try {
+          yield SystemMapper.jsonMapper().writeValueAsString(pushNotification.data());
+        } catch (final JsonProcessingException e) {
+          throw new UncheckedIOException(e);
+        }
+      }
+      default -> pushNotification.data() != null ? pushNotification.data().toString() : "";
+    };
+
+    builder.putData(key, data);
 
     final Timer.Sample sample = Timer.start();
 

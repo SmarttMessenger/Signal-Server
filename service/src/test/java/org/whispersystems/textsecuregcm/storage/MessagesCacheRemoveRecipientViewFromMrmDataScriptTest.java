@@ -6,21 +6,25 @@
 package org.whispersystems.textsecuregcm.storage;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.mockito.Mockito.mock;
 
 import io.lettuce.core.cluster.SlotHash;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.signal.libsignal.protocol.SealedSenderMultiRecipientMessage;
 import org.whispersystems.textsecuregcm.identity.AciServiceIdentifier;
 import org.whispersystems.textsecuregcm.identity.ServiceIdentifier;
 import org.whispersystems.textsecuregcm.redis.RedisClusterExtension;
@@ -38,10 +42,15 @@ class MessagesCacheRemoveRecipientViewFromMrmDataScriptTest {
   void testUpdateSingleKey(final Map<ServiceIdentifier, List<Byte>> destinations) throws Exception {
 
     final MessagesCacheInsertSharedMultiRecipientPayloadAndViewsScript insertMrmScript = new MessagesCacheInsertSharedMultiRecipientPayloadAndViewsScript(
-        REDIS_CLUSTER_EXTENSION.getRedisCluster());
+        REDIS_CLUSTER_EXTENSION.getRedisCluster(), mock(ScheduledExecutorService.class));
+
+    final SealedSenderMultiRecipientMessage multiRecipientMessage =
+        MessagesCacheTest.generateRandomMrmMessage(destinations);
 
     final byte[] sharedMrmKey = MessagesCache.getSharedMrmKey(UUID.randomUUID());
-    insertMrmScript.executeAsync(sharedMrmKey, MessagesCacheTest.generateRandomMrmMessage(destinations)).join();
+    insertMrmScript.executeAsync(sharedMrmKey, multiRecipientMessage, new HashSet<>(multiRecipientMessage.getRecipients().values()))
+        .toCompletableFuture()
+        .join();
 
     final MessagesCacheRemoveRecipientViewFromMrmDataScript removeRecipientViewFromMrmDataScript = new MessagesCacheRemoveRecipientViewFromMrmDataScript(
         REDIS_CLUSTER_EXTENSION.getRedisCluster());
@@ -99,11 +108,14 @@ class MessagesCacheRemoveRecipientViewFromMrmDataScriptTest {
     for (int i = 0; i < keyCount; i++) {
 
       final MessagesCacheInsertSharedMultiRecipientPayloadAndViewsScript insertMrmScript = new MessagesCacheInsertSharedMultiRecipientPayloadAndViewsScript(
-          REDIS_CLUSTER_EXTENSION.getRedisCluster());
+          REDIS_CLUSTER_EXTENSION.getRedisCluster(), mock(ScheduledExecutorService.class));
+
+      final SealedSenderMultiRecipientMessage multiRecipientMessage =
+          MessagesCacheTest.generateRandomMrmMessage(serviceIdentifier, deviceId);
 
       final byte[] sharedMrmKey = MessagesCache.getSharedMrmKey(UUID.randomUUID());
       insertMrmScript.executeAsync(sharedMrmKey,
-          MessagesCacheTest.generateRandomMrmMessage(serviceIdentifier, deviceId)).join();
+          multiRecipientMessage, new HashSet<>(multiRecipientMessage.getRecipients().values())).toCompletableFuture().join();
 
       sharedMrmKeys.add(sharedMrmKey);
     }

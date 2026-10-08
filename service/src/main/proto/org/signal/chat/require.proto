@@ -14,8 +14,9 @@ import "google/protobuf/descriptor.proto";
 extend google.protobuf.FieldOptions {
   /*
    * Requires a field to have content of non-zero size/length.
-   * Applies to both `optional` and regular fields, i.e. if the field is not set or has a default value,
-   * it's considered to be empty.
+   * Applies to both `optional` and regular fields, i.e. if the field is not set
+   * or has a default value, it's considered to be empty. This does not apply
+   * to fields that are contained in a `oneof`.
    *
    * ```
    * import "org/signal/chat/require.proto";
@@ -57,8 +58,10 @@ extend google.protobuf.FieldOptions {
 
   /*
    * Requires a size/length of a field to be within certain boundaries.
-   * Applies to both `optional` and regular fields, i.e. if the field is not set or has a default value,
-   * its size considered to be zero.
+   * Applies to both `optional` and regular fields, i.e. if the field is not set
+   * or has a default value, its size considered to be zero. However, if the
+   * field is contained in a `oneof` and is not set, this annotation does not
+   * apply.
    *
    * ```
    * import "org/signal/chat/require.proto";
@@ -76,9 +79,11 @@ extend google.protobuf.FieldOptions {
   optional SizeConstraint size = 70003;
 
   /*
-   * Requires a size/length of a field to be one of the specified values.
-   * Applies to both `optional` and regular fields, i.e. if the field is not set or has a default value,
-   * its size considered to be zero.
+   * Requires a size/length of a field to be within certain boundaries.
+   * Applies to both `optional` and regular fields, i.e. if the field is not set
+   * or has a default value, its size considered to be zero. However, if the
+   * field is contained in a `oneof` and is not set, this annotation does not
+   * apply.
    *
    * ```
    * import "org/signal/chat/require.proto";
@@ -130,7 +135,8 @@ extend google.protobuf.FieldOptions {
    * Require a value of a message field to be present.
    *
    * Applies to both `optional` and regular fields (both of which have explicit
-   * presence for the message type anyways)
+   * presence for the message type anyways). This does not apply to fields that
+   * are contained in a `oneof`.
    *
    * ```
    * import "org/signal/chat/require.proto";
@@ -141,6 +147,71 @@ extend google.protobuf.FieldOptions {
    *````
    */
   optional bool present = 70007;
+
+  /*
+   * Requires a value of a string field to be a valid base64 URL string. The
+   * string may be padded or unpadded. If the field is `optional`, this check
+   * allows a value to be not set.
+   *
+   *  ```
+   *  import "org/signal/chat/require.proto";
+   *
+   *  message Data {
+   *    string myString = 1 [(require.base64url) = true];
+   *  }
+   *  ```
+   */
+  optional bool base64url  = 70008;
+
+  /*
+   * Requires a common.ServiceIdentifier field to have its IdentityType
+   * be the given type (`aci` or `pni`).
+   *
+   *  ```
+   *  import "org/signal/chat/require.proto";
+   *  import "org/signal/chat/common.proto";
+   *
+   *  message Data {
+   *    common.ServiceIdentifier accountIdentifier = 1 [(require.identityType) = IDENTITY_TYPE_ACI];
+   *  }
+   *  ```
+   */
+  optional IdentityType identityType = 70009;
+
+  /*
+   * Applies element-wise constraints to the elements of a `repeated` field.
+   * Top-level `require.*` annotations on a `repeated` field constrain the
+   * collection itself (e.g. element count), `each` constrains the
+   * individual elements.
+   *
+   * ```
+   * import "org/signal/chat/require.proto";
+   *
+   * message Data {
+   *   // 1-20 username hashes, each exactly 32 bytes
+   *   repeated bytes username_hashes = 1 [
+   *     (require.size) = {min: 1, max: 20},
+   *     (require.each) = { exactlySize: 32 }
+   *   ];
+   * }
+   * ```
+   *
+   * Applicable only to `repeated` fields.
+   */
+  optional ElementConstraint each = 70010;
+
+  // next 70011
+}
+
+message ElementConstraint {
+  optional bool nonEmpty = 1;
+  optional SizeConstraint size = 2;
+  repeated uint32 exactlySize = 3;
+  optional bool e164 = 4;
+  optional bool base64url = 5;
+  optional ValueRangeConstraint range = 6;
+  optional IdentityType identityType = 7;
+  optional bool specified = 8;
 }
 
 message SizeConstraint {
@@ -176,3 +247,12 @@ enum Auth {
   AUTH_ONLY_ANONYMOUS = 2;
 }
 
+// This is duplicated from common.proto because:
+//
+// 1. importing would be a circular dependency
+// 2. the canonical declaration belongs there
+enum IdentityType {
+  IDENTITY_TYPE_UNSPECIFIED = 0;
+  IDENTITY_TYPE_ACI = 1;
+  IDENTITY_TYPE_PNI = 2;
+}

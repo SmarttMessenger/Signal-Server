@@ -6,7 +6,6 @@
 package org.whispersystems.textsecuregcm.workers;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.argThat;
 import static org.mockito.Mockito.mock;
@@ -24,7 +23,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
-import java.util.concurrent.CompletableFuture;
+import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.Consumer;
 import java.util.stream.IntStream;
@@ -33,6 +32,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
+import org.whispersystems.textsecuregcm.identity.IdentityType;
 import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.storage.AccountsManager;
 import org.whispersystems.textsecuregcm.util.TestClock;
@@ -75,13 +75,13 @@ class RemoveExpiredUsernameHoldsCommandTest {
     final TestClock clock = TestClock.pinned(Instant.EPOCH.plus(Duration.ofSeconds(1)));
 
     final AccountsManager accountsManager = mock(AccountsManager.class);
-    when(accountsManager.updateAsync(any(), any()))
-        .thenReturn(CompletableFuture.completedFuture(null));
-
     final RemoveExpiredUsernameHoldsCommand removeExpiredUsernameHoldsCommand =
         new TestRemoveExpiredUsernameHoldsCommand(clock, accountsManager, isDryRun);
 
+    final UUID hasHoldsAccountIdentifier = UUID.randomUUID();
+
     final Account hasHolds = mock(Account.class);
+    when(hasHolds.getAccountIdentifier()).thenReturn(hasHoldsAccountIdentifier);
     final List<Account.UsernameHold> originalHolds = List.of(
         // expired
         new Account.UsernameHold(TestRandomUtil.nextBytes(32), Instant.EPOCH.getEpochSecond()),
@@ -97,7 +97,7 @@ class RemoveExpiredUsernameHoldsCommandTest {
       verifyNoInteractions(accountsManager);
     } else {
       ArgumentCaptor<Consumer<Account>> updaterCaptor = ArgumentCaptor.forClass(Consumer.class);
-      verify(accountsManager, times(1)).updateAsync(eq(hasHolds), updaterCaptor.capture());
+      verify(accountsManager, times(1)).update(eq(hasHoldsAccountIdentifier), updaterCaptor.capture());
       final Consumer<Account> consumer = updaterCaptor.getValue();
       consumer.accept(hasHolds);
       verify(hasHolds, times(1)).setUsernameHolds(argThat(holds ->

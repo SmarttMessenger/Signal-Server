@@ -14,13 +14,12 @@ import static org.mockito.Mockito.when;
 
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.ScheduledExecutorService;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.extension.RegisterExtension;
-import org.whispersystems.textsecuregcm.auth.grpc.AuthenticatedDevice;
-import org.whispersystems.textsecuregcm.grpc.net.GrpcClientConnectionManager;
 import org.whispersystems.textsecuregcm.identity.IdentityType;
 import org.whispersystems.textsecuregcm.redis.RedisServerExtension;
 import org.whispersystems.textsecuregcm.storage.Account;
@@ -29,7 +28,6 @@ import org.whispersystems.textsecuregcm.storage.Device;
 @Timeout(value = 5, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
 class DisconnectionRequestManagerTest {
 
-  private GrpcClientConnectionManager grpcClientConnectionManager;
   private DisconnectionRequestManager disconnectionRequestManager;
 
   @RegisterExtension
@@ -37,10 +35,10 @@ class DisconnectionRequestManagerTest {
 
   @BeforeEach
   void setUp() {
-    grpcClientConnectionManager = mock(GrpcClientConnectionManager.class);
 
-    disconnectionRequestManager =
-        new DisconnectionRequestManager(REDIS_EXTENSION.getRedisClient(), grpcClientConnectionManager, Runnable::run);
+    disconnectionRequestManager = new DisconnectionRequestManager(REDIS_EXTENSION.getRedisClient(),
+        Runnable::run,
+        mock(ScheduledExecutorService.class));
 
     disconnectionRequestManager.start();
   }
@@ -100,16 +98,8 @@ class DisconnectionRequestManagerTest {
 
     verify(primaryDeviceListener, timeout(1_000)).handleDisconnectionRequest();
     verify(linkedDeviceListener, timeout(1_000)).handleDisconnectionRequest();
-    verify(grpcClientConnectionManager, timeout(1_000))
-        .closeConnection(new AuthenticatedDevice(accountIdentifier, primaryDeviceId));
-
-    verify(grpcClientConnectionManager, timeout(1_000))
-        .closeConnection(new AuthenticatedDevice(accountIdentifier, linkedDeviceId));
 
     disconnectionRequestManager.requestDisconnection(otherAccountIdentifier, List.of(otherDeviceId));
-
-    verify(grpcClientConnectionManager, timeout(1_000))
-        .closeConnection(new AuthenticatedDevice(otherAccountIdentifier, otherDeviceId));
   }
 
   @Test
@@ -125,7 +115,7 @@ class DisconnectionRequestManagerTest {
     when(linkedDevice.getId()).thenReturn(linkedDeviceId);
 
     final Account account = mock(Account.class);
-    when(account.getIdentifier(IdentityType.ACI)).thenReturn(accountIdentifier);
+    when(account.getAccountIdentifier()).thenReturn(accountIdentifier);
     when(account.getDevices()).thenReturn(List.of(primaryDevice, linkedDevice));
 
     final DisconnectionRequestListener primaryDeviceListener = mock(DisconnectionRequestListener.class);
@@ -138,11 +128,5 @@ class DisconnectionRequestManagerTest {
 
     verify(primaryDeviceListener, timeout(1_000)).handleDisconnectionRequest();
     verify(linkedDeviceListener, timeout(1_000)).handleDisconnectionRequest();
-
-    verify(grpcClientConnectionManager, timeout(1_000))
-        .closeConnection(new AuthenticatedDevice(accountIdentifier, primaryDeviceId));
-
-    verify(grpcClientConnectionManager, timeout(1_000))
-        .closeConnection(new AuthenticatedDevice(accountIdentifier, linkedDeviceId));
   }
 }

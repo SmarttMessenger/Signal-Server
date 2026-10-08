@@ -6,27 +6,27 @@
 package org.whispersystems.textsecuregcm.filters;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
+import com.google.common.net.HttpHeaders;
 import io.dropwizard.core.Application;
 import io.dropwizard.core.Configuration;
 import io.dropwizard.core.setup.Environment;
+import io.dropwizard.testing.ConfigOverride;
 import io.dropwizard.testing.junit5.DropwizardAppExtension;
 import io.dropwizard.testing.junit5.DropwizardExtensionsSupport;
-import jakarta.servlet.DispatcherType;
 import jakarta.ws.rs.GET;
 import jakarta.ws.rs.Path;
 import jakarta.ws.rs.client.Client;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.core.Context;
-import java.io.IOException;
 import java.net.InetAddress;
 import java.net.URI;
 import java.nio.ByteBuffer;
 import java.security.Principal;
 import java.time.Duration;
 import java.util.Arrays;
-import java.util.EnumSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -35,17 +35,20 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import javax.security.auth.Subject;
+import org.eclipse.jetty.ee10.websocket.server.config.JettyWebSocketServletContainerInitializer;
 import org.eclipse.jetty.util.HostPort;
+import org.eclipse.jetty.websocket.api.Callback;
 import org.eclipse.jetty.websocket.api.Session;
-import org.eclipse.jetty.websocket.api.WebSocketListener;
+import org.eclipse.jetty.websocket.client.ClientUpgradeRequest;
 import org.eclipse.jetty.websocket.client.WebSocketClient;
-import org.eclipse.jetty.websocket.server.config.JettyWebSocketServletContainerInitializer;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Nested;
+import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.whispersystems.textsecuregcm.jetty.JettyHttpConfigurationCustomizer;
 import org.whispersystems.textsecuregcm.util.SystemMapper;
 import org.whispersystems.websocket.WebSocketResourceProviderFactory;
 import org.whispersystems.websocket.configuration.WebSocketConfiguration;
@@ -55,6 +58,7 @@ import org.whispersystems.websocket.messages.protobuf.ProtobufWebSocketMessageFa
 import org.whispersystems.websocket.setup.WebSocketEnvironment;
 
 @ExtendWith(DropwizardExtensionsSupport.class)
+@Timeout(value = 10, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
 class RemoteAddressFilterIntegrationTest {
 
   private static final String WEBSOCKET_PREFIX = "/websocket";
@@ -65,7 +69,9 @@ class RemoteAddressFilterIntegrationTest {
   // in jersey-test-framework-provider-jetty doesn’t easily support @Context HttpServletRequest, so this test runs a
   // full Jetty server in a separate process
   private static final DropwizardAppExtension<Configuration> EXTENSION = new DropwizardAppExtension<>(
-      TestApplication.class);
+      TestApplication.class, null,
+      ConfigOverride.config("server.applicationConnectors[0].type", "h2c"),
+      ConfigOverride.config("server.applicationConnectors[0].useForwardedHeaders", "true"));
 
   @Nested
   class Rest {
@@ -87,6 +93,37 @@ class RemoteAddressFilterIntegrationTest {
           .get(RemoteAddressFilterIntegrationTest.TestResponse.class);
 
       assertEquals(ip, response.remoteAddress());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"127.0.0.3", "0:0:0:0:0:0:dead:beef"})
+    void testForwardedForHeader(final String ip) throws Exception {
+      final Client client = EXTENSION.client();
+
+      final RemoteAddressFilterIntegrationTest.TestResponse response = client.target(
+              String.format("http://%s:%d%s", "localhost", EXTENSION.getLocalPort(), REMOTE_ADDRESS_PATH))
+          .request("application/json")
+          .header(HttpHeaders.X_FORWARDED_FOR, ip)
+          .get(RemoteAddressFilterIntegrationTest.TestResponse.class);
+
+      assertEquals(ip, response.remoteAddress());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"Forwarded", "X-Forwarded-Host", "X-Forwarded-Server", "X-Forwarded-Proto"})
+    void testOtherHeadersIgnored(final String header) throws Exception {
+      final Client client = EXTENSION.client();
+
+      final String ip = "127.0.0.3";
+
+      final RemoteAddressFilterIntegrationTest.TestResponse response = client.target(
+              String.format("http://%s:%d%s", "localhost", EXTENSION.getLocalPort(), REMOTE_ADDRESS_PATH))
+          .request("application/json")
+          .header(header, ip)
+          .get(RemoteAddressFilterIntegrationTest.TestResponse.class);
+
+      assertNotEquals(ip, response.remoteAddress(), "header " + header + " should be ignored");
+      assertEquals("127.0.0.1", response.remoteAddress());
     }
   }
 
@@ -129,9 +166,48 @@ class RemoteAddressFilterIntegrationTest {
 
       assertEquals(ip, response.remoteAddress());
     }
+
+
+    @ParameterizedTest
+    @ValueSource(strings = {"127.0.0.3", "0:0:0:0:0:0:dead:beef"})
+    void testForwardedForHeader(final String ip) throws Exception {
+      final CompletableFuture<byte[]> responseFuture = new CompletableFuture<>();
+      final ClientEndpoint clientEndpoint = new ClientEndpoint(WS_REQUEST_PATH, responseFuture);
+      final ClientUpgradeRequest upgradeRequest = new ClientUpgradeRequest(URI.create(String.format("ws://%s:%d%s",
+          "localhost",
+          EXTENSION.getLocalPort(),
+          WEBSOCKET_PREFIX + REMOTE_ADDRESS_PATH)));
+      upgradeRequest.setHeader(HttpHeaders.X_FORWARDED_FOR, ip);
+      client.connect(clientEndpoint, upgradeRequest);
+
+      final byte[] responseBytes = responseFuture.get(1, TimeUnit.SECONDS);
+      final TestResponse response = SystemMapper.jsonMapper().readValue(responseBytes, TestResponse.class);
+      assertEquals(ip, response.remoteAddress());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"Forwarded", "X-Forwarded-Host", "X-Forwarded-Server", "X-Forwarded-Proto"})
+    void testOtherHeadersIgnored(final String header) throws Exception {
+      final String ip = "127.0.0.3";
+
+      final CompletableFuture<byte[]> responseFuture = new CompletableFuture<>();
+      final ClientEndpoint clientEndpoint = new ClientEndpoint(WS_REQUEST_PATH, responseFuture);
+      final ClientUpgradeRequest upgradeRequest = new ClientUpgradeRequest(URI.create(String.format("ws://%s:%d%s",
+          "localhost",
+          EXTENSION.getLocalPort(),
+          WEBSOCKET_PREFIX + REMOTE_ADDRESS_PATH)));
+      upgradeRequest.setHeader(header, ip);
+      client.connect(clientEndpoint, upgradeRequest);
+
+      final byte[] responseBytes = responseFuture.get(1, TimeUnit.SECONDS);
+      final TestResponse response = SystemMapper.jsonMapper().readValue(responseBytes, TestResponse.class);
+
+      assertNotEquals(ip, response.remoteAddress(), "header " + header + " should be ignored");
+      assertEquals("127.0.0.1", response.remoteAddress());
+    }
   }
 
-  private static class ClientEndpoint implements WebSocketListener {
+  public static class ClientEndpoint implements Session.Listener.AutoDemanding {
 
     private final String requestPath;
     private final CompletableFuture<byte[]> responseFuture;
@@ -145,22 +221,19 @@ class RemoteAddressFilterIntegrationTest {
     }
 
     @Override
-    public void onWebSocketConnect(final Session session) {
+    public void onWebSocketOpen(final Session session) {
       final byte[] requestBytes = messageFactory.createRequest(Optional.of(1L), "GET", requestPath,
           List.of("Accept: application/json"),
           Optional.empty()).toByteArray();
-      try {
-        session.getRemote().sendBytes(ByteBuffer.wrap(requestBytes));
-      } catch (IOException e) {
-        throw new RuntimeException(e);
-      }
+
+      session.sendBinary(ByteBuffer.wrap(requestBytes), Callback.NOOP);
     }
 
     @Override
-    public void onWebSocketBinary(final byte[] payload, final int offset, final int length) {
+    public void onWebSocketBinary(final ByteBuffer payload, final Callback callback) {
 
       try {
-        WebSocketMessage webSocketMessage = messageFactory.parseMessage(payload, offset, length);
+        WebSocketMessage webSocketMessage = messageFactory.parseMessage(payload);
 
         if (Objects.requireNonNull(webSocketMessage.getType()) == WebSocketMessage.Type.RESPONSE_MESSAGE) {
           assert 200 == webSocketMessage.getResponseMessage().getStatus();
@@ -206,10 +279,6 @@ class RemoteAddressFilterIntegrationTest {
     public void run(final Configuration configuration,
         final Environment environment) throws Exception {
 
-      environment.servlets().addFilter("RemoteAddressFilterRemoteAddress", new RemoteAddressFilter())
-          .addMappingForUrlPatterns(EnumSet.of(DispatcherType.REQUEST), false, REMOTE_ADDRESS_PATH,
-              WEBSOCKET_PREFIX + REMOTE_ADDRESS_PATH);
-
       environment.jersey().register(new TestRemoteAddressController());
 
       // WebSocket set up
@@ -220,15 +289,16 @@ class RemoteAddressFilterIntegrationTest {
 
       webSocketEnvironment.jersey().register(new TestWebSocketController());
 
-      JettyWebSocketServletContainerInitializer.configure(environment.getApplicationContext(), null);
-
       WebSocketResourceProviderFactory<TestPrincipal> webSocketServlet = new WebSocketResourceProviderFactory<>(
-          webSocketEnvironment, TestPrincipal.class, webSocketConfiguration,
+          webSocketEnvironment, TestPrincipal.class,
           RemoteAddressFilter.REMOTE_ADDRESS_ATTRIBUTE_NAME);
 
-      environment.servlets().addServlet("WebSocketRemoteAddress", webSocketServlet)
-          .addMapping(WEBSOCKET_PREFIX + REMOTE_ADDRESS_PATH);
+      environment.lifecycle().addEventListener(new JettyHttpConfigurationCustomizer());
 
+      JettyWebSocketServletContainerInitializer.configure(environment.getApplicationContext(), (servletContext, container) -> {
+        container.addMapping(WEBSOCKET_PREFIX + REMOTE_ADDRESS_PATH, webSocketServlet);
+        PriorityFilter.ensureFilter(servletContext, new RemoteAddressFilter());
+      });
     }
   }
 

@@ -14,25 +14,61 @@ import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.AssertTrue;
 import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.PositiveOrZero;
 import java.util.List;
+import java.util.stream.Stream;
 import javax.annotation.Nullable;
+import jakarta.validation.constraints.Size;
+import org.apache.commons.lang3.ArrayUtils;
 import org.signal.libsignal.protocol.IdentityKey;
 import org.whispersystems.textsecuregcm.util.ByteArrayAdapter;
 import org.whispersystems.textsecuregcm.util.IdentityKeyAdapter;
 
 public record RegistrationRequest(@Schema(requiredMode = Schema.RequiredMode.NOT_REQUIRED, description = """
                                   The ID of an existing verification session as it appears in a verification session
-                                  metadata object. Must be provided if `recoveryPassword` is not provided; must not be
-                                  provided if `recoveryPassword` is provided.
+                                  metadata object. Must be provided if `recoveryPassword` and `receiptCredentialPresentation`
+                                  are not provided; must not be provided if `recoveryPassword` or `receiptCredentialPresentation`
+                                  is provided.
                                   """)
+                                  @Nullable
                                   String sessionId,
 
                                   @JsonDeserialize(using = ByteArrayAdapter.Deserializing.class)
                                   @Schema(requiredMode = Schema.RequiredMode.NOT_REQUIRED, description = """
-                                  A base64-encoded registration recovery password. Must be provided if `sessionId` is
-                                  not provided; must not be provided if `sessionId` is provided
+                                  A base64-encoded registration recovery password. Must be provided if `sessionId` and
+                                  `receiptCredentialPresentation` are not provided; must not be provided if `sessionId`
+                                  or `receiptCredentialPresentation` is provided. Registration recovery passwords must
+                                  be specified when reclaiming an account by account identifier.
                                   """)
+                                  @Nullable
                                   byte[] recoveryPassword,
+
+                                  @JsonDeserialize(using = ByteArrayAdapter.Deserializing.class)
+                                  @Schema(requiredMode = Schema.RequiredMode.NOT_REQUIRED, description = """
+                                  A base64-encoded receipt credential presentation that allows for redeeming a Signal Login.
+                                  Must be provided if `sessionId` and `recoveryPassword` are not provided;
+                                  must not be provided if `sessionId` or `recoveryPassword` is provided. Must not be
+                                  provided if recovering a previously used account.
+                                  """)
+                                  @Nullable
+                                  byte[] receiptCredentialPresentation,
+
+                                  @Schema(requiredMode = Schema.RequiredMode.NOT_REQUIRED, description = """
+                                  A TOTP one-time password; required if recovering an account that has TOTP keys. Must
+                                  not be provided if `receiptCredentialPresentation` is provided.
+                                  """)
+                                  @PositiveOrZero
+                                  @Nullable
+                                  Integer totp,
+
+                                  @Schema(requiredMode = Schema.RequiredMode.NOT_REQUIRED, description = """
+                                      A JSON-serialized assertion response from a completed authentication ceremony.
+                                      See https://www.w3.org/TR/webauthn/#authenticatorassertionresponse.
+                                      """)
+                                  @Nullable
+                                  // There is no documented max size, but 8kiB should be enough
+                                  @Size(min = 1, max = 8192)
+                                  String webAuthnResponse,
 
                                   @NotNull
                                   @Valid
@@ -58,13 +94,17 @@ public record RegistrationRequest(@Schema(requiredMode = Schema.RequiredMode.NOT
                                   @JsonDeserialize(using = IdentityKeyAdapter.Deserializer.class)
                                   IdentityKey aciIdentityKey,
 
-                                  @NotNull
                                   @Valid
-                                  @Schema(requiredMode = Schema.RequiredMode.REQUIRED, description = """
+                                  @Schema(requiredMode = Schema.RequiredMode.NOT_REQUIRED, description = """
                                   The PNI-associated identity key for the account, encoded as a base64 string.
+                                  Must be provided for an account with a phone number or when recovering an account by
+                                  ID (even if the recovered account does not have a phone number, in which case
+                                  PNI-associated key material will be ignored). Must be absent when registering an
+                                  account without a phone number.
                                   """)
                                   @JsonSerialize(using = IdentityKeyAdapter.Serializer.class)
                                   @JsonDeserialize(using = IdentityKeyAdapter.Deserializer.class)
+                                  @Nullable
                                   IdentityKey pniIdentityKey,
 
                                   @NotNull
@@ -75,24 +115,58 @@ public record RegistrationRequest(@Schema(requiredMode = Schema.RequiredMode.NOT
 
   public boolean isEverySignedKeyValid(@Nullable final String userAgent) {
     if (deviceActivationRequest().aciSignedPreKey() == null ||
-        deviceActivationRequest().pniSignedPreKey() == null ||
-        deviceActivationRequest().aciPqLastResortPreKey() == null ||
-        deviceActivationRequest().pniPqLastResortPreKey() == null) {
+        deviceActivationRequest().aciPqLastResortPreKey() == null) {
+      return false;
+    }
+
+    final boolean allPniPresentOrAllAbsent = ((pniIdentityKey == null) == deviceActivationRequest().pniSignedPreKey().isEmpty())
+        && ((pniIdentityKey == null) == deviceActivationRequest().pniPqLastResortPreKey().isEmpty());
+    if (!allPniPresentOrAllAbsent) {
       return false;
     }
 
     return PreKeySignatureValidator.validatePreKeySignatures(aciIdentityKey(), List.of(deviceActivationRequest().aciSignedPreKey(), deviceActivationRequest().aciPqLastResortPreKey()), userAgent, "register")
-        && PreKeySignatureValidator.validatePreKeySignatures(pniIdentityKey(), List.of(deviceActivationRequest().pniSignedPreKey(), deviceActivationRequest().pniPqLastResortPreKey()), userAgent, "register");
+        && (pniIdentityKey == null || PreKeySignatureValidator.validatePreKeySignatures(pniIdentityKey(), List.of(deviceActivationRequest().pniSignedPreKey().get(), deviceActivationRequest().pniPqLastResortPreKey().get()), userAgent, "register"));
   }
 
   @VisibleForTesting
   @AssertTrue
   @Schema(hidden = true)
-  boolean hasExactlyOneMessageDeliveryChannel() {
+  boolean isExactlyOneMessageDeliveryChannel() {
+    if (deviceActivationRequest == null || accountAttributes == null) {
+      return false;
+    }
     if (accountAttributes.getFetchesMessages()) {
       return deviceActivationRequest().apnToken().isEmpty() && deviceActivationRequest().gcmToken().isEmpty();
     } else {
       return deviceActivationRequest().apnToken().isPresent() ^ deviceActivationRequest().gcmToken().isPresent();
     }
+  }
+
+  @VisibleForTesting
+  @AssertTrue
+  @Schema(hidden = true)
+  boolean isAllOrNoPhoneNumberInformationProvided() {
+    final boolean expectPresence = pniIdentityKey != null;
+
+    return Stream.of(pniIdentityKey != null,
+            accountAttributes().getPhoneNumberIdentityRegistrationId().isPresent(),
+            deviceActivationRequest().pniSignedPreKey().isPresent(),
+            deviceActivationRequest().pniPqLastResortPreKey().isPresent())
+        .allMatch(present -> present == expectPresence);
+  }
+
+  @VisibleForTesting
+  @AssertTrue
+  @Schema(hidden = true)
+  boolean isMfaAbsentWhenUsingReceipt() {
+    return ArrayUtils.isEmpty(receiptCredentialPresentation) || (totp == null && webAuthnResponse == null);
+  }
+
+  @VisibleForTesting
+  @AssertTrue
+  @Schema(hidden = true)
+  boolean isAtMostOneMfaPresent() {
+    return totp == null || webAuthnResponse == null;
   }
 }

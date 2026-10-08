@@ -16,7 +16,7 @@ import static org.mockito.Mockito.when;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneId;
-import java.util.concurrent.CompletableFuture;
+import java.util.UUID;
 import java.util.stream.Stream;
 import net.sourceforge.argparse4j.inf.Namespace;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -61,15 +61,19 @@ class RemoveExpiredAccountsCommandTest {
     final Clock clock = Clock.fixed(Instant.now(), ZoneId.systemDefault());
 
     final AccountsManager accountsManager = mock(AccountsManager.class);
-    when(accountsManager.delete(any(), any())).thenReturn(CompletableFuture.completedFuture(null));
 
     final RemoveExpiredAccountsCommand removeExpiredAccountsCommand =
         new TestRemoveExpiredAccountsCommand(clock, accountsManager, isDryRun);
 
+    final UUID activeAccountIdentifier = UUID.randomUUID();
+    final UUID expiredAccountIdentifier = UUID.randomUUID();
+
     final Account activeAccount = mock(Account.class);
+    when(activeAccount.getAccountIdentifier()).thenReturn(activeAccountIdentifier);
     when(activeAccount.getLastSeen()).thenReturn(clock.instant().toEpochMilli());
 
     final Account expiredAccount = mock(Account.class);
+    when(expiredAccount.getAccountIdentifier()).thenReturn(expiredAccountIdentifier);
     when(expiredAccount.getLastSeen())
         .thenReturn(clock.instant().minus(RemoveExpiredAccountsCommand.MAX_IDLE_DURATION).minusMillis(1).toEpochMilli());
 
@@ -78,8 +82,8 @@ class RemoveExpiredAccountsCommandTest {
     if (isDryRun) {
       verify(accountsManager, never()).delete(any(), any());
     } else {
-      verify(accountsManager).delete(expiredAccount, AccountsManager.DeletionReason.EXPIRED);
-      verify(accountsManager, never()).delete(eq(activeAccount), any());
+      verify(accountsManager).delete(expiredAccountIdentifier, AccountsManager.DeletionReason.EXPIRED);
+      verify(accountsManager, never()).delete(eq(activeAccountIdentifier), any());
     }
   }
 

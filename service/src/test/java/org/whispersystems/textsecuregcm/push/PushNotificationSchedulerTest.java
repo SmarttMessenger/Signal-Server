@@ -23,6 +23,7 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ScheduledExecutorService;
 import org.apache.commons.lang3.RandomStringUtils;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -31,7 +32,6 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.mockito.ArgumentCaptor;
-import org.whispersystems.textsecuregcm.identity.IdentityType;
 import org.whispersystems.textsecuregcm.redis.FaultTolerantRedisClusterClient;
 import org.whispersystems.textsecuregcm.redis.RedisClusterExtension;
 import org.whispersystems.textsecuregcm.storage.Account;
@@ -69,9 +69,8 @@ class PushNotificationSchedulerTest {
     when(device.getLastSeen()).thenReturn(System.currentTimeMillis());
 
     account = mock(Account.class);
-    when(account.getUuid()).thenReturn(ACCOUNT_UUID);
-    when(account.getIdentifier(IdentityType.ACI)).thenReturn(ACCOUNT_UUID);
-    when(account.getNumber()).thenReturn(ACCOUNT_NUMBER);
+    when(account.getAccountIdentifier()).thenReturn(ACCOUNT_UUID);
+    when(account.getNumber()).thenReturn(Optional.of(ACCOUNT_NUMBER));
     when(account.getDevice(DEVICE_ID)).thenReturn(Optional.of(device));
 
     final AccountsManager accountsManager = mock(AccountsManager.class);
@@ -90,7 +89,7 @@ class PushNotificationSchedulerTest {
         .thenReturn(CompletableFuture.completedFuture(new SendPushNotificationResult(true, Optional.empty(), false, Optional.empty())));
 
     pushNotificationScheduler = new PushNotificationScheduler(REDIS_CLUSTER_EXTENSION.getRedisCluster(),
-        apnSender, fcmSender, accountsManager, clock, 1, 1);
+        apnSender, fcmSender, accountsManager, clock, 1, 1, mock(ScheduledExecutorService.class));
   }
 
   @ParameterizedTest
@@ -267,7 +266,7 @@ class PushNotificationSchedulerTest {
     final AccountsManager accountsManager = mock(AccountsManager.class);
 
     pushNotificationScheduler = new PushNotificationScheduler(redisCluster, apnSender, fcmSender,
-        accountsManager, dedicatedThreadCount, 1);
+        accountsManager, dedicatedThreadCount, 1, mock(ScheduledExecutorService.class));
 
     pushNotificationScheduler.start();
     pushNotificationScheduler.stop();

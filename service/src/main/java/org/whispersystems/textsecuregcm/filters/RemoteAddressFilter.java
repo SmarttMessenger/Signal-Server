@@ -15,6 +15,7 @@ import java.io.IOException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.whispersystems.textsecuregcm.util.HttpServletRequestUtil;
+import org.whispersystems.textsecuregcm.util.logging.ImpossibleEvents;
 
 /**
  * Sets a {@link HttpServletRequest} attribute (that will also be available as a
@@ -26,10 +27,6 @@ public class RemoteAddressFilter implements Filter {
   public static final String REMOTE_ADDRESS_ATTRIBUTE_NAME = RemoteAddressFilter.class.getName() + ".remoteAddress";
   private static final Logger logger = LoggerFactory.getLogger(RemoteAddressFilter.class);
 
-
-  public RemoteAddressFilter() {
-  }
-
   @Override
   public void doFilter(final ServletRequest request, final ServletResponse response, final FilterChain chain)
       throws ServletException, IOException {
@@ -40,7 +37,7 @@ public class RemoteAddressFilter implements Filter {
       request.setAttribute(REMOTE_ADDRESS_ATTRIBUTE_NAME, remoteAddress);
 
     } else {
-      logger.warn("request was of unexpected type: {}", request.getClass());
+      ImpossibleEvents.logImpossible(logger, "request was of unexpected type: {}", request.getClass());
     }
 
     chain.doFilter(request, response);

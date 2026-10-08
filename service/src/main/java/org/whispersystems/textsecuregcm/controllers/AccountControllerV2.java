@@ -5,13 +5,8 @@
 
 package org.whispersystems.textsecuregcm.controllers;
 
-import static org.whispersystems.textsecuregcm.metrics.MetricsUtil.name;
-
 import com.google.common.net.HttpHeaders;
 import io.dropwizard.auth.Auth;
-import io.micrometer.core.instrument.Metrics;
-import io.micrometer.core.instrument.Tag;
-import io.micrometer.core.instrument.Tags;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.headers.Header;
 import io.swagger.v3.oas.annotations.media.Content;
@@ -24,33 +19,34 @@ import jakarta.ws.rs.Consumes;
 import jakarta.ws.rs.ForbiddenException;
 import jakarta.ws.rs.GET;
 import jakarta.ws.rs.HeaderParam;
+import jakarta.ws.rs.NotAuthorizedException;
 import jakarta.ws.rs.PUT;
 import jakarta.ws.rs.Path;
 import jakarta.ws.rs.Produces;
+import jakarta.ws.rs.ServiceUnavailableException;
 import jakarta.ws.rs.WebApplicationException;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.core.Context;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
+import java.io.IOException;
 import java.time.Instant;
-import java.util.Optional;
 import java.util.UUID;
-import javax.annotation.Nullable;
+import org.apache.commons.lang3.StringUtils;
 import org.whispersystems.textsecuregcm.auth.AuthenticatedDevice;
 import org.whispersystems.textsecuregcm.auth.ChangesPhoneNumber;
-import org.whispersystems.textsecuregcm.auth.PhoneVerificationTokenManager;
-import org.whispersystems.textsecuregcm.auth.RegistrationLockVerificationManager;
+import org.whispersystems.textsecuregcm.auth.InvalidRegistrationSessionException;
+import org.whispersystems.textsecuregcm.auth.RecoveryPasswordVerificationFailedException;
+import org.whispersystems.textsecuregcm.auth.RegistrationLockFailureException;
+import org.whispersystems.textsecuregcm.auth.UnverifiedRegistrationSessionException;
 import org.whispersystems.textsecuregcm.entities.AccountDataReportResponse;
 import org.whispersystems.textsecuregcm.entities.AccountIdentityResponse;
 import org.whispersystems.textsecuregcm.entities.ChangeNumberRequest;
 import org.whispersystems.textsecuregcm.entities.MismatchedDevicesResponse;
 import org.whispersystems.textsecuregcm.entities.PhoneNumberDiscoverabilityRequest;
-import org.whispersystems.textsecuregcm.entities.PhoneNumberIdentityKeyDistributionRequest;
-import org.whispersystems.textsecuregcm.entities.PhoneVerificationRequest;
 import org.whispersystems.textsecuregcm.entities.RegistrationLockFailure;
 import org.whispersystems.textsecuregcm.entities.StaleDevicesResponse;
-import org.whispersystems.textsecuregcm.limits.RateLimiters;
-import org.whispersystems.textsecuregcm.metrics.UserAgentTagUtil;
+import org.whispersystems.textsecuregcm.filters.RemoteAddressFilter;
 import org.whispersystems.textsecuregcm.push.MessageTooLargeException;
 import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.storage.AccountsManager;
@@ -61,26 +57,14 @@ import org.whispersystems.textsecuregcm.storage.Device;
 @io.swagger.v3.oas.annotations.tags.Tag(name = "Account")
 public class AccountControllerV2 {
 
-  private static final String CHANGE_NUMBER_COUNTER_NAME = name(AccountControllerV2.class, "changeNumber");
-  private static final String VERIFICATION_TYPE_TAG_NAME = "verification";
-
   private final AccountsManager accountsManager;
   private final ChangeNumberManager changeNumberManager;
-  private final PhoneVerificationTokenManager phoneVerificationTokenManager;
-  private final RegistrationLockVerificationManager registrationLockVerificationManager;
-  private final RateLimiters rateLimiters;
 
   public AccountControllerV2(final AccountsManager accountsManager,
-      final ChangeNumberManager changeNumberManager,
-      final PhoneVerificationTokenManager phoneVerificationTokenManager,
-      final RegistrationLockVerificationManager registrationLockVerificationManager,
-      final RateLimiters rateLimiters) {
+      final ChangeNumberManager changeNumberManager) {
 
     this.accountsManager = accountsManager;
     this.changeNumberManager = changeNumberManager;
-    this.phoneVerificationTokenManager = phoneVerificationTokenManager;
-    this.registrationLockVerificationManager = registrationLockVerificationManager;
-    this.rateLimiters = rateLimiters;
   }
 
   @PUT
@@ -99,11 +83,12 @@ public class AccountControllerV2 {
   @ApiResponse(responseCode = "423", content = @Content(schema = @Schema(implementation = RegistrationLockFailure.class)))
   @ApiResponse(responseCode = "429", description = "Too many attempts", headers = @Header(
       name = "Retry-After",
-      description = "If present, an positive integer indicating the number of seconds before a subsequent attempt could succeed"))
+      description = "If present, a positive integer indicating the number of seconds before a subsequent attempt could succeed"))
   public AccountIdentityResponse changeNumber(@Auth final AuthenticatedDevice authenticatedDevice,
       @NotNull @Valid final ChangeNumberRequest request,
       @HeaderParam(HttpHeaders.USER_AGENT) final String userAgentString,
-      @Context final ContainerRequestContext requestContext) throws RateLimitExceededException, InterruptedException {
+      @Context final ContainerRequestContext requestContext)
+      throws RateLimitExceededException, InterruptedException, RegistrationLockFailureException {
 
     if (authenticatedDevice.deviceId() != Device.PRIMARY_ID) {
       throw new ForbiddenException();
@@ -113,45 +98,24 @@ public class AccountControllerV2 {
       throw new WebApplicationException("Invalid signature", 422);
     }
 
-    final String number = request.number();
-
-    final Account account = accountsManager.getByAccountIdentifier(authenticatedDevice.accountIdentifier())
-        .orElseThrow(() -> new WebApplicationException(Response.Status.UNAUTHORIZED));
-
-    // Only verify and check reglock if there's a data change to be made...
-    if (!account.getNumber().equals(number)) {
-
-      rateLimiters.getRegistrationLimiter().validate(number);
-
-      final PhoneVerificationRequest.VerificationType verificationType = phoneVerificationTokenManager.verify(
-          requestContext, number, request);
-
-      final Optional<Account> existingAccount = accountsManager.getByE164(number);
-
-      if (existingAccount.isPresent()) {
-        registrationLockVerificationManager.verifyRegistrationLock(existingAccount.get(), request.registrationLock(),
-            userAgentString, RegistrationLockVerificationManager.Flow.CHANGE_NUMBER, verificationType);
-      }
-
-      Metrics.counter(CHANGE_NUMBER_COUNTER_NAME, Tags.of(UserAgentTagUtil.getPlatformTag(userAgentString),
-              Tag.of(VERIFICATION_TYPE_TAG_NAME, verificationType.name())))
-          .increment();
-    }
-
-    // ...but always attempt to make the change in case a client retries and needs to re-send messages
     try {
       final Account updatedAccount = changeNumberManager.changeNumber(
-          account,
+          authenticatedDevice.accountIdentifier(),
+          StringUtils.isNotBlank(request.sessionId()) ? request.decodeSessionId() : null,
+          request.recoveryPassword(),
+          request.registrationLock(),
           request.number(),
           request.pniIdentityKey(),
           request.devicePniSignedPrekeys(),
           request.devicePniPqLastResortPrekeys(),
           request.deviceMessages(),
           request.pniRegistrationIds(),
-          userAgentString);
+          userAgentString,
+          requestContext.getHeaderString(HttpHeaders.ACCEPT_LANGUAGE),
+          (String) requestContext.getProperty(RemoteAddressFilter.REMOTE_ADDRESS_ATTRIBUTE_NAME));
 
       return AccountIdentityResponseBuilder.fromAccount(updatedAccount);
-    } catch (MismatchedDevicesException e) {
+    } catch (final MismatchedDevicesException e) {
       if (!e.getMismatchedDevices().staleDeviceIds().isEmpty()) {
         throw new WebApplicationException(Response.status(410)
             .type(MediaType.APPLICATION_JSON)
@@ -164,40 +128,21 @@ public class AccountControllerV2 {
                 e.getMismatchedDevices().extraDeviceIds()))
             .build());
       }
-    } catch (IllegalArgumentException e) {
+    } catch (final IllegalArgumentException e) {
       throw new BadRequestException(e);
-    } catch (MessageTooLargeException e) {
+    } catch (final MessageTooLargeException e) {
       throw new WebApplicationException(Response.Status.REQUEST_ENTITY_TOO_LARGE);
+    } catch (final MessageDeliveryNotAllowedException e) {
+      throw new ServiceUnavailableException();
+    } catch (final UnverifiedRegistrationSessionException e) {
+      throw new NotAuthorizedException("registration session is unverified");
+    } catch (final InvalidRegistrationSessionException e) {
+      throw new BadRequestException(e.getMessage());
+    } catch (final IOException e) {
+      throw new ServiceUnavailableException(e.getMessage());
+    } catch (final RecoveryPasswordVerificationFailedException e) {
+      throw new ForbiddenException("recovery password could not be verified");
     }
-  }
-
-  // TODO Remove entirely on or after 2025-10-08
-  @Deprecated(forRemoval = true)
-  @PUT
-  @Path("/phone_number_identity_key_distribution")
-  @Consumes(MediaType.APPLICATION_JSON)
-  @Produces(MediaType.APPLICATION_JSON)
-  @Operation(summary = "Set phone-number identity keys",
-      description = "Updates key material for the phone-number identity for all devices and sends a synchronization message to companion devices")
-  @ApiResponse(responseCode = "200", description = "Indicates the transaction was successful and returns basic information about this account.", useReturnTypeSchema = true)
-  @ApiResponse(responseCode = "401", description = "Account authentication check failed.")
-  @ApiResponse(responseCode = "403", description = "This endpoint can only be invoked from the account's primary device.")
-  @ApiResponse(responseCode = "422", description = "The request body failed validation.")
-  public AccountIdentityResponse distributePhoneNumberIdentityKeys(
-      @Auth final AuthenticatedDevice authenticatedDevice,
-      @HeaderParam(HttpHeaders.USER_AGENT) @Nullable final String userAgentString,
-      @NotNull @Valid final PhoneNumberIdentityKeyDistributionRequest request) {
-
-    if (authenticatedDevice.deviceId() != Device.PRIMARY_ID) {
-      throw new ForbiddenException();
-    }
-
-    if (!request.isSignatureValidOnEachSignedPreKey(userAgentString)) {
-      throw new WebApplicationException("Invalid signature", 422);
-    }
-
-    return AccountIdentityResponseBuilder.fromAccount(accountsManager.getByAccountIdentifier(authenticatedDevice.accountIdentifier())
-        .orElseThrow(() -> new WebApplicationException(Response.Status.UNAUTHORIZED)));
   }
 
   @PUT
@@ -210,11 +155,13 @@ public class AccountControllerV2 {
       @Auth AuthenticatedDevice auth,
       @NotNull @Valid PhoneNumberDiscoverabilityRequest phoneNumberDiscoverability) {
 
-    final Account account = accountsManager.getByAccountIdentifier(auth.accountIdentifier())
-        .orElseThrow(() -> new WebApplicationException(Response.Status.UNAUTHORIZED));
+    accountsManager.update(auth.accountIdentifier(), account -> {
+      if (account.getNumber().isEmpty()) {
+        throw new BadRequestException();
+      }
 
-    accountsManager.update(account, a -> a.setDiscoverableByPhoneNumber(
-        phoneNumberDiscoverability.discoverableByPhoneNumber()));
+      account.setDiscoverableByPhoneNumber(phoneNumberDiscoverability.discoverableByPhoneNumber());
+    });
   }
 
   @GET

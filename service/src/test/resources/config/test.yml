@@ -14,31 +14,6 @@ awsCredentialsProvider:
   accessKeyId: secret://aws.accessKeyId
   secretAccessKey: secret://aws.secretAccessKey
 
-metrics:
-  reporters:
-    - type: signal-datadog
-      frequency: 10 seconds
-      tags:
-        - "env:test"
-        - "service:chat"
-      udpTransport:
-        statsdHost: localhost
-        port: 8125
-      excludesAttributes:
-        - m1_rate
-        - m5_rate
-        - m15_rate
-        - mean_rate
-        - stddev
-      useRegexFilters: true
-      excludes:
-        - ^.+\.total$
-        - ^.+\.request\.filtering$
-        - ^.+\.response\.filtering$
-        - ^executor\..+$
-        - ^lettuce\..+$
-  reportOnStop: true
-
 tlsKeyStore:
   password: secret://tlsKeyStore.password
 
@@ -56,7 +31,7 @@ stripe:
 
 braintree:
   merchantId: unset
-  publicKey: unset
+  publicKey: secret://braintree.publicKey
   privateKey: secret://braintree.privateKey
   environment: sandbox
   graphqlUrl: unset
@@ -71,7 +46,16 @@ braintree:
     type: stub
 
 googlePlayBilling:
-  credentialsJson: secret://googlePlayBilling.credentialsJson
+  credentialsJson: |
+    {
+      "type": "external_account",
+      "credential_source": {
+        "file": "/tmp/my-token"
+      },
+      "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+      "audience": "//iam.googleapis.com/abc",
+      "token_url": "https://sts.googleapis.com/v1/token"
+    }
   packageName: package.name
   applicationName: test
   productIdToLevel: {}
@@ -96,7 +80,6 @@ appleDeviceCheck:
 
 deviceCheck:
   backupRedemptionDuration: P30D
-  backupRedemptionLevel: 201
 
 dynamoDbClient:
   type: local
@@ -114,17 +97,21 @@ dynamoDbTables:
     tableName: apple_device_check_public_keys_test
   backups:
     tableName: backups_test
+  changeNumberWaitingPeriods:
+    tableName: change_number_waiting_periods_test
   clientReleases:
     tableName: client_releases_test
   deletedAccounts:
     tableName: deleted_accounts_test
   deletedAccountsLock:
     tableName: deleted_accounts_lock_test
+  donationPermits:
+    tableName: donation_permits_test
+    expiration: P7D # Duration of time until rows expire
   issuedReceipts:
     tableName: issued_receipts_test
-    expiration: P30D # Duration of time until rows expire
     generator: abcdefg12345678= # random base64-encoded binary sequence
-    maxIssuedReceiptsPerPaymentId:
+    maxReceiptsPerSubscriptionPayment:
       STRIPE: 1
       BRAINTREE: 1
       GOOGLE_PLAY_BILLING: 1
@@ -133,8 +120,6 @@ dynamoDbTables:
     tableName: keys_test
   ecSignedPreKeys:
     tableName: repeated_use_signed_ec_pre_keys_test
-  pqKeys:
-    tableName: pq_keys_test
   pagedPqKeys:
     tableName: paged_pq_keys_test
   pqLastResortKeys:
@@ -147,15 +132,18 @@ dynamoDbTables:
     expiration: P90D
   phoneNumberIdentifiers:
     tableName: pni_test
+  profileAvatars:
+    tableName: profileAvatars_test
   profiles:
     tableName: profiles_test
+  profilesV2:
+    tableName: profilesV2_test
   pushChallenge:
     tableName: push_challenge_test
   pushNotificationExperimentSamples:
     tableName: Example_PushNotificationExperimentSamples
   redeemedReceipts:
     tableName: redeemed_receipts_test
-    expiration: P30D # Duration of time until rows expire
   registrationRecovery:
     tableName: registration_recovery_passwords_test
     expiration: P300D # Duration of time until rows expire
@@ -163,13 +151,13 @@ dynamoDbTables:
     tableName: remote_config_test
   reportMessage:
     tableName: report_messages_test
+  sandboxAccounts:
+    tableName: sandbox_accounts_test
   scheduledJobs:
     tableName: scheduled_jobs_test
     expiration: P7D
   subscriptions:
     tableName: subscriptions_test
-  clientPublicKeys:
-    tableName: client_public_keys_test
   verificationSessions:
     tableName: verification_sessions_test
 
@@ -257,10 +245,13 @@ messageCache: # Redis server configuration for message store cache
   cluster:
     type: local
 
+attachments:
+  maxAttachmentUploadSizeInBytes: 1024
+  maxMessageBackupUploadSizeInBytes: 1024
+
 gcpAttachments: # GCP Storage configuration
   domain: example.com
   email: user@example.cocm
-  maxSizeInBytes: 1024
   pathPrefix:
   rsaSigningKey: secret://gcpAttachments.rsaSigningKey
 
@@ -293,11 +284,6 @@ cdn3StorageManager:
     2: gcs
     3: r2
 
-dogstatsd:
-  type: nowait
-  environment: dev
-  host: 127.0.0.1
-
 openTelemetry:
   enabled: false
   environment: dev
@@ -305,9 +291,10 @@ openTelemetry:
   url: http://127.0.0.1:4318/
 
 unidentifiedDelivery:
-  certificate: CgIIAQ==
+  certificate: CikI14bfmgcSIQWEfA0sN1I082XmYJVRh6NzWg92E9FgnTpqTYxTrqpaIhJA4LnrrN/Dqign95JLaXeE0cJeRMoF3UM+GjjcY4LrJzDUGcqaJQsb6dWpRj5h79Z4F3epG4PJe4RNAUIG4oKXhQ==
   privateKey: secret://unidentifiedDelivery.privateKey
   expiresDays: 7
+  embedSigner: true
 
 shortCode:
   baseUrl: https://example.com/shortcodes/
@@ -339,21 +326,26 @@ storageService:
       9Kxq0DY7RCEpdHMCKcOL
       -----END CERTIFICATE-----
 
-zkConfig:
-  serverPublic: AAp8oB0D4EV2q7hSue3Kxzh1Vc88/nmLuRR9G3EefC0+CMcxJFQwDMgjFvFBKx3o6m9gJLevYiKcm/NxXX9WtnFMDHgDgfqHxbCi2rm20SgoHnuoph6XArmEOX6a1xLJVxgDtgfm1IbcyyqROXYxe9v2RvMUAnjbLI/fm0rXXhldjszlVR/wRpybX90RUjFyL/2Achttf3IC/ShWKkB6mWXwuFCcNfzeCCQ+w7cNnDbWscBcrhuou7HZvbt16/YdCXLyp+WdwS8ZkelpITvyK2hsPvf4oxaRLQfVRYXUMX55xpapbKH6PthuOzMVRkf+I3Xz3/bNjiQSlQkmAXlgB1YujgABYnJ6yJXQKP2mR4UJ3UYoGroYoafWycDa+vUYYozaUmzFjsBYWpYE+HyPJlJ2QaFTrpVqxX7NXsSbg8t35IvfWfZME9YBZ2eErDunwkaE4iDQhHl5IXAhbHDrr2QaJ68YIkn7lJSgFDKGFB2kb6BvDUGzcpI/CTHQi6WlCqQidQLJWDFFdlYjrUCQM2vvJtgyGrSc89jdXTFjM31aqmtcPWgWL0qv+RmK/BC392Nsu8WoSJcAE4yhccQuRSemtolgwewnjasoOFBNOPh4+pX55SwhyTVgtwl+NTNVNFydxGp9Me8ogRWElzwA9BFtNAgQtlfgIyZRTetFqLkYmIBDxwMcpizDKES5lPhV2uJJuzcMq/06mVQz2OrXgglWk01uN8U59pfNFpTZhcGQv+MHjwEAudq5eLpt3aFrdxJ7D26Fwl5j215SJ0yZo7vmSEML1vf7FaGh0IL57bRpCvdebB5WapSChUX+PPvCXohVjGrERFvQpeET6pydGGlEKYLWuWa3zFGmPvJJYZ/QfcmIP9zyhqzQT/7a7RIqFA==
-  serverSecret: secret://zkConfig-libsignal-0.42.serverSecret
+callingZkConfigPreV101:
+  serverSecret: secret://callingZkConfigPreV101.serverSecret
 
 callingZkConfig:
-  serverSecret: secret://callingZkConfig.serverSecret
+  serverSecret: secret://callingZkConfigV101.serverSecret
 
-backupsZkConfig:
-  serverSecret: secret://backupsZkConfig.serverSecret
+chatZkConfig:
+  serverSecret: secret://chatZkConfig.serverSecret
+
+groupsZkConfig:
+  serverPublic: AAp8oB0D4EV2q7hSue3Kxzh1Vc88/nmLuRR9G3EefC0+CMcxJFQwDMgjFvFBKx3o6m9gJLevYiKcm/NxXX9WtnFMDHgDgfqHxbCi2rm20SgoHnuoph6XArmEOX6a1xLJVxgDtgfm1IbcyyqROXYxe9v2RvMUAnjbLI/fm0rXXhldjszlVR/wRpybX90RUjFyL/2Achttf3IC/ShWKkB6mWXwuFCcNfzeCCQ+w7cNnDbWscBcrhuou7HZvbt16/YdCXLyp+WdwS8ZkelpITvyK2hsPvf4oxaRLQfVRYXUMX55xpapbKH6PthuOzMVRkf+I3Xz3/bNjiQSlQkmAXlgB1YujgABYnJ6yJXQKP2mR4UJ3UYoGroYoafWycDa+vUYYozaUmzFjsBYWpYE+HyPJlJ2QaFTrpVqxX7NXsSbg8t35IvfWfZME9YBZ2eErDunwkaE4iDQhHl5IXAhbHDrr2QaJ68YIkn7lJSgFDKGFB2kb6BvDUGzcpI/CTHQi6WlCqQidQLJWDFFdlYjrUCQM2vvJtgyGrSc89jdXTFjM31aqmtcPWgWL0qv+RmK/BC392Nsu8WoSJcAE4yhccQuRSemtolgwewnjasoOFBNOPh4+pX55SwhyTVgtwl+NTNVNFydxGp9Me8ogRWElzwA9BFtNAgQtlfgIyZRTetFqLkYmIBDxwMcpizDKES5lPhV2uJJuzcMq/06mVQz2OrXgglWk01uN8U59pfNFpTZhcGQv+MHjwEAudq5eLpt3aFrdxJ7D26Fwl5j215SJ0yZo7vmSEML1vf7FaGh0IL57bRpCvdebB5WapSChUX+PPvCXohVjGrERFvQpeET6pydGGlEKYLWuWa3zFGmPvJJYZ/QfcmIP9zyhqzQT/7a7RIqFA==
+  serverSecret: secret://zkConfig-libsignal-0.42.serverSecret
 
 dynamicConfig:
   type: static
   object: |
     captcha:
       scoreFloor: 1.0
+    grpcAllowList:
+      enableAll: true
 
 remoteConfig:
   globalConfig: # keys and values that are given to clients on GET /v1/config
@@ -382,10 +374,8 @@ badges:
       svgs:
         - light: example-light.svg
           dark: example-dark.svg
-  badgeIdsEnabledForAll:
-    - TEST
   receiptLevels:
-    '1': TEST
+    ONE_TIME_DONATION: TEST
 
 subscription: # configuration for Stripe subscriptions
   badgeExpiration: P30D
@@ -409,14 +399,17 @@ subscription: # configuration for Stripe subscriptions
             STRIPE: price_example   # stripe Price ID
             BRAINTREE: plan_example # braintree Plan ID
 
+loginPurchase:
+  playProductId: login_example
+  playOptionId: login_option_example
+  appStoreProductId: login_example
+
 oneTimeDonations:
   sepaMaximumEuros: '10000'
   boost:
-    level: 1
     expiration: P90D
     badge: TEST
   gift:
-    level: 10
     expiration: P90D
     badge: TEST
   currencies:
@@ -525,12 +518,6 @@ turn:
 linkDevice:
   secret: secret://linkDevice.secret
 
-noiseTunnel:
-  webSocketPort: 8444
-  directPort: 8445
-  noiseStaticPrivateKey: secret://noiseTunnel.noiseStaticPrivateKey
-  recognizedProxySecret: secret://noiseTunnel.recognizedProxySecret
-
 externalRequestFilter:
   grpcMethods:
     - com.example.grpc.ExampleService/exampleMethod
@@ -541,3 +528,61 @@ externalRequestFilter:
 
 idlePrimaryDeviceReminder:
   minIdleDuration: P30D
+
+grpc:
+  port: 50051
+  websocketPort: 8080
+  h2c: true
+
+asnTable:
+  s3Region: a-region
+  s3Bucket: a-bucket
+  objectKey: asn.tsv
+  maxSize: 100000
+  refreshInterval: PT10S
+
+callQualitySurvey:
+  pubSubPublisher:
+    type: stub
+
+hlrLookup:
+  apiKey: secret://hlrLookup.apiKey
+  apiSecret: secret://hlrLookup.apiSecret
+
+server:
+  allowedMethods:
+    - GET
+    - POST
+    - PUT
+    - DELETE
+    - HEAD
+    - OPTIONS
+    - PATCH
+    - CONNECT
+  applicationConnectors:
+    - type: h2c
+      port: 8080
+      useForwardedHeaders: true
+
+foundationDbMessages:
+  maxWatchesPerClient: 10000
+  transactionTimeout: PT1S
+  transactionRetryLimit: 3
+  batchPriorityTransactionTimeout: PT5S
+  batchPriorityTransactionRetryLimit: 10
+  versionstampCipherKeys:
+    0: secret://foundationDbMessages.versionstampCipherKey.0
+  currentVersionstampCipherKey: 0
+  clusters:
+    "messages-0":
+      type: local
+  epochs:
+    0:
+      - messages-0
+
+registrationWebAuthn:
+  relyingPartyId: example.org
+  origins:
+    - https://example.org
+  challengeTtl: PT2M
+  userHandleBlindingSecret: secret://registrationWebAuthn.userHandleBlindingSecret

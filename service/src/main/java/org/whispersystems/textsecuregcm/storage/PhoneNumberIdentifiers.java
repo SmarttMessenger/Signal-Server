@@ -18,7 +18,6 @@ import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.whispersystems.textsecuregcm.identity.IdentityType;
 import org.whispersystems.textsecuregcm.util.AttributeValues;
 import org.whispersystems.textsecuregcm.util.ExceptionUtils;
 import org.whispersystems.textsecuregcm.util.Util;
@@ -44,7 +43,7 @@ public class PhoneNumberIdentifiers {
   private final String tableName;
 
   @VisibleForTesting
-  static final String KEY_E164 = "P";
+  public static final String KEY_E164 = "P";
   @VisibleForTesting
   static final String INDEX_NAME = "pni_to_p";
   @VisibleForTesting
@@ -184,7 +183,8 @@ public class PhoneNumberIdentifiers {
    * @return The provided PNI if the update occurred, or the existing PNI associated with originalPhoneNumber
    */
   @VisibleForTesting
-  CompletableFuture<UUID> setPni(final String originalPhoneNumber, final List<String> allPhoneNumberForms,
+  public CompletableFuture<UUID> setPni(final String originalPhoneNumber,
+      final List<String> allPhoneNumberForms,
       final UUID pni) {
     if (!originalPhoneNumber.equals(allPhoneNumberForms.getFirst())) {
       throw new IllegalArgumentException("allPhoneNumberForms must start with the target phoneNumber");
@@ -246,7 +246,12 @@ public class PhoneNumberIdentifiers {
   }
 
   CompletableFuture<Void> regeneratePhoneNumberIdentifierMappings(final Account account) {
-    return setPni(account.getNumber(), Util.getAlternateForms(account.getNumber()), account.getIdentifier(IdentityType.PNI))
-        .thenRun(Util.NOOP);
+    return account.getNumber()
+            .map(phoneNumber -> setPni(phoneNumber,
+                    Util.getAlternateForms(phoneNumber),
+                    account.getPhoneNumberIdentifier()
+                            .orElseThrow(() -> new AssertionError("Account has a phone number, but no PNI")))
+                    .thenRun(Util.NOOP))
+            .orElseGet(() -> CompletableFuture.completedFuture(null));
   }
 }

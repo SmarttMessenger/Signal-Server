@@ -236,12 +236,12 @@ class DynamicConfigurationTest {
           .getRemoteDeprecationConfiguration();
 
       assertEquals(Map.of(ClientPlatform.IOS, new Semver("1.2.3"), ClientPlatform.ANDROID, new Semver("4.5.6")),
-          remoteDeprecationConfiguration.getMinimumVersions());
+          remoteDeprecationConfiguration.minimumVersions());
       assertEquals(Map.of(ClientPlatform.DESKTOP, new Semver("7.8.9")),
-          remoteDeprecationConfiguration.getVersionsPendingDeprecation());
+          remoteDeprecationConfiguration.versionsPendingDeprecation());
       assertEquals(Map.of(ClientPlatform.DESKTOP, Set.of(new Semver("1.4.0-beta.2"))),
-          remoteDeprecationConfiguration.getBlockedVersions());
-      assertTrue(remoteDeprecationConfiguration.getVersionsPendingBlock().isEmpty());
+          remoteDeprecationConfiguration.blockedVersions());
+      assertTrue(remoteDeprecationConfiguration.versionsPendingBlock().isEmpty());
     }
   }
 
@@ -252,7 +252,7 @@ class DynamicConfigurationTest {
       final DynamicConfiguration emptyConfig =
           DynamicConfigurationManager.parseConfiguration(emptyConfigYaml, DynamicConfiguration.class).orElseThrow();
 
-      assertTrue(emptyConfig.getPaymentsConfiguration().getDisallowedPrefixes().isEmpty());
+      assertTrue(emptyConfig.getPaymentsConfiguration().disallowedPrefixes().isEmpty());
     }
 
     {
@@ -266,7 +266,7 @@ class DynamicConfigurationTest {
           DynamicConfigurationManager.parseConfiguration(paymentsConfigYaml, DynamicConfiguration.class).orElseThrow()
               .getPaymentsConfiguration();
 
-      assertEquals(List.of("+44"), config.getDisallowedPrefixes());
+      assertEquals(List.of("+44"), config.disallowedPrefixes());
     }
   }
 

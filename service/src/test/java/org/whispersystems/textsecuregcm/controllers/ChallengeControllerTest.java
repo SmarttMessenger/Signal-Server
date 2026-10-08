@@ -33,6 +33,7 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.whispersystems.textsecuregcm.auth.AuthenticatedDevice;
+import org.whispersystems.textsecuregcm.captcha.InvalidCaptchaArgumentException;
 import org.whispersystems.textsecuregcm.limits.RateLimitChallengeManager;
 import org.whispersystems.textsecuregcm.mappers.RateLimitExceededExceptionMapper;
 import org.whispersystems.textsecuregcm.push.NotPushRegisteredException;
@@ -68,7 +69,7 @@ class ChallengeControllerTest {
     when(accountsManager.getByAccountIdentifier(AuthHelper.VALID_UUID)).thenReturn(Optional.of(AuthHelper.VALID_ACCOUNT));
     when(accountsManager.getByAccountIdentifier(AuthHelper.VALID_UUID_TWO)).thenReturn(Optional.of(AuthHelper.VALID_ACCOUNT_TWO));
 
-    when(challengeConstraintChecker.challengeConstraints(any(), any()))
+    when(challengeConstraintChecker.challengeConstraintsHttp(any(), any()))
         .thenReturn(new ChallengeConstraints(true, Optional.empty()));
   }
 
@@ -119,7 +120,8 @@ class ChallengeControllerTest {
 
   @ParameterizedTest
   @ValueSource(booleans = { true, false } )
-  void testHandleCaptcha(boolean hasThreshold) throws RateLimitExceededException, IOException {
+  void testHandleCaptcha(boolean hasThreshold)
+      throws RateLimitExceededException, IOException, InvalidCaptchaArgumentException {
     final String captchaChallengeJson = """
         {
           "type": "captcha",
@@ -133,7 +135,7 @@ class ChallengeControllerTest {
 
 
     if (hasThreshold) {
-      when(challengeConstraintChecker.challengeConstraints(any(), any()))
+      when(challengeConstraintChecker.challengeConstraintsHttp(any(), any()))
           .thenReturn(new ChallengeConstraints(true, Optional.of(0.5F)));
     }
     final Response response = EXTENSION.target("/v1/challenge")
@@ -149,7 +151,7 @@ class ChallengeControllerTest {
   }
 
   @Test
-  void testHandleInvalidCaptcha() throws RateLimitExceededException, IOException {
+  void testHandleInvalidCaptcha() throws RateLimitExceededException, IOException, InvalidCaptchaArgumentException {
     final String captchaChallengeJson = """
         {
           "type": "captcha",
@@ -170,7 +172,7 @@ class ChallengeControllerTest {
   }
 
   @Test
-  void testHandleCaptchaRateLimited() throws RateLimitExceededException, IOException {
+  void testHandleCaptchaRateLimited() throws RateLimitExceededException, IOException, InvalidCaptchaArgumentException {
     final String captchaChallengeJson = """
         {
           "type": "captcha",
@@ -236,7 +238,7 @@ class ChallengeControllerTest {
 
   @Test
   void testRequestPushChallengeNotPermitted() {
-    when(challengeConstraintChecker.challengeConstraints(any(), any()))
+    when(challengeConstraintChecker.challengeConstraintsHttp(any(), any()))
         .thenReturn(new ChallengeConstraints(false, Optional.empty()));
 
     final Response response = EXTENSION.target("/v1/challenge/push")
@@ -249,7 +251,7 @@ class ChallengeControllerTest {
 
   @Test
   void testAnswerPushChallengeNotPermitted() {
-    when(challengeConstraintChecker.challengeConstraints(any(), any()))
+    when(challengeConstraintChecker.challengeConstraintsHttp(any(), any()))
         .thenReturn(new ChallengeConstraints(false, Optional.empty()));
 
     final String pushChallengeJson = """

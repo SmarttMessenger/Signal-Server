@@ -4,8 +4,8 @@
  */
 package org.whispersystems.textsecuregcm.backup;
 
-import io.grpc.Status;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.security.SecureRandom;
@@ -22,18 +22,12 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Predicate;
-import io.micrometer.core.instrument.DistributionSummary;
-import io.micrometer.core.instrument.Metrics;
-import io.micrometer.core.instrument.Tag;
-import io.micrometer.core.instrument.Tags;
 import org.signal.libsignal.protocol.InvalidKeyException;
 import org.signal.libsignal.protocol.ecc.ECPublicKey;
 import org.signal.libsignal.zkgroup.backups.BackupLevel;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.whispersystems.textsecuregcm.auth.AuthenticatedBackupUser;
-import org.whispersystems.textsecuregcm.metrics.MetricsUtil;
-import org.whispersystems.textsecuregcm.metrics.UserAgentTagUtil;
 import org.whispersystems.textsecuregcm.util.AttributeValues;
 import org.whispersystems.textsecuregcm.util.ExceptionUtils;
 import org.whispersystems.textsecuregcm.util.Util;
@@ -87,10 +81,6 @@ public class BackupsDb {
 
   private final SecureRandom secureRandom;
 
-  private static final String NUM_OBJECTS_SUMMARY_NAME = MetricsUtil.name(BackupsDb.class, "numObjects");
-  private static final String BYTES_USED_SUMMARY_NAME = MetricsUtil.name(BackupsDb.class, "bytesUsed");
-  private static final String BACKUPS_COUNTER_NAME = MetricsUtil.name(BackupsDb.class, "backups");
-
   // The backups table
 
   // B: 16 bytes that identifies the backup
@@ -137,7 +127,7 @@ public class BackupsDb {
    * @param authenticatedBackupLevel The backup level
    * @param publicKey                The public key to associate with the backup id
    * @return A stage that completes when the public key has been set. If the backup-id already has a set public key that
-   * does not match, the stage will be completed exceptionally with a {@link PublicKeyConflictException}
+   * does not match, the stage will be completed exceptionally with a {@link BackupPublicKeyConflictException}
    */
   CompletableFuture<Void> setPublicKey(
       final byte[] authenticatedBackupId,
@@ -156,7 +146,7 @@ public class BackupsDb {
             .build())
         .exceptionally(ExceptionUtils.marshal(ConditionalCheckFailedException.class, e ->
             // There was already a row for this backup-id and it contained a different publicKey
-            new PublicKeyConflictException()))
+            new BackupPublicKeyConflictException()))
         .thenRun(Util.NOOP);
   }
 
@@ -194,9 +184,7 @@ public class BackupsDb {
   private static String getDirName(final Map<String, AttributeValue> item, final String attr) {
     return AttributeValues.get(item, attr).map(AttributeValue::s).orElseThrow(() -> {
       logger.error("Backups with public keys should have directory names");
-      return Status.INTERNAL
-          .withDescription("Backups with public keys must have directory names")
-          .asRuntimeException();
+      throw new UncheckedIOException(new IOException("Backups with public keys must have directory names"));
     });
   }
 
@@ -212,10 +200,7 @@ public class BackupsDb {
       return new ECPublicKey(publicKeyBytes);
     } catch (InvalidKeyException e) {
       logger.error("Invalid publicKey {}", HexFormat.of().formatHex(publicKeyBytes), e);
-      throw Status.INTERNAL
-          .withCause(e)
-          .withDescription("Could not deserialize stored public key")
-          .asRuntimeException();
+      throw new UncheckedIOException(new IOException("Could not deserialize stored public key"));
     }
   }
 
@@ -246,7 +231,7 @@ public class BackupsDb {
    *
    * @param backupUser an already authorized backup user
    */
-  CompletableFuture<Void> ttlRefresh(final AuthenticatedBackupUser backupUser) {
+  CompletableFuture<StoredBackupAttributes> ttlRefresh(final AuthenticatedBackupUser backupUser) {
     final Instant today = clock.instant().truncatedTo(ChronoUnit.DAYS);
     // update message backup TTL
     return dynamoClient.updateItem(UpdateBuilder.forUser(backupTableName, backupUser)
@@ -254,16 +239,17 @@ public class BackupsDb {
             .updateItemBuilder()
             .returnValues(ReturnValue.ALL_OLD)
             .build())
-        .thenAccept(updateItemResponse ->
-            updateMetricsAfterRefresh(backupUser, today, updateItemResponse.attributes()));
+        .thenApply(updateItemResponse -> fromItem(updateItemResponse.attributes()));
   }
+
 
   /**
    * Track that a backup will be stored for the user
    *
    * @param backupUser an already authorized backup user
+   * @return A future that completes with the attributes of the backup before the update
    */
-  CompletableFuture<Void> addMessageBackup(final AuthenticatedBackupUser backupUser) {
+  CompletableFuture<StoredBackupAttributes> addMessageBackup(final AuthenticatedBackupUser backupUser) {
     final Instant today = clock.instant().truncatedTo(ChronoUnit.DAYS);
     // this could race with concurrent updates, but the only effect would be last-writer-wins on the timestamp
     return dynamoClient.updateItem(
@@ -273,40 +259,7 @@ public class BackupsDb {
                 .updateItemBuilder()
                 .returnValues(ReturnValue.ALL_OLD)
                 .build())
-        .thenAccept(updateItemResponse ->
-            updateMetricsAfterRefresh(backupUser, today, updateItemResponse.attributes()));
-  }
-
-  private void updateMetricsAfterRefresh(final AuthenticatedBackupUser backupUser, final Instant today, final Map<String, AttributeValue> item) {
-    final Instant previousRefreshTime = Instant.ofEpochSecond(
-        AttributeValues.getLong(item, ATTR_LAST_REFRESH, 0L));
-    // Only publish a metric update once per day
-    if (previousRefreshTime.isBefore(today)) {
-      final long mediaCount = AttributeValues.getLong(item, ATTR_MEDIA_COUNT, 0L);
-      final long bytesUsed = AttributeValues.getLong(item, ATTR_MEDIA_BYTES_USED, 0L);
-      final Tags tags = Tags.of(
-          UserAgentTagUtil.getPlatformTag(backupUser.userAgent()),
-          Tag.of("tier", backupUser.backupLevel().name()));
-
-      DistributionSummary.builder(NUM_OBJECTS_SUMMARY_NAME)
-          .tags(tags)
-          .publishPercentileHistogram()
-          .register(Metrics.globalRegistry)
-          .record(mediaCount);
-      DistributionSummary.builder(BYTES_USED_SUMMARY_NAME)
-          .tags(tags)
-          .publishPercentileHistogram()
-          .register(Metrics.globalRegistry)
-          .record(bytesUsed);
-
-      // Report that the backup is out of quota if it cannot store a max size media object
-      final boolean quotaExhausted = bytesUsed >=
-          (BackupManager.MAX_TOTAL_BACKUP_MEDIA_BYTES - BackupManager.MAX_MEDIA_OBJECT_SIZE);
-
-      Metrics.counter(BACKUPS_COUNTER_NAME,
-              tags.and("quotaExhausted", String.valueOf(quotaExhausted)))
-          .increment();
-    }
+        .thenApply(updateItemResponse -> fromItem(updateItemResponse.attributes()));
   }
 
   /**
@@ -366,6 +319,7 @@ public class BackupsDb {
    * @param backupUser an already authorized backup user
    * @return A {@link BackupDescription} containing the cdn of the message backup and the total number of media space
    * bytes used by the backup user.
+   * @throws BackupNotFoundException If the provided backupUser's backup-id does not exist
    */
   CompletableFuture<BackupDescription> describeBackup(final AuthenticatedBackupUser backupUser) {
     return dynamoClient.getItem(GetItemRequest.builder()
@@ -377,7 +331,9 @@ public class BackupsDb {
             .build())
         .thenApply(response -> {
           if (!response.hasItem()) {
-            throw Status.NOT_FOUND.withDescription("Backup ID not found").asRuntimeException();
+            // At this point, the user has already authenticated against this backup record, so we must have raced
+            // with a deletion. Just throw the same error we would have thrown if authentication had failed
+            throw ExceptionUtils.wrap(new BackupFailedZkAuthenticationException("Backup ID not found"));
           }
           // If the client hasn't already uploaded a backup, return the cdn we would return if they did create one
           final int cdn = AttributeValues.getInt(response.item(), ATTR_CDN, BACKUP_CDN);
@@ -497,14 +453,12 @@ public class BackupsDb {
     }
   }
 
-  Flux<StoredBackupAttributes> listBackupAttributes(final int segments, final Scheduler scheduler) {
+  Flux<StoredBackupAttributes> listBackupAttributes(final int segments) {
     if (segments < 1) {
       throw new IllegalArgumentException("Total number of segments must be positive");
     }
 
     return Flux.range(0, segments)
-        .parallel()
-        .runOn(scheduler)
         .flatMap(segment -> dynamoClient.scanPaginator(ScanRequest.builder()
                 .tableName(backupTableName)
                 .consistentRead(true)
@@ -519,18 +473,22 @@ public class BackupsDb {
                     "#backupDir", ATTR_BACKUP_DIR,
                     "#mediaDir", ATTR_MEDIA_DIR))
                 .projectionExpression("#backupIdHash, #refresh, #mediaRefresh, #bytesUsed, #numObjects, #backupDir, #mediaDir")
-                .build())
-            .items())
-        .sequential()
+                .build()))
+        // Don't use the SDK's item publisher, works around https://github.com/aws/aws-sdk-java-v2/issues/6411
+        .concatMap(page -> Flux.fromIterable(page.items()))
         .filter(item -> item.containsKey(KEY_BACKUP_ID_HASH))
-        .map(item -> new StoredBackupAttributes(
-            AttributeValues.getByteArray(item, KEY_BACKUP_ID_HASH, null),
-            AttributeValues.getString(item, ATTR_BACKUP_DIR, null),
-            AttributeValues.getString(item, ATTR_MEDIA_DIR, null),
-            Instant.ofEpochSecond(AttributeValues.getLong(item, ATTR_LAST_REFRESH, 0L)),
-            Instant.ofEpochSecond(AttributeValues.getLong(item, ATTR_LAST_MEDIA_REFRESH, 0L)),
-            AttributeValues.getLong(item, ATTR_MEDIA_BYTES_USED, 0L),
-            AttributeValues.getLong(item, ATTR_MEDIA_COUNT, 0L)));
+        .map(BackupsDb::fromItem);
+  }
+
+  private static StoredBackupAttributes fromItem(Map<String, AttributeValue> item) {
+    return new StoredBackupAttributes(
+        AttributeValues.getByteArray(item, KEY_BACKUP_ID_HASH, null),
+        AttributeValues.getString(item, ATTR_BACKUP_DIR, null),
+        AttributeValues.getString(item, ATTR_MEDIA_DIR, null),
+        Instant.ofEpochSecond(AttributeValues.getLong(item, ATTR_LAST_REFRESH, 0L)),
+        Instant.ofEpochSecond(AttributeValues.getLong(item, ATTR_LAST_MEDIA_REFRESH, 0L)),
+        AttributeValues.getLong(item, ATTR_MEDIA_BYTES_USED, 0L),
+        AttributeValues.getLong(item, ATTR_MEDIA_COUNT, 0L));
   }
 
   Flux<ExpiredBackup> getExpiredBackups(final int segments, final Scheduler scheduler, final Instant purgeTime) {

@@ -12,6 +12,7 @@ import java.time.Instant;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
+import org.whispersystems.textsecuregcm.purchases.PaymentProvider;
 
 public class OnetimeDonationsManagerTest {
   @RegisterExtension
@@ -23,7 +24,7 @@ public class OnetimeDonationsManagerTest {
     oneTimeDonationsManager = new OneTimeDonationsManager(
         DynamoDbExtensionSchema.Tables.ONETIME_DONATIONS.tableName(),
         Duration.ofDays(90),
-        DYNAMO_DB_EXTENSION.getDynamoDbAsyncClient());
+        DYNAMO_DB_EXTENSION.getDynamoDbClient());
   }
 
   @Test
@@ -31,9 +32,9 @@ public class OnetimeDonationsManagerTest {
     final String validPaymentIntentId = "abc";
     final Instant paidAt = Instant.ofEpochSecond(1_000_000);
     final Instant fallBackTimestamp = Instant.ofEpochSecond(2_000_000);
-    oneTimeDonationsManager.putPaidAt(validPaymentIntentId, paidAt).join();
+    oneTimeDonationsManager.putPaidAt(validPaymentIntentId, paidAt);
 
-    assertThat(oneTimeDonationsManager.getPaidAt(validPaymentIntentId, fallBackTimestamp).join()).isEqualTo(paidAt);
-    assertThat(oneTimeDonationsManager.getPaidAt("invalidPaymentId", fallBackTimestamp).join()).isEqualTo(fallBackTimestamp);
+    assertThat(oneTimeDonationsManager.getPaidAt(PaymentProvider.STRIPE, validPaymentIntentId, fallBackTimestamp)).isEqualTo(paidAt);
+    assertThat(oneTimeDonationsManager.getPaidAt(PaymentProvider.STRIPE, "invalidPaymentId", fallBackTimestamp)).isEqualTo(fallBackTimestamp);
   }
 }

@@ -11,12 +11,17 @@
   <artifactId>service</artifactId>
 
   <properties>
-    <firebase-admin.version>9.4.3</firebase-admin.version>
-    <java-uuid-generator.version>5.1.0</java-uuid-generator.version>
-    <google-androidpublisher.version>v3-rev20250318-2.0.0</google-androidpublisher.version>
-    <storekit.version>3.4.0</storekit.version>
-    <webauthn4j.version>0.28.6.RELEASE</webauthn4j.version>
-    <java-jwt.version>4.5.0</java-jwt.version>
+    <apollo-api-jvm.version>3.8.6</apollo-api-jvm.version>
+    <commons-compress.version>1.28.0</commons-compress.version>
+    <dynamodb-lock-client.version>1.5.0</dynamodb-lock-client.version>
+    <firebase-admin.version>9.10.0</firebase-admin.version>
+    <libphonenumber-geocoder.version>3.38</libphonenumber-geocoder.version>
+    <google-androidpublisher.version>v3-rev20250904-2.0.0</google-androidpublisher.version>
+    <java-jwt.version>4.6.0</java-jwt.version>
+    <java-uuid-generator.version>5.2.0</java-uuid-generator.version>
+    <!-- *all* opentelemetry-logback-appender versions are "alpha" despite the advanced version number -->
+    <opentelemetry-logback-appender-1.0.version>2.31.1-alpha</opentelemetry-logback-appender-1.0.version>
+    <storekit.version>5.2.0</storekit.version>
   </properties>
 
   <dependencies>
@@ -35,16 +40,26 @@
       <artifactId>app-store-server-library</artifactId>
       <version>${storekit.version}</version>
       <exclusions>
-        <!-- conflicts with okio-jvm from apollo-api-jvm -->
+        <!-- conflicts with other users; resolved manually with explicit import -->
         <exclusion>
           <groupId>com.squareup.okio</groupId>
           <artifactId>okio-jvm</artifactId>
+        </exclusion>
+        <!-- conflicts with our direct dependency -->
+        <exclusion>
+          <groupId>com.auth0</groupId>
+          <artifactId>java-jwt</artifactId>
         </exclusion>
       </exclusions>
     </dependency>
     <dependency>
       <groupId>com.webauthn4j</groupId>
       <artifactId>webauthn4j-appattest</artifactId>
+      <version>${webauthn4j.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>com.webauthn4j</groupId>
+      <artifactId>webauthn4j-core</artifactId>
       <version>${webauthn4j.version}</version>
     </dependency>
     <dependency>
@@ -80,11 +95,6 @@
     <dependency>
       <groupId>org.signal</groupId>
       <artifactId>libsignal-server</artifactId>
-    </dependency>
-
-    <dependency>
-      <groupId>org.signal.forks</groupId>
-      <artifactId>noise-java</artifactId>
     </dependency>
 
     <dependency>
@@ -137,6 +147,11 @@
       <artifactId>dropwizard-jetty</artifactId>
     </dependency>
     <dependency>
+      <groupId>org.eclipse.jetty.http2</groupId>
+      <artifactId>jetty-http2-client-transport</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
       <groupId>io.dropwizard</groupId>
       <artifactId>dropwizard-validation</artifactId>
     </dependency>
@@ -165,6 +180,20 @@
     <dependency>
       <groupId>net.logstash.logback</groupId>
       <artifactId>logstash-logback-encoder</artifactId>
+      <exclusions>
+        <!-- conflicts with webauthn4j-appattest -->
+        <exclusion>
+          <groupId>tools.jackson.core</groupId>
+          <artifactId>jackson-databind</artifactId>
+        </exclusion>
+      </exclusions>
+    </dependency>
+    <!-- sentinel for dependency convergence -->
+    <dependency>
+      <groupId>tools.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <!-- update dependabot.yml when this dependency is removed -->
+      <version>3.2.1</version>
     </dependency>
 
     <dependency>
@@ -199,6 +228,27 @@
     </dependency>
 
     <dependency>
+      <groupId>io.opentelemetry</groupId>
+      <artifactId>opentelemetry-sdk</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>io.opentelemetry</groupId>
+      <artifactId>opentelemetry-exporter-otlp</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>io.opentelemetry.instrumentation</groupId>
+      <artifactId>opentelemetry-logback-appender-1.0</artifactId>
+      <version>${opentelemetry-logback-appender-1.0.version}</version>
+      <exclusions>
+        <!-- incubator packages aren't included in the opentelemetry BOM, and we don't use them -->
+        <exclusion>
+          <groupId>io.opentelemetry.instrumentation</groupId>
+          <artifactId>opentelemetry-instrumentation-api-incubator</artifactId>
+        </exclusion>
+      </exclusions>
+    </dependency>
+
+    <dependency>
       <groupId>party.iroiro.luajava</groupId>
       <artifactId>luajava</artifactId>
       <version>${luajava.version}</version>
@@ -220,15 +270,15 @@
 
     <dependency>
       <groupId>org.eclipse.jetty.websocket</groupId>
-      <artifactId>websocket-jetty-api</artifactId>
+      <artifactId>jetty-websocket-jetty-api</artifactId>
     </dependency>
     <dependency>
-      <groupId>org.eclipse.jetty</groupId>
-      <artifactId>jetty-servlets</artifactId>
+      <groupId>org.eclipse.jetty.ee10</groupId>
+      <artifactId>jetty-ee10-servlets</artifactId>
     </dependency>
     <dependency>
       <groupId>org.eclipse.jetty.websocket</groupId>
-      <artifactId>websocket-jetty-client</artifactId>
+      <artifactId>jetty-websocket-jetty-client</artifactId>
       <scope>test</scope>
     </dependency>
 
@@ -243,7 +293,7 @@
     <dependency>
       <groupId>org.apache.commons</groupId>
       <artifactId>commons-compress</artifactId>
-      <version>1.27.1</version>
+      <version>${commons-compress.version}</version>
     </dependency>
 
     <dependency>
@@ -251,30 +301,15 @@
       <artifactId>google-cloud-pubsub</artifactId>
     </dependency>
 
-    <!-- resolve opentelemetry-semconv conflicts from lower in firebase-admin and firestore dependency trees -->
     <dependency>
       <groupId>com.google.firebase</groupId>
       <artifactId>firebase-admin</artifactId>
       <version>${firebase-admin.version}</version>
       <exclusions>
         <exclusion>
-          <groupId>io.opentelemetry.semconv</groupId>
-          <artifactId>opentelemetry-semconv</artifactId>
-        </exclusion>
-      </exclusions>
-    </dependency>
-    <dependency>
-      <groupId>io.opentelemetry.semconv</groupId>
-      <artifactId>opentelemetry-semconv</artifactId>
-      <version>1.30.0</version>
-    </dependency>
-    <dependency>
-      <groupId>com.google.cloud</groupId>
-      <artifactId>google-cloud-firestore</artifactId>
-      <exclusions>
-        <exclusion>
-          <groupId>io.opentelemetry.semconv</groupId>
-          <artifactId>opentelemetry-semconv</artifactId>
+          <!-- conflicts with jackson-dataformat 2.22.1 -->
+          <groupId>org.codehaus.woodstox</groupId>
+          <artifactId>stax2-api</artifactId>
         </exclusion>
       </exclusions>
     </dependency>
@@ -284,6 +319,17 @@
       <artifactId>jsr305</artifactId>
     </dependency>
 
+    <dependency>
+      <!-- manually resolve dependency conflict -->
+      <groupId>org.codehaus.woodstox</groupId>
+      <artifactId>stax2-api</artifactId>
+      <version>4.3.0</version>
+    </dependency>
+
+    <dependency>
+      <groupId>io.github.resilience4j</groupId>
+      <artifactId>resilience4j-bulkhead</artifactId>
+    </dependency>
     <dependency>
       <groupId>io.github.resilience4j</groupId>
       <artifactId>resilience4j-circuitbreaker</artifactId>
@@ -322,15 +368,7 @@
     </dependency>
     <dependency>
       <groupId>io.micrometer</groupId>
-      <artifactId>micrometer-registry-statsd</artifactId>
-    </dependency>
-    <dependency>
-      <groupId>io.micrometer</groupId>
       <artifactId>micrometer-registry-otlp</artifactId>
-    </dependency>
-    <dependency>
-      <groupId>org.coursera</groupId>
-      <artifactId>dropwizard-metrics-datadog</artifactId>
     </dependency>
     <dependency>
       <groupId>com.fasterxml.jackson.core</groupId>
@@ -355,11 +393,6 @@
     <dependency>
       <groupId>com.fasterxml.jackson.jaxrs</groupId>
       <artifactId>jackson-jaxrs-json-provider</artifactId>
-    </dependency>
-
-    <dependency>
-      <groupId>com.salesforce.servicelibs</groupId>
-      <artifactId>reactor-grpc-stub</artifactId>
     </dependency>
 
     <dependency>
@@ -390,12 +423,17 @@
     <dependency>
       <groupId>com.amazonaws</groupId>
       <artifactId>dynamodb-lock-client</artifactId>
-      <version>1.3.0</version>
+      <version>${dynamodb-lock-client.version}</version>
     </dependency>
 
     <dependency>
       <groupId>io.lettuce</groupId>
       <artifactId>lettuce-core</artifactId>
+    </dependency>
+
+    <dependency>
+      <groupId>com.eatthepath</groupId>
+      <artifactId>java-otp</artifactId>
     </dependency>
 
     <dependency>
@@ -432,7 +470,7 @@
     <dependency>
       <groupId>com.googlecode.libphonenumber</groupId>
       <artifactId>geocoder</artifactId>
-      <version>3.2</version>
+      <version>${libphonenumber-geocoder.version}</version>
     </dependency>
 
     <dependency>
@@ -442,7 +480,66 @@
 
     <dependency>
       <groupId>io.netty</groupId>
+      <artifactId>netty-buffer</artifactId>
+    </dependency>
+
+    <dependency>
+      <groupId>io.netty</groupId>
       <artifactId>netty-codec-haproxy</artifactId>
+    </dependency>
+
+    <dependency>
+      <groupId>io.netty</groupId>
+      <artifactId>netty-codec-http2</artifactId>
+    </dependency>
+
+    <dependency>
+      <groupId>io.netty</groupId>
+      <artifactId>netty-handler</artifactId>
+    </dependency>
+
+    <dependency>
+      <groupId>io.netty</groupId>
+      <artifactId>netty-common</artifactId>
+    </dependency>
+
+    <dependency>
+      <groupId>io.netty</groupId>
+      <artifactId>netty-resolver</artifactId>
+    </dependency>
+
+    <dependency>
+      <groupId>io.netty</groupId>
+      <artifactId>netty-resolver-dns</artifactId>
+    </dependency>
+
+    <dependency>
+      <groupId>io.netty</groupId>
+      <artifactId>netty-tcnative-boringssl-static</artifactId>
+    </dependency>
+
+    <dependency>
+      <groupId>io.netty</groupId>
+      <artifactId>netty-transport</artifactId>
+    </dependency>
+
+    <dependency>
+      <groupId>io.netty</groupId>
+      <artifactId>netty-transport-native-epoll</artifactId>
+      <classifier>linux-x86_64</classifier>
+    </dependency>
+
+    <dependency>
+      <groupId>io.netty</groupId>
+      <artifactId>netty-pkitesting</artifactId>
+      <scope>test</scope>
+    </dependency>
+
+    <dependency>
+      <groupId>io.netty</groupId>
+      <artifactId>netty-testsuite-common</artifactId>
+      <scope>test</scope>
+      <version>${netty.version}</version>
     </dependency>
 
     <dependency>
@@ -489,6 +586,13 @@
     </dependency>
 
     <dependency>
+      <groupId>com.webauthn4j</groupId>
+      <artifactId>webauthn4j-test</artifactId>
+      <version>${webauthn4j.version}</version>
+      <scope>test</scope>
+    </dependency>
+
+    <dependency>
       <groupId>com.fasterxml.uuid</groupId>
       <artifactId>java-uuid-generator</artifactId>
       <version>${java-uuid-generator.version}</version>
@@ -497,13 +601,13 @@
 
     <dependency>
       <groupId>org.testcontainers</groupId>
-      <artifactId>localstack</artifactId>
+      <artifactId>testcontainers-localstack</artifactId>
       <scope>test</scope>
     </dependency>
 
     <dependency>
       <groupId>org.testcontainers</groupId>
-      <artifactId>junit-jupiter</artifactId>
+      <artifactId>testcontainers-junit-jupiter</artifactId>
       <scope>test</scope>
     </dependency>
 
@@ -519,6 +623,12 @@
     </dependency>
 
     <dependency>
+      <groupId>org.bouncycastle</groupId>
+      <artifactId>bcprov-jdk18on</artifactId>
+      <scope>compile</scope>
+    </dependency>
+
+    <dependency>
       <groupId>com.stripe</groupId>
       <artifactId>stripe-java</artifactId>
     </dependency>
@@ -531,14 +641,27 @@
     <dependency>
       <groupId>com.apollographql.apollo3</groupId>
       <artifactId>apollo-api-jvm</artifactId>
-      <version>3.8.5</version>
+      <version>${apollo-api-jvm.version}</version>
 
       <exclusions>
         <exclusion>
           <groupId>org.jetbrains</groupId>
           <artifactId>annotations</artifactId>
         </exclusion>
+        <!-- conflicts with other users; resolved manually with explicit import -->
+        <exclusion>
+          <groupId>com.squareup.okio</groupId>
+          <artifactId>okio-jvm</artifactId>
+        </exclusion>
       </exclusions>
+    </dependency>
+
+    <!-- to resolve conflicting imports from other dependencies -->
+    <dependency>
+      <groupId>com.squareup.okio</groupId>
+      <artifactId>okio-jvm</artifactId>
+      <!-- update dependabot.yml when this dependency is removed -->
+      <version>3.17.0</version>
     </dependency>
 
   </dependencies>
@@ -551,7 +674,7 @@
           <plugin>
             <groupId>io.github.download-maven-plugin</groupId>
             <artifactId>download-maven-plugin</artifactId>
-            <version>2.0.0</version>
+            <version>2.1.0</version>
 
             <executions>
               <execution>
@@ -566,6 +689,7 @@
             <configuration>
               <url>https://github.com/apple/foundationdb/releases/download/${foundationdb.version}/libfdb_c.x86_64.so</url>
               <outputDirectory>${project.build.directory}/jib-extra/usr/lib</outputDirectory>
+              <outputFileName>libfdb_c.so</outputFileName>
               <sha256>${foundationdb.client-library-sha256}</sha256>
             </configuration>
           </plugin>
@@ -653,7 +777,7 @@
             </executions>
             <configuration>
               <from>
-                <image>eclipse-temurin@sha256:${docker.image.sha256}</image>
+                <image>${docker.image}</image>
                 <platforms>
                   <platform>
                     <architecture>amd64</architecture>
@@ -675,9 +799,14 @@
                   <jvmFlag>-Djava.awt.headless=true</jvmFlag>
                   <jvmFlag>-Djdk.nio.maxCachedBufferSize=262144</jvmFlag>
                   <jvmFlag>-Dlog4j2.formatMsgNoLookups=true</jvmFlag>
+                  <jvmFlag>-Djdk.tls.server.newSessionTicketCount=0</jvmFlag>
+                  <jvmFlag>-Djdk.tls.server.enableSessionTicketExtension=false</jvmFlag>
                   <jvmFlag>-XX:MaxRAMPercentage=75</jvmFlag>
                   <jvmFlag>-XX:+HeapDumpOnOutOfMemoryError</jvmFlag>
                   <jvmFlag>-XX:HeapDumpPath=/tmp/heapdump.bin</jvmFlag>
+                  <!-- This will likely become the default in a future version of Java, and we can remove this flag when
+                  that happens. Please see https://openjdk.org/jeps/534 for details. -->
+                  <jvmFlag>-XX:+UseCompactObjectHeaders</jvmFlag>
                 </jvmFlags>
                 <ports>
                   <port>8080</port>
@@ -748,7 +877,7 @@
       <plugin>
         <groupId>org.codehaus.mojo</groupId>
         <artifactId>templating-maven-plugin</artifactId>
-        <version>3.0.0</version>
+        <version>3.1.0</version>
         <executions>
           <execution>
             <id>filter-src</id>
@@ -810,7 +939,7 @@
       <plugin>
         <groupId>com.github.aoudiamoncef</groupId>
         <artifactId>apollo-client-maven-plugin</artifactId>
-        <version>5.0.0</version>
+        <version>7.1.0</version>
         <executions>
           <execution>
             <goals>
@@ -823,6 +952,8 @@
                     <name>braintree</name>
                     <compilerParams>
                       <schemaPackageName>com.braintree.graphql.client</schemaPackageName>
+                      <!-- override the default in 7.1.0, see https://github.com/aoudiamoncef/apollo-client-maven-plugin/issues/84 -->
+                      <operationManifestFormat>none</operationManifestFormat>
                     </compilerParams>
                   </compilationUnit>
                 </braintree>

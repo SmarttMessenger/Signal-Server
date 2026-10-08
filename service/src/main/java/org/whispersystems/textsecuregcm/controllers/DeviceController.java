@@ -37,15 +37,12 @@ import jakarta.ws.rs.WebApplicationException;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import java.time.Duration;
-import java.time.Instant;
 import java.util.Arrays;
 import java.util.EnumMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
@@ -53,8 +50,8 @@ import javax.annotation.Nullable;
 import org.whispersystems.textsecuregcm.auth.AuthenticatedDevice;
 import org.whispersystems.textsecuregcm.auth.BasicAuthorizationHeader;
 import org.whispersystems.textsecuregcm.auth.ChangesLinkedDevices;
-import org.whispersystems.textsecuregcm.entities.AccountAttributes;
 import org.whispersystems.textsecuregcm.entities.DeviceActivationRequest;
+import org.whispersystems.textsecuregcm.entities.DeviceAttributes;
 import org.whispersystems.textsecuregcm.entities.DeviceInfo;
 import org.whispersystems.textsecuregcm.entities.DeviceInfoList;
 import org.whispersystems.textsecuregcm.entities.LinkDeviceRequest;
@@ -64,9 +61,7 @@ import org.whispersystems.textsecuregcm.entities.ProvisioningMessage;
 import org.whispersystems.textsecuregcm.entities.RemoteAttachment;
 import org.whispersystems.textsecuregcm.entities.RemoteAttachmentError;
 import org.whispersystems.textsecuregcm.entities.RestoreAccountRequest;
-import org.whispersystems.textsecuregcm.entities.SetPublicKeyRequest;
 import org.whispersystems.textsecuregcm.entities.TransferArchiveUploadedRequest;
-import org.whispersystems.textsecuregcm.identity.IdentityType;
 import org.whispersystems.textsecuregcm.limits.RateLimitedByIp;
 import org.whispersystems.textsecuregcm.limits.RateLimiters;
 import org.whispersystems.textsecuregcm.metrics.DevicePlatformUtil;
@@ -74,9 +69,10 @@ import org.whispersystems.textsecuregcm.metrics.MetricsUtil;
 import org.whispersystems.textsecuregcm.metrics.UserAgentTagUtil;
 import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.storage.AccountsManager;
-import org.whispersystems.textsecuregcm.storage.ClientPublicKeysManager;
 import org.whispersystems.textsecuregcm.storage.Device;
 import org.whispersystems.textsecuregcm.storage.DeviceCapability;
+import org.whispersystems.textsecuregcm.storage.DeviceIdentityInfo;
+import org.whispersystems.textsecuregcm.storage.DeviceLimitExceededException;
 import org.whispersystems.textsecuregcm.storage.DeviceSpec;
 import org.whispersystems.textsecuregcm.storage.LinkDeviceTokenAlreadyUsedException;
 import org.whispersystems.textsecuregcm.storage.PersistentTimer;
@@ -93,13 +89,9 @@ import org.whispersystems.textsecuregcm.util.ua.UserAgentUtil;
 @Tag(name = "Devices")
 public class DeviceController {
 
-  static final int MAX_DEVICES = 6;
-
   private final AccountsManager accounts;
-  private final ClientPublicKeysManager clientPublicKeysManager;
   private final RateLimiters rateLimiters;
   private final PersistentTimer persistentTimer;
-  private final Map<String, Integer> maxDeviceConfiguration;
 
   private final EnumMap<ClientPlatform, AtomicInteger> linkedDeviceListenersByPlatform;
   private final AtomicInteger linkedDeviceListenersForUnrecognizedPlatforms;
@@ -115,9 +107,6 @@ public class DeviceController {
   private static final String WAIT_FOR_TRANSFER_ARCHIVE_TIMER_NAME =
       MetricsUtil.name(DeviceController.class, "waitForTransferArchiveDuration");
 
-  private static final String RECORD_TRANSFER_ARCHIVE_UPLOADED_COUNTER_NAME = MetricsUtil.name(DeviceController.class, "recordTransferArchiveUploaded");
-  private static final String HAS_REGISTRATION_ID_TAG_NAME = "hasRegistrationId";
-
   @VisibleForTesting
   static final int MIN_TOKEN_IDENTIFIER_LENGTH = 32;
 
@@ -125,16 +114,12 @@ public class DeviceController {
   static final int MAX_TOKEN_IDENTIFIER_LENGTH = 64;
 
   public DeviceController(final AccountsManager accounts,
-      final ClientPublicKeysManager clientPublicKeysManager,
       final RateLimiters rateLimiters,
-      final PersistentTimer persistentTimer,
-      final Map<String, Integer> maxDeviceConfiguration) {
+      final PersistentTimer persistentTimer) {
 
     this.accounts = accounts;
-    this.clientPublicKeysManager = clientPublicKeysManager;
     this.rateLimiters = rateLimiters;
     this.persistentTimer = persistentTimer;
-    this.maxDeviceConfiguration = maxDeviceConfiguration;
 
     linkedDeviceListenersByPlatform =
         EnumMapUtil.toEnumMap(ClientPlatform.class, clientPlatform -> buildGauge(clientPlatform.name().toLowerCase()));
@@ -173,10 +158,7 @@ public class DeviceController {
       throw new ForbiddenException();
     }
 
-    final Account account = accounts.getByAccountIdentifier(auth.accountIdentifier())
-            .orElseThrow(() -> new WebApplicationException(Response.Status.UNAUTHORIZED));
-
-    accounts.removeDevice(account, deviceId).join();
+    accounts.removeDevice(auth.accountIdentifier(), deviceId);
   }
 
   /**
@@ -213,23 +195,13 @@ public class DeviceController {
     final Account account = accounts.getByAccountIdentifier(auth.accountIdentifier())
         .orElseThrow(() -> new WebApplicationException(Response.Status.UNAUTHORIZED));
 
-    rateLimiters.getAllocateDeviceLimiter().validate(account.getUuid());
-
-    int maxDeviceLimit = MAX_DEVICES;
-
-    if (maxDeviceConfiguration.containsKey(account.getNumber())) {
-      maxDeviceLimit = maxDeviceConfiguration.get(account.getNumber());
-    }
-
-    if (account.getDevices().size() >= maxDeviceLimit) {
-      throw new DeviceLimitExceededException(account.getDevices().size(), maxDeviceLimit);
-    }
+    rateLimiters.getAllocateDeviceLimiter().validate(account.getAccountIdentifier());
 
     if (auth.deviceId() != Device.PRIMARY_ID) {
       throw new WebApplicationException(Response.Status.UNAUTHORIZED);
     }
 
-    final String token = accounts.generateLinkDeviceToken(account.getUuid());
+    final String token = accounts.generateLinkDeviceToken(account);
 
     return new LinkDeviceToken(token, AccountsManager.getLinkDeviceTokenIdentifier(token));
   }
@@ -245,47 +217,56 @@ public class DeviceController {
           """)
   @ApiResponse(responseCode = "200", description = "The new device was linked to the calling account", useReturnTypeSchema = true)
   @ApiResponse(responseCode = "403", description = "The given account was not found or the given verification code was incorrect")
-  @ApiResponse(responseCode = "409", description = "The new device is missing a capability supported by all other devices on the account")
+  @ApiResponse(responseCode = "409", description = "The new device is missing a capability required for the account")
   @ApiResponse(responseCode = "411", description = "The given account already has its maximum number of linked devices")
   @ApiResponse(responseCode = "422", description = "The request did not pass validation")
   @ApiResponse(responseCode = "429", description = "Too many attempts", headers = @Header(
       name = "Retry-After",
       description = "If present, an positive integer indicating the number of seconds before a subsequent attempt could succeed"))
-  public LinkDeviceResponse linkDevice(@HeaderParam(HttpHeaders.AUTHORIZATION) BasicAuthorizationHeader authorizationHeader,
+  public LinkDeviceResponse linkDevice(@HeaderParam(HttpHeaders.AUTHORIZATION) @NotNull BasicAuthorizationHeader authorizationHeader,
       @HeaderParam(HttpHeaders.USER_AGENT) @Nullable String userAgent,
       @NotNull @Valid LinkDeviceRequest linkDeviceRequest)
       throws RateLimitExceededException, DeviceLimitExceededException {
-
     final Account account = accounts.checkDeviceLinkingToken(linkDeviceRequest.verificationCode())
         .flatMap(accounts::getByAccountIdentifier)
         .orElseThrow(ForbiddenException::new);
 
     final DeviceActivationRequest deviceActivationRequest = linkDeviceRequest.deviceActivationRequest();
-    final AccountAttributes accountAttributes = linkDeviceRequest.accountAttributes();
+    final DeviceAttributes deviceAttributes = linkDeviceRequest.deviceAttributes();
 
-    rateLimiters.getVerifyDeviceLimiter().validate(account.getUuid());
+    rateLimiters.getVerifyDeviceLimiter().validate(account.getAccountIdentifier());
+
+    // Check the optional-phone-number capability before checking PNI keys, so we can give a better error code (since an
+    // older device will improperly supply PNI keys for a PNI-less account)
+    if (account.getPhoneNumberIdentifier().isEmpty() &&
+        !linkDeviceRequest.deviceAttributes().capabilities().contains(DeviceCapability.OPTIONAL_PHONE_NUMBER)) {
+      throw new WebApplicationException("Missing required device capability", 409);
+    }
 
     final boolean allKeysValid =
-        PreKeySignatureValidator.validatePreKeySignatures(account.getIdentityKey(IdentityType.ACI),
-            List.of(deviceActivationRequest.aciSignedPreKey(), deviceActivationRequest.aciPqLastResortPreKey()),
-            userAgent,
-            "link-device")
-            && PreKeySignatureValidator.validatePreKeySignatures(account.getIdentityKey(IdentityType.PNI),
-            List.of(deviceActivationRequest.pniSignedPreKey(), deviceActivationRequest.pniPqLastResortPreKey()),
-            userAgent,
-            "link-device");
+      PreKeySignatureValidator
+          .validatePreKeySignatures(account.getAccountIdentityKey(),
+              List.of(deviceActivationRequest.aciSignedPreKey(), deviceActivationRequest.aciPqLastResortPreKey()),
+              userAgent,
+              "link-device")
+          && account.getPhoneNumberIdentityKey()
+                .map(pniIdentityKey ->
+                  deviceActivationRequest.pniSignedPreKey().isPresent()
+                      && deviceActivationRequest.pniPqLastResortPreKey().isPresent()
+                      && PreKeySignatureValidator.validatePreKeySignatures(
+                          pniIdentityKey,
+                          List.of(deviceActivationRequest.pniSignedPreKey().get(), deviceActivationRequest.pniPqLastResortPreKey().get()),
+                          userAgent,
+                          "link-device"))
+              .orElse(
+                  deviceActivationRequest.pniSignedPreKey().isEmpty()
+                      && deviceActivationRequest.pniPqLastResortPreKey().isEmpty());
 
     if (!allKeysValid) {
       throw new WebApplicationException(Response.status(422).build());
     }
 
-    final int maxDeviceLimit = maxDeviceConfiguration.getOrDefault(account.getNumber(), MAX_DEVICES);
-
-    if (account.getDevices().size() >= maxDeviceLimit) {
-      throw new DeviceLimitExceededException(account.getDevices().size(), maxDeviceLimit);
-    }
-
-    final Set<DeviceCapability> capabilities = accountAttributes.getCapabilities();
+    final Set<DeviceCapability> capabilities = deviceAttributes.capabilities();
 
     if (capabilities == null) {
       throw new WebApplicationException(Response.status(422, "Missing device capabilities").build());
@@ -304,31 +285,31 @@ public class DeviceController {
     }
 
     try {
-      return accounts.addDevice(account, new DeviceSpec(accountAttributes.getName(),
-                  authorizationHeader.getPassword(),
-                  signalAgent,
-                  capabilities,
-                  accountAttributes.getRegistrationId(),
-                  accountAttributes.getPhoneNumberIdentityRegistrationId(),
-                  accountAttributes.getFetchesMessages(),
-                  deviceActivationRequest.apnToken(),
-                  deviceActivationRequest.gcmToken(),
+      final Pair<Account, Device> accountAndDevice = accounts.addDevice(account.getAccountIdentifier(),
+          new DeviceSpec(deviceAttributes.name(),
+              authorizationHeader.getPassword(),
+              signalAgent,
+              capabilities,
+              new DeviceIdentityInfo(
+                  deviceAttributes.registrationId(),
                   deviceActivationRequest.aciSignedPreKey(),
-                  deviceActivationRequest.pniSignedPreKey(),
-                  deviceActivationRequest.aciPqLastResortPreKey(),
-                  deviceActivationRequest.pniPqLastResortPreKey()),
-              linkDeviceRequest.verificationCode())
-          .thenApply(accountAndDevice -> new LinkDeviceResponse(
-              accountAndDevice.first().getIdentifier(IdentityType.ACI),
-              accountAndDevice.first().getIdentifier(IdentityType.PNI),
-              accountAndDevice.second().getId()))
-          .join();
-    } catch (final CompletionException e) {
-      if (e.getCause() instanceof LinkDeviceTokenAlreadyUsedException) {
-        throw new ForbiddenException();
-      }
+                  deviceActivationRequest.aciPqLastResortPreKey()),
+              account.getPhoneNumberIdentityKey().map(_ ->
+                  new DeviceIdentityInfo(
+                      deviceAttributes.phoneNumberIdentityRegistrationId(),
+                      deviceActivationRequest.pniSignedPreKey().get(),
+                      deviceActivationRequest.pniPqLastResortPreKey().get())),
+              deviceAttributes.fetchesMessages(),
+              deviceActivationRequest.apnToken(),
+              deviceActivationRequest.gcmToken()),
+          linkDeviceRequest.verificationCode());
 
-      throw e;
+      return new LinkDeviceResponse(
+          accountAndDevice.first().getAccountIdentifier(),
+          accountAndDevice.first().getPhoneNumberIdentifier(),
+          accountAndDevice.second().getId());
+    } catch (final LinkDeviceTokenAlreadyUsedException e) {
+      throw new ForbiddenException();
     }
   }
 
@@ -387,13 +368,12 @@ public class DeviceController {
                 .map(deviceInfo -> Response.status(Response.Status.OK).entity(deviceInfo).build())
                 .orElseGet(() -> Response.status(Response.Status.NO_CONTENT).build()))
             .exceptionally(ExceptionUtils.exceptionallyHandler(IllegalArgumentException.class,
-                e -> Response.status(Response.Status.BAD_REQUEST).build()))
-            .whenComplete((response, throwable) -> {
+                _ -> Response.status(Response.Status.BAD_REQUEST).build()))
+            .whenComplete((response, _) -> {
               linkedDeviceListenerCounter.decrementAndGet();
 
               if (response != null && response.getStatus() == Response.Status.OK.getStatusCode()) {
                 accountAndSample.second().stop(Timer.builder(WAIT_FOR_LINKED_DEVICE_TIMER_NAME)
-                    .publishPercentileHistogram(true)
                     .tags(Tags.of(UserAgentTagUtil.getPlatformTag(userAgent)))
                     .register(Metrics.globalRegistry));
               }
@@ -411,43 +391,19 @@ public class DeviceController {
   @PUT
   @Produces(MediaType.APPLICATION_JSON)
   @Path("/capabilities")
-  public void setCapabilities(@Auth final AuthenticatedDevice auth,
-
-      @NotNull
-      final Map<String, Boolean> capabilities) {
-
-    final Account account = accounts.getByAccountIdentifier(auth.accountIdentifier())
-        .orElseThrow(() -> new WebApplicationException(Response.Status.UNAUTHORIZED));
-
-    accounts.updateDevice(account, auth.deviceId(),
+  public void setCapabilities(@Auth final AuthenticatedDevice auth, @NotNull final Map<String, Boolean> capabilities) {
+    accounts.updateDevice(auth.accountIdentifier(), auth.deviceId(),
         d -> d.setCapabilities(DeviceCapabilityAdapter.mapToSet(capabilities)));
   }
 
-  @PUT
-  @Produces(MediaType.APPLICATION_JSON)
-  @Path("/public_key")
-  @Operation(
-      summary = "Sets a public key for authentication",
-      description = """
-          Sets the authentication public key for the authenticated device. The public key will be used for
-          authentication in the nascent gRPC-over-Noise API. Existing devices must upload a public key before they can
-          use the gRPC-over-Noise API, and this endpoint exists to facilitate migration to the new API.
-          """
-  )
-  @ApiResponse(responseCode = "200", description = "Public key stored successfully")
-  @ApiResponse(responseCode = "401", description = "Account authentication check failed")
-  @ApiResponse(responseCode = "422", description = "Invalid request format")
-  public CompletableFuture<Void> setPublicKey(@Auth final AuthenticatedDevice auth,
-      final SetPublicKeyRequest setPublicKeyRequest) {
-
-    final Account account = accounts.getByAccountIdentifier(auth.accountIdentifier())
-        .orElseThrow(() -> new WebApplicationException(Response.Status.UNAUTHORIZED));
-
-    return clientPublicKeysManager.setPublicKey(account, auth.deviceId(), setPublicKeyRequest.publicKey());
-  }
-
   private static boolean isCapabilityDowngrade(final Account account, final Set<DeviceCapability> capabilities) {
+    if (!capabilities.containsAll(DeviceCapability.CAPABILITIES_REQUIRED_FOR_NEW_DEVICES)) {
+      return true;
+    }
+
     final Set<DeviceCapability> requiredCapabilities = Arrays.stream(DeviceCapability.values())
+        // `ALWAYS_CAPABLE` capabilities are always assumed to be present, so we don't require callers to specify them
+        .filter(capability -> capability.getAccountCapabilityMode() != DeviceCapability.AccountCapabilityMode.ALWAYS_CAPABLE)
         .filter(DeviceCapability::preventDowngrade)
         .filter(account::hasCapability)
         .collect(Collectors.toSet());
@@ -535,14 +491,7 @@ public class DeviceController {
   @ApiResponse(responseCode = "422", description = "The request object could not be parsed or was otherwise invalid")
   @ApiResponse(responseCode = "429", description = "Rate-limited; try again after the prescribed delay")
   public CompletionStage<Void> recordTransferArchiveUploaded(@Auth final AuthenticatedDevice authenticatedDevice,
-      @NotNull @Valid final TransferArchiveUploadedRequest transferArchiveUploadedRequest,
-      @HeaderParam(HttpHeaders.USER_AGENT) @Nullable String userAgent) {
-    Metrics.counter(RECORD_TRANSFER_ARCHIVE_UPLOADED_COUNTER_NAME, Tags.of(
-        UserAgentTagUtil.getPlatformTag(userAgent),
-        io.micrometer.core.instrument.Tag.of(
-            HAS_REGISTRATION_ID_TAG_NAME,
-            String.valueOf(transferArchiveUploadedRequest.destinationDeviceRegistrationId().isPresent()))
-    )).increment();
+      @NotNull @Valid final TransferArchiveUploadedRequest transferArchiveUploadedRequest) {
     return rateLimiters.getUploadTransferArchiveLimiter()
         .validateAsync(authenticatedDevice.accountIdentifier())
         .thenCompose(ignored -> accounts.getByAccountIdentifierAsync(authenticatedDevice.accountIdentifier()))
@@ -552,7 +501,6 @@ public class DeviceController {
 
           return accounts.recordTransferArchiveUpload(account,
               transferArchiveUploadedRequest.destinationDeviceId(),
-              transferArchiveUploadedRequest.destinationDeviceCreated().map(Instant::ofEpochMilli),
               transferArchiveUploadedRequest.destinationDeviceRegistrationId(),
               transferArchiveUploadedRequest.transferArchive());
         });
@@ -608,10 +556,9 @@ public class DeviceController {
             .thenApply(maybeTransferArchive -> maybeTransferArchive
                 .map(transferArchive -> Response.status(Response.Status.OK).entity(transferArchive).build())
                 .orElseGet(() -> Response.status(Response.Status.NO_CONTENT).build()))
-            .whenComplete((response, throwable) -> {
+            .whenComplete((response, _) -> {
               if (response != null && response.getStatus() == Response.Status.OK.getStatusCode()) {
                 accountAndSample.second().stop(Timer.builder(WAIT_FOR_TRANSFER_ARCHIVE_TIMER_NAME)
-                    .publishPercentileHistogram(true)
                     .tags(Tags.of(
                         UserAgentTagUtil.getPlatformTag(userAgent),
                         primaryPlatformTag(accountAndSample.first())))

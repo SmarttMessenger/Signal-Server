@@ -11,41 +11,41 @@ import io.swagger.v3.oas.annotations.responses.ApiResponse;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotNull;
+import jakarta.ws.rs.BadRequestException;
 import jakarta.ws.rs.Consumes;
 import jakarta.ws.rs.POST;
 import jakarta.ws.rs.Path;
 import jakarta.ws.rs.Produces;
-import jakarta.ws.rs.WebApplicationException;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import jakarta.ws.rs.core.Response.Status;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.Objects;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionStage;
-import java.util.function.Function;
-import javax.annotation.Nonnull;
+import org.glassfish.jersey.server.ManagedAsync;
 import org.signal.libsignal.zkgroup.InvalidInputException;
 import org.signal.libsignal.zkgroup.VerificationFailedException;
+import org.signal.libsignal.zkgroup.donation.DonationPermitRequest;
+import org.signal.libsignal.zkgroup.donation.DonationPermitResponse;
 import org.signal.libsignal.zkgroup.receipts.ReceiptCredentialPresentation;
 import org.signal.libsignal.zkgroup.receipts.ReceiptSerial;
 import org.signal.libsignal.zkgroup.receipts.ServerZkReceiptOperations;
 import org.whispersystems.textsecuregcm.auth.AuthenticatedDevice;
 import org.whispersystems.textsecuregcm.configuration.BadgesConfiguration;
+import org.whispersystems.textsecuregcm.entities.CreateDonationPermitResponse;
+import org.whispersystems.textsecuregcm.entities.CreateDonationPermitsRequest;
 import org.whispersystems.textsecuregcm.entities.RedeemReceiptRequest;
-import org.whispersystems.textsecuregcm.storage.Account;
+import org.whispersystems.textsecuregcm.limits.RateLimiters;
 import org.whispersystems.textsecuregcm.storage.AccountBadge;
 import org.whispersystems.textsecuregcm.storage.AccountsManager;
+import org.whispersystems.textsecuregcm.storage.DonationPermitsManager;
 import org.whispersystems.textsecuregcm.storage.RedeemedReceiptsManager;
+import org.whispersystems.textsecuregcm.purchases.ReceiptCredentialPresentationFactory;
+import org.whispersystems.textsecuregcm.purchases.ReceiptLevel;
 
 @Path("/v1/donation")
 @Tag(name = "Donations")
 public class DonationController {
-
-  public interface ReceiptCredentialPresentationFactory {
-    ReceiptCredentialPresentation build(byte[] bytes) throws InvalidInputException;
-  }
 
   private final Clock clock;
   private final ServerZkReceiptOperations serverZkReceiptOperations;
@@ -53,20 +53,26 @@ public class DonationController {
   private final AccountsManager accountsManager;
   private final BadgesConfiguration badgesConfiguration;
   private final ReceiptCredentialPresentationFactory receiptCredentialPresentationFactory;
+  private final DonationPermitsManager donationPermitsManager;
+  private final RateLimiters rateLimiters;
 
   public DonationController(
-      @Nonnull final Clock clock,
-      @Nonnull final ServerZkReceiptOperations serverZkReceiptOperations,
-      @Nonnull final RedeemedReceiptsManager redeemedReceiptsManager,
-      @Nonnull final AccountsManager accountsManager,
-      @Nonnull final BadgesConfiguration badgesConfiguration,
-      @Nonnull final ReceiptCredentialPresentationFactory receiptCredentialPresentationFactory) {
+      final Clock clock,
+      final ServerZkReceiptOperations serverZkReceiptOperations,
+      final RedeemedReceiptsManager redeemedReceiptsManager,
+      final AccountsManager accountsManager,
+      final BadgesConfiguration badgesConfiguration,
+      final ReceiptCredentialPresentationFactory receiptCredentialPresentationFactory,
+      final DonationPermitsManager donationPermitsManager,
+      final RateLimiters rateLimiters) {
     this.clock = Objects.requireNonNull(clock);
     this.serverZkReceiptOperations = Objects.requireNonNull(serverZkReceiptOperations);
     this.redeemedReceiptsManager = Objects.requireNonNull(redeemedReceiptsManager);
     this.accountsManager = Objects.requireNonNull(accountsManager);
     this.badgesConfiguration = Objects.requireNonNull(badgesConfiguration);
     this.receiptCredentialPresentationFactory = Objects.requireNonNull(receiptCredentialPresentationFactory);
+    this.donationPermitsManager = Objects.requireNonNull(donationPermitsManager);
+    this.rateLimiters = Objects.requireNonNull(rateLimiters);
   }
 
   @POST
@@ -86,64 +92,89 @@ public class DonationController {
       specific error message suitable for logging will be included as text/plain body
       """)
   @ApiResponse(responseCode = "429", description = "Rate limited.")
-  public CompletionStage<Response> redeemReceipt(
+  @ManagedAsync
+  public Response redeemReceipt(
       @Auth final AuthenticatedDevice auth,
       @NotNull @Valid final RedeemReceiptRequest request) {
-    return CompletableFuture.supplyAsync(() -> {
-      ReceiptCredentialPresentation receiptCredentialPresentation;
-      try {
-        receiptCredentialPresentation = receiptCredentialPresentationFactory
-            .build(request.getReceiptCredentialPresentation());
-      } catch (InvalidInputException e) {
-        return CompletableFuture.completedFuture(Response.status(Status.BAD_REQUEST)
-            .entity("invalid receipt credential presentation")
-            .type(MediaType.TEXT_PLAIN_TYPE)
-            .build());
+    ReceiptCredentialPresentation receiptCredentialPresentation;
+    try {
+      receiptCredentialPresentation = receiptCredentialPresentationFactory
+          .build(request.getReceiptCredentialPresentation());
+    } catch (InvalidInputException e) {
+      return Response.status(Status.BAD_REQUEST)
+          .entity("invalid receipt credential presentation")
+          .type(MediaType.TEXT_PLAIN_TYPE)
+          .build();
+    }
+    try {
+      serverZkReceiptOperations.verifyReceiptCredentialPresentation(receiptCredentialPresentation);
+    } catch (VerificationFailedException e) {
+      return Response.status(Status.BAD_REQUEST)
+          .entity("receipt credential presentation verification failed")
+          .type(MediaType.TEXT_PLAIN_TYPE)
+          .build();
+    }
+
+    final ReceiptSerial receiptSerial = receiptCredentialPresentation.getReceiptSerial();
+    final Instant receiptExpiration = Instant.ofEpochSecond(receiptCredentialPresentation.getReceiptExpirationTime());
+    final long receiptLevel = receiptCredentialPresentation.getReceiptLevel();
+    final String badgeId = ReceiptLevel
+        .lookupLevel(receiptLevel)
+        .map(badgesConfiguration.getReceiptLevels()::get)
+        .orElse(null);
+    if (badgeId == null) {
+      return Response.serverError()
+          .entity("server does not recognize the requested receipt level")
+          .type(MediaType.TEXT_PLAIN_TYPE)
+          .build();
+    }
+
+    final boolean receiptMatched = redeemedReceiptsManager.put(
+        receiptSerial, receiptExpiration, receiptLevel, auth.accountIdentifier());
+    if (!receiptMatched) {
+      return Response.status(Status.BAD_REQUEST)
+          .entity("receipt serial is already redeemed")
+          .type(MediaType.TEXT_PLAIN_TYPE)
+          .build();
+    }
+
+    accountsManager.update(auth.accountIdentifier(), a -> {
+      a.addBadge(clock, new AccountBadge(badgeId, receiptExpiration, request.isVisible()));
+      if (request.isPrimary()) {
+        a.makeBadgePrimaryIfExists(clock, badgeId);
       }
-      try {
-        serverZkReceiptOperations.verifyReceiptCredentialPresentation(receiptCredentialPresentation);
-      } catch (VerificationFailedException e) {
-        return CompletableFuture.completedFuture(Response.status(Status.BAD_REQUEST)
-            .entity("receipt credential presentation verification failed")
-            .type(MediaType.TEXT_PLAIN_TYPE)
-            .build());
-      }
+    });
+    return Response.ok().build();
+  }
 
-      final ReceiptSerial receiptSerial = receiptCredentialPresentation.getReceiptSerial();
-      final Instant receiptExpiration = Instant.ofEpochSecond(receiptCredentialPresentation.getReceiptExpirationTime());
-      final long receiptLevel = receiptCredentialPresentation.getReceiptLevel();
-      final String badgeId = badgesConfiguration.getReceiptLevels().get(receiptLevel);
-      if (badgeId == null) {
-        return CompletableFuture.completedFuture(Response.serverError()
-            .entity("server does not recognize the requested receipt level")
-            .type(MediaType.TEXT_PLAIN_TYPE)
-            .build());
-      }
+  @POST
+  @Path("/permit")
+  @Produces({MediaType.APPLICATION_JSON})
+  @Operation(
+      summary = "Generate permits for anonymous donation endpoints",
+      description = """
+          Generate a set of anonymous, single-use, permits for use with /v1/subscription endpoints.
+          """)
+  @ApiResponse(responseCode = "200", description = "`JSON` with generated credentials", useReturnTypeSchema = true)
+  @ApiResponse(responseCode = "400", description = "Invalid credential request")
+  @ApiResponse(responseCode = "401", description = "Account authentication check failed")
+  @ApiResponse(responseCode = "422", description = "Invalid request format")
+  @ApiResponse(responseCode = "429", description = "Rate-limited; reduce requested permit count and/or try again after the prescribed delay")
+  public CreateDonationPermitResponse createPermits(@Auth final AuthenticatedDevice auth,
+      @NotNull @Valid final CreateDonationPermitsRequest request) throws RateLimitExceededException {
 
-      return accountsManager.getByAccountIdentifierAsync(auth.accountIdentifier())
-          .thenCompose(maybeAccount -> {
-            final Account account = maybeAccount.orElseThrow(() -> new WebApplicationException(Status.UNAUTHORIZED));
+    final DonationPermitRequest permitRequest;
+    try {
+      permitRequest = new DonationPermitRequest(request.permitRequest());
+    } catch (InvalidInputException e) {
+      throw new BadRequestException();
+    }
 
-            return redeemedReceiptsManager.put(
-                    receiptSerial, receiptExpiration.getEpochSecond(), receiptLevel, auth.accountIdentifier())
-                .thenCompose(receiptMatched -> {
-                  if (!receiptMatched) {
-                    return CompletableFuture.completedFuture(Response.status(Status.BAD_REQUEST)
-                        .entity("receipt serial is already redeemed")
-                        .type(MediaType.TEXT_PLAIN_TYPE)
-                        .build());
-                  }
+    rateLimiters.getCreateDonationPermitLimiter().validate(auth.accountIdentifier(), permitRequest.getPermitCount());
 
-                  return accountsManager.updateAsync(account, a -> {
-                        a.addBadge(clock, new AccountBadge(badgeId, receiptExpiration, request.isVisible()));
-                        if (request.isPrimary()) {
-                          a.makeBadgePrimaryIfExists(clock, badgeId);
-                        }
-                      })
-                      .thenApply(ignored -> Response.ok().build());
-                });
-          });
-    }).thenCompose(Function.identity());
+    final DonationPermitResponse permitResponse = donationPermitsManager.issue(permitRequest);
+
+    return new CreateDonationPermitResponse(permitResponse.serialize());
   }
 
 }

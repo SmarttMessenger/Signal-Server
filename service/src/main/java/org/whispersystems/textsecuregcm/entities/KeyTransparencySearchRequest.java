@@ -53,6 +53,9 @@ public record KeyTransparencySearchRequest(
     @Schema(description = "The distinguished tree head size to prove consistency against.")
     @Positive long distinguishedTreeHeadSize
 ) {
+    // This is the max value for a protobuf uint32 field
+    private static final long MAX_UINT32 = 0xFFFFFFFFL;
+
     @AssertTrue
     @Schema(hidden = true)
     public boolean isUnidentifiedAccessKeyProvidedWithE164() {

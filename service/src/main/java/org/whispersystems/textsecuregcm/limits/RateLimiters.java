@@ -7,6 +7,8 @@ package org.whispersystems.textsecuregcm.limits;
 import com.google.common.annotations.VisibleForTesting;
 import java.time.Clock;
 import java.time.Duration;
+import java.util.concurrent.ScheduledExecutorService;
+import io.dropwizard.util.DataSize;
 import org.whispersystems.textsecuregcm.configuration.dynamic.DynamicConfiguration;
 import org.whispersystems.textsecuregcm.redis.ClusterLuaScript;
 import org.whispersystems.textsecuregcm.redis.FaultTolerantRedisClusterClient;
@@ -18,6 +20,7 @@ public class RateLimiters extends BaseRateLimiters<RateLimiters.For> {
     BACKUP_AUTH_CHECK("backupAuthCheck", new RateLimiterConfig(100, Duration.ofMinutes(15), true)),
     PIN("pin", new RateLimiterConfig(10, Duration.ofDays(1), false)),
     ATTACHMENT("attachmentCreate", new RateLimiterConfig(50, Duration.ofMillis(1200), true)),
+    ATTACHMENT_BYTES("attachmentCreateBytes", new RateLimiterConfig(DataSize.gigabytes(1).toBytes(), Duration.ofNanos(1000), true)),
     BACKUP_ATTACHMENT("backupAttachmentCreate", new RateLimiterConfig(10_000, Duration.ofSeconds(1), true)),
     PRE_KEYS("prekeys", new RateLimiterConfig(6, Duration.ofMinutes(10), false)),
     MESSAGES("messages", new RateLimiterConfig(60, Duration.ofSeconds(1), true)),
@@ -25,6 +28,7 @@ public class RateLimiters extends BaseRateLimiters<RateLimiters.For> {
     ALLOCATE_DEVICE("allocateDevice", new RateLimiterConfig(6, Duration.ofMinutes(2), false)),
     VERIFY_DEVICE("verifyDevice", new RateLimiterConfig(6, Duration.ofMinutes(2), false)),
     PROFILE("profile", new RateLimiterConfig(4320, Duration.ofSeconds(20), true)),
+    PROFILE_AVATAR_BYTES("profileAvatarBytes", new RateLimiterConfig(DataSize.mebibytes(100).toBytes(), Duration.ofNanos(10000), true)),
     STICKER_PACK("stickerPack", new RateLimiterConfig(50, Duration.ofMinutes(72), false)),
     USERNAME_LOOKUP("usernameLookup", new RateLimiterConfig(100, Duration.ofMinutes(15), true)),
     USERNAME_SET("usernameSet", new RateLimiterConfig(100, Duration.ofMinutes(15), false)),
@@ -33,6 +37,7 @@ public class RateLimiters extends BaseRateLimiters<RateLimiters.For> {
     USERNAME_LINK_LOOKUP_PER_IP("usernameLinkLookupPerIp", new RateLimiterConfig(100, Duration.ofSeconds(15), true)),
     CHECK_ACCOUNT_EXISTENCE("checkAccountExistence", new RateLimiterConfig(1000, Duration.ofSeconds(4), true)),
     REGISTRATION("registration", new RateLimiterConfig(6, Duration.ofSeconds(30), false)),
+    SET_ZK_CREDENTIAL_KEY("setZkCredentialKey", new RateLimiterConfig(5, Duration.ofDays(7), false)),
     VERIFICATION_PUSH_CHALLENGE("verificationPushChallenge", new RateLimiterConfig(5, Duration.ofSeconds(30), false)),
     VERIFICATION_CAPTCHA("verificationCaptcha", new RateLimiterConfig(10, Duration.ofSeconds(30), false)),
     RATE_LIMIT_RESET("rateLimitReset", new RateLimiterConfig(2, Duration.ofHours(12), false)),
@@ -55,6 +60,12 @@ public class RateLimiters extends BaseRateLimiters<RateLimiters.For> {
     RECORD_DEVICE_TRANSFER_REQUEST("recordDeviceTransferRequest", new RateLimiterConfig(10, Duration.ofMillis(100), true)),
     WAIT_FOR_DEVICE_TRANSFER_REQUEST("waitForDeviceTransferRequest", new RateLimiterConfig(10, Duration.ofMillis(100), true)),
     DEVICE_CHECK_CHALLENGE("deviceCheckChallenge", new RateLimiterConfig(10, Duration.ofMinutes(1), false)),
+    SUBMIT_CALL_QUALITY_SURVEY("submitCallQualitySurvey", new RateLimiterConfig(100, Duration.ofMinutes(1), true)),
+    BATCH_IDENTITY_CHECK("batchIdentityCheck", new RateLimiterConfig(100, Duration.ofMinutes(1), true)),
+    CREATE_DONATION_PERMIT("createDonationCredential", new RateLimiterConfig(30, Duration.ofHours(4), true)),
+    ONE_TIME_DONATION("oneTimeDonation", new RateLimiterConfig(5, Duration.ofMinutes(1), true)),
+    ADD_SUBSCRIPTION_PAYMENT_METHOD("addSubscriptionPaymentMethod", new RateLimiterConfig(10, Duration.ofMinutes(1), true)),
+    CHECK_MFA("checkMfa", new RateLimiterConfig(50, Duration.ofHours(12), false))
     ;
 
     private final String id;
@@ -77,9 +88,10 @@ public class RateLimiters extends BaseRateLimiters<RateLimiters.For> {
 
   public static RateLimiters create(
       final DynamicConfigurationManager<DynamicConfiguration> dynamicConfigurationManager,
-      final FaultTolerantRedisClusterClient cacheCluster) {
+      final FaultTolerantRedisClusterClient cacheCluster,
+      final ScheduledExecutorService retryExecutor) {
     return new RateLimiters(
-        dynamicConfigurationManager, defaultScript(cacheCluster), cacheCluster, Clock.systemUTC());
+        dynamicConfigurationManager, defaultScript(cacheCluster), cacheCluster, retryExecutor, Clock.systemUTC());
   }
 
   @VisibleForTesting
@@ -87,8 +99,9 @@ public class RateLimiters extends BaseRateLimiters<RateLimiters.For> {
       final DynamicConfigurationManager<DynamicConfiguration> dynamicConfigurationManager,
       final ClusterLuaScript validateScript,
       final FaultTolerantRedisClusterClient cacheCluster,
+      final ScheduledExecutorService retryExecutor,
       final Clock clock) {
-    super(For.values(), dynamicConfigurationManager, validateScript, cacheCluster, clock);
+    super(For.values(), dynamicConfigurationManager, validateScript, cacheCluster, retryExecutor, clock);
   }
 
   public RateLimiter getAllocateDeviceLimiter() {
@@ -99,8 +112,8 @@ public class RateLimiters extends BaseRateLimiters<RateLimiters.For> {
     return forDescriptor(For.VERIFY_DEVICE);
   }
 
-  public RateLimiter getMessagesLimiter() {
-    return forDescriptor(For.MESSAGES);
+  public RateLimiter getSetZkCredentialKeyLimiter() {
+    return forDescriptor(For.SET_ZK_CREDENTIAL_KEY);
   }
 
   public RateLimiter getPreKeysLimiter() {
@@ -111,12 +124,20 @@ public class RateLimiters extends BaseRateLimiters<RateLimiters.For> {
     return forDescriptor(For.ATTACHMENT);
   }
 
+  public RateLimiter getAttachmentBytesLimiter() {
+    return forDescriptor(For.ATTACHMENT_BYTES);
+  }
+
   public RateLimiter getPinLimiter() {
     return forDescriptor(For.PIN);
   }
 
   public RateLimiter getProfileLimiter() {
     return forDescriptor(For.PROFILE);
+  }
+
+  public RateLimiter getProfileAvatarBytesLimiter() {
+    return forDescriptor(For.PROFILE_AVATAR_BYTES);
   }
 
   public RateLimiter getStickerPackLimiter() {
@@ -149,6 +170,10 @@ public class RateLimiters extends BaseRateLimiters<RateLimiters.For> {
 
   public RateLimiter getRegistrationLimiter() {
     return forDescriptor(For.REGISTRATION);
+  }
+
+  public RateLimiter getMessagesLimiter() {
+    return forDescriptor(For.MESSAGES);
   }
 
   public RateLimiter getRateLimitResetLimiter() {
@@ -217,5 +242,17 @@ public class RateLimiters extends BaseRateLimiters<RateLimiters.For> {
 
   public RateLimiter getKeyTransparencyMonitorLimiter() {
     return forDescriptor(For.KEY_TRANSPARENCY_MONITOR_PER_IP);
+  }
+
+  public RateLimiter getSubmitCallQualitySurveyLimiter() {
+    return forDescriptor(For.SUBMIT_CALL_QUALITY_SURVEY);
+  }
+
+  public RateLimiter getCreateDonationPermitLimiter() {
+    return forDescriptor(For.CREATE_DONATION_PERMIT);
+  }
+
+  public RateLimiter getCheckMfaLimiter() {
+    return forDescriptor(For.CHECK_MFA);
   }
 }

@@ -24,6 +24,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.junitpioneer.jupiter.cartesian.CartesianTest;
+import org.whispersystems.textsecuregcm.identity.IdentityType;
 import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.storage.AccountsManager;
 import org.whispersystems.textsecuregcm.storage.Device;
@@ -65,7 +66,7 @@ class PushNotificationManagerTest {
       when(fcmSender.sendNotification(any()))
           .thenReturn(CompletableFuture.completedFuture(new SendPushNotificationResult(true, Optional.empty(), false, Optional.empty())));
     pushNotificationManager.sendNewMessageNotification(account, Device.PRIMARY_ID, true);
-    verify(fcmSender).sendNotification(new PushNotification(deviceToken, PushNotification.TokenType.FCM, PushNotification.NotificationType.NOTIFICATION, null, account, device, true));
+    verify(fcmSender).sendNotification(new PushNotification(deviceToken, PushNotification.TokenType.FCM, PushNotification.NotificationType.NOTIFICATION, null, account, device, true, null));
   }
 
   @Test
@@ -95,7 +96,7 @@ class PushNotificationManagerTest {
         .thenReturn(CompletableFuture.completedFuture(new SendPushNotificationResult(true, Optional.empty(), false, Optional.empty())));
 
     pushNotificationManager.sendRegistrationChallengeNotification(deviceToken, PushNotification.TokenType.APN, challengeToken);
-    verify(apnSender).sendNotification(new PushNotification(deviceToken, PushNotification.TokenType.APN, PushNotification.NotificationType.CHALLENGE, challengeToken, null, null, true));
+    verify(apnSender).sendNotification(new PushNotification(deviceToken, PushNotification.TokenType.APN, PushNotification.NotificationType.CHALLENGE, challengeToken, null, null, true, null));
   }
 
   @Test
@@ -114,7 +115,7 @@ class PushNotificationManagerTest {
         .thenReturn(CompletableFuture.completedFuture(new SendPushNotificationResult(true, Optional.empty(), false, Optional.empty())));
 
     pushNotificationManager.sendRateLimitChallengeNotification(account, challengeToken);
-    verify(apnSender).sendNotification(new PushNotification(deviceToken, PushNotification.TokenType.APN, PushNotification.NotificationType.RATE_LIMIT_CHALLENGE, challengeToken, account, device, true));
+    verify(apnSender).sendNotification(new PushNotification(deviceToken, PushNotification.TokenType.APN, PushNotification.NotificationType.RATE_LIMIT_CHALLENGE, challengeToken, account, device, true, null));
   }
 
   @ParameterizedTest
@@ -141,23 +142,28 @@ class PushNotificationManagerTest {
 
     if (isApn){
       verify(apnSender).sendNotification(new PushNotification(deviceToken, PushNotification.TokenType.APN,
-          PushNotification.NotificationType.ATTEMPT_LOGIN_NOTIFICATION_HIGH_PRIORITY, "someContext", account, device, true));
+          PushNotification.NotificationType.ATTEMPT_LOGIN_NOTIFICATION_HIGH_PRIORITY, "someContext", account, device, true, null));
     } else {
       verify(fcmSender, times(1)).sendNotification(new PushNotification(deviceToken, PushNotification.TokenType.FCM,
-          PushNotification.NotificationType.ATTEMPT_LOGIN_NOTIFICATION_HIGH_PRIORITY, "someContext", account, device, true));
+          PushNotification.NotificationType.ATTEMPT_LOGIN_NOTIFICATION_HIGH_PRIORITY, "someContext", account, device, true, null));
     }
   }
 
   @Test
   void testSendNotificationFcm() {
+    final UUID accountIdentifier = UUID.randomUUID();
+
     final Account account = mock(Account.class);
     final Device device = mock(Device.class);
 
     when(device.getId()).thenReturn(Device.PRIMARY_ID);
+    when(account.getAccountIdentifier()).thenReturn(accountIdentifier);
     when(account.getDevice(Device.PRIMARY_ID)).thenReturn(Optional.of(device));
 
+    AccountsHelper.setupMockGet(accountsManager, account);
+
     final PushNotification pushNotification = new PushNotification(
-        "token", PushNotification.TokenType.FCM, PushNotification.NotificationType.NOTIFICATION, null, account, device, true);
+        "token", PushNotification.TokenType.FCM, PushNotification.NotificationType.NOTIFICATION, null, account, device, true, null);
 
     when(fcmSender.sendNotification(pushNotification))
         .thenReturn(CompletableFuture.completedFuture(new SendPushNotificationResult(true, Optional.empty(), false, Optional.empty())));
@@ -166,7 +172,7 @@ class PushNotificationManagerTest {
 
     verify(fcmSender).sendNotification(pushNotification);
     verifyNoInteractions(apnSender);
-    verify(accountsManager, never()).updateDevice(eq(account), eq(Device.PRIMARY_ID), any());
+    verify(accountsManager, never()).updateDevice(eq(accountIdentifier), eq(Device.PRIMARY_ID), any());
     verify(device, never()).setGcmId(any());
     verifyNoInteractions(pushNotificationScheduler);
   }
@@ -184,10 +190,10 @@ class PushNotificationManagerTest {
 
     when(device.getId()).thenReturn(Device.PRIMARY_ID);
     when(account.getDevice(Device.PRIMARY_ID)).thenReturn(Optional.of(device));
-    when(account.getUuid()).thenReturn(aci);
+    when(account.getAccountIdentifier()).thenReturn(aci);
 
     final PushNotification pushNotification = new PushNotification(
-        "token", tokenType, PushNotification.NotificationType.NOTIFICATION, null, account, device, urgent);
+        "token", tokenType, PushNotification.NotificationType.NOTIFICATION, null, account, device, urgent, null);
 
     final PushNotificationSender sender = switch (tokenType) {
       case FCM -> fcmSender;
@@ -220,18 +226,19 @@ class PushNotificationManagerTest {
     when(device.getId()).thenReturn(Device.PRIMARY_ID);
     when(device.getGcmId()).thenReturn("token");
     when(account.getDevice(Device.PRIMARY_ID)).thenReturn(Optional.of(device));
-    when(account.getUuid()).thenReturn(aci);
+    when(account.getAccountIdentifier()).thenReturn(aci);
+    when(account.getAccountIdentifier()).thenReturn(aci);
     when(accountsManager.getByAccountIdentifier(aci)).thenReturn(Optional.of(account));
 
     final PushNotification pushNotification = new PushNotification(
-        "token", PushNotification.TokenType.FCM, PushNotification.NotificationType.NOTIFICATION, null, account, device, true);
+        "token", PushNotification.TokenType.FCM, PushNotification.NotificationType.NOTIFICATION, null, account, device, true, null);
 
     when(fcmSender.sendNotification(pushNotification))
         .thenReturn(CompletableFuture.completedFuture(new SendPushNotificationResult(false, Optional.empty(), true, Optional.empty())));
 
     pushNotificationManager.sendNotification(pushNotification);
 
-    verify(accountsManager).updateDevice(eq(account), eq(Device.PRIMARY_ID), any());
+    verify(accountsManager).updateDevice(eq(aci), eq(Device.PRIMARY_ID), any());
     verify(device).setGcmId(null);
     verifyNoInteractions(apnSender);
     verifyNoInteractions(pushNotificationScheduler);
@@ -245,11 +252,12 @@ class PushNotificationManagerTest {
     when(device.getId()).thenReturn(Device.PRIMARY_ID);
     when(device.getApnId()).thenReturn("apns-token");
     when(account.getDevice(Device.PRIMARY_ID)).thenReturn(Optional.of(device));
-    when(account.getUuid()).thenReturn(aci);
+    when(account.getAccountIdentifier()).thenReturn(aci);
+    when(account.getAccountIdentifier()).thenReturn(aci);
     when(accountsManager.getByAccountIdentifier(aci)).thenReturn(Optional.of(account));
 
     final PushNotification pushNotification = new PushNotification(
-        "token", PushNotification.TokenType.APN, PushNotification.NotificationType.NOTIFICATION, null, account, device, true);
+        "token", PushNotification.TokenType.APN, PushNotification.NotificationType.NOTIFICATION, null, account, device, true, null);
 
     when(apnSender.sendNotification(pushNotification))
         .thenReturn(CompletableFuture.completedFuture(new SendPushNotificationResult(false, Optional.empty(), true, Optional.empty())));
@@ -260,7 +268,7 @@ class PushNotificationManagerTest {
     pushNotificationManager.sendNotification(pushNotification);
 
     verifyNoInteractions(fcmSender);
-    verify(accountsManager).updateDevice(eq(account), eq(Device.PRIMARY_ID), any());
+    verify(accountsManager).updateDevice(eq(aci), eq(Device.PRIMARY_ID), any());
     verify(device).setApnId(null);
     verify(pushNotificationScheduler).cancelScheduledNotifications(account, device);
   }
@@ -276,11 +284,11 @@ class PushNotificationManagerTest {
     when(device.getApnId()).thenReturn("apns-token");
     when(device.getPushTimestamp()).thenReturn(tokenTimestamp.toEpochMilli());
     when(account.getDevice(Device.PRIMARY_ID)).thenReturn(Optional.of(device));
-    when(account.getUuid()).thenReturn(aci);
+    when(account.getAccountIdentifier()).thenReturn(aci);
     when(accountsManager.getByAccountIdentifier(aci)).thenReturn(Optional.of(account));
 
     final PushNotification pushNotification = new PushNotification(
-        "token", PushNotification.TokenType.APN, PushNotification.NotificationType.NOTIFICATION, null, account, device, true);
+        "token", PushNotification.TokenType.APN, PushNotification.NotificationType.NOTIFICATION, null, account, device, true, null);
 
     when(apnSender.sendNotification(pushNotification))
         .thenReturn(CompletableFuture.completedFuture(new SendPushNotificationResult(false, Optional.empty(), true, Optional.of(tokenTimestamp.minusSeconds(60)))));
@@ -291,7 +299,7 @@ class PushNotificationManagerTest {
     pushNotificationManager.sendNotification(pushNotification);
 
     verifyNoInteractions(fcmSender);
-    verify(accountsManager, never()).updateDevice(eq(account), eq(Device.PRIMARY_ID), any());
+    verify(accountsManager, never()).updateDevice(eq(aci), eq(Device.PRIMARY_ID), any());
     verify(device, never()).setApnId(any());
     verify(pushNotificationScheduler, never()).cancelScheduledNotifications(account, device);
   }
@@ -303,7 +311,7 @@ class PushNotificationManagerTest {
     final Device device = mock(Device.class);
     final String userAgent = HttpHeaders.USER_AGENT;
 
-    when(account.getUuid()).thenReturn(accountIdentifier);
+    when(account.getAccountIdentifier()).thenReturn(accountIdentifier);
     when(device.getId()).thenReturn(Device.PRIMARY_ID);
 
     when(pushNotificationScheduler.cancelScheduledNotifications(account, device))

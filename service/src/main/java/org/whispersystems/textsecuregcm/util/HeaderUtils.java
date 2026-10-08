@@ -32,13 +32,13 @@ public final class HeaderUtils {
 
   public static final String X_SIGNAL_AGENT = "X-Signal-Agent";
 
-  public static final String X_SIGNAL_KEY = "X-Signal-Key";
-
   public static final String TIMESTAMP_HEADER = "X-Signal-Timestamp";
 
   public static final String UNIDENTIFIED_ACCESS_KEY = "Unidentified-Access-Key";
 
   public static final String GROUP_SEND_TOKEN = "Group-Send-Token";
+
+  public static final String DONATION_PERMIT = "Donation-Permit";
 
   private static final String INVALID_ACCEPT_LANGUAGE_COUNTER_NAME = MetricsUtil.name(HeaderUtils.class,
       "invalidAcceptLanguage");
@@ -55,6 +55,10 @@ public final class HeaderUtils {
     requireNonNull(username);
     requireNonNull(password);
     return "Basic " + Base64.getEncoder().encodeToString((username + ":" + password).getBytes(StandardCharsets.UTF_8));
+  }
+
+  public static String bearerAuthHeader(final String token) {
+    return "Bearer " + token;
   }
 
   @Nonnull
@@ -105,8 +109,9 @@ public final class HeaderUtils {
               Tag.of("path", containerRequestContext.getUriInfo().getPath())))
           .increment();
       logger.debug("Could not get acceptable languages; Accept-Language: {}; User-Agent: {}",
-          containerRequestContext.getHeaderString(HttpHeaders.ACCEPT_LANGUAGE),
-          userAgent,
+          // Strip any control codes to avoid any weird formatting with console loggers
+          containerRequestContext.getHeaderString(HttpHeaders.ACCEPT_LANGUAGE).replaceAll("\\p{Cntrl}", ""),
+          userAgent.replaceAll("\\p{Cntrl}", ""),
           e);
 
       return List.of();

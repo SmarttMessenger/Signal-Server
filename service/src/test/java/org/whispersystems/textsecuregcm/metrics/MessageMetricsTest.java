@@ -19,7 +19,6 @@ import java.util.UUID;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.whispersystems.textsecuregcm.entities.MessageProtos;
-import org.whispersystems.textsecuregcm.entities.OutgoingMessageEntity;
 import org.whispersystems.textsecuregcm.identity.AciServiceIdentifier;
 import org.whispersystems.textsecuregcm.identity.PniServiceIdentifier;
 import org.whispersystems.textsecuregcm.identity.ServiceIdentifier;
@@ -36,40 +35,13 @@ class MessageMetricsTest {
 
   @BeforeEach
   void setup() {
-    when(account.getUuid()).thenReturn(aci);
-    when(account.getPhoneNumberIdentifier()).thenReturn(pni);
+    when(account.getAccountIdentifier()).thenReturn(aci);
+    when(account.getPhoneNumberIdentifier()).thenReturn(Optional.of(pni));
     when(account.isIdentifiedBy(any())).thenReturn(false);
     when(account.isIdentifiedBy(new AciServiceIdentifier(aci))).thenReturn(true);
     when(account.isIdentifiedBy(new PniServiceIdentifier(pni))).thenReturn(true);
     simpleMeterRegistry = new SimpleMeterRegistry();
     messageMetrics = new MessageMetrics(simpleMeterRegistry);
-  }
-
-  @Test
-  void measureAccountOutgoingMessageUuidMismatches() {
-
-    final OutgoingMessageEntity outgoingMessageToAci = createOutgoingMessageEntity(new AciServiceIdentifier(aci));
-    messageMetrics.measureAccountOutgoingMessageUuidMismatches(account, outgoingMessageToAci);
-
-    Optional<Counter> counter = findCounter(simpleMeterRegistry);
-
-    assertTrue(counter.isEmpty());
-
-    final OutgoingMessageEntity outgoingMessageToPni = createOutgoingMessageEntity(new PniServiceIdentifier(pni));
-    messageMetrics.measureAccountOutgoingMessageUuidMismatches(account, outgoingMessageToPni);
-    counter = findCounter(simpleMeterRegistry);
-
-    assertTrue(counter.isEmpty());
-
-    final OutgoingMessageEntity outgoingMessageToOtherUuid = createOutgoingMessageEntity(new AciServiceIdentifier(otherUuid));
-    messageMetrics.measureAccountOutgoingMessageUuidMismatches(account, outgoingMessageToOtherUuid);
-    counter = findCounter(simpleMeterRegistry);
-
-    assertEquals(1.0, counter.map(Counter::count).orElse(0.0));
-  }
-
-  private OutgoingMessageEntity createOutgoingMessageEntity(final ServiceIdentifier destinationIdentifier) {
-    return new OutgoingMessageEntity(UUID.randomUUID(), 1, 1L, null, 1, destinationIdentifier, null, new byte[]{}, 1, true, false, null);
   }
 
   @Test
@@ -104,7 +76,7 @@ class MessageMetricsTest {
     final MessageProtos.Envelope.Builder builder = MessageProtos.Envelope.newBuilder();
 
     if (destinationIdentifier != null) {
-      builder.setDestinationServiceId(destinationIdentifier.toServiceIdentifierString());
+      builder.setDestinationServiceId(destinationIdentifier.toCompactByteString());
     }
 
     return builder.build();

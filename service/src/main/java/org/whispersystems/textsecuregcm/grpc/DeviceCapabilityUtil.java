@@ -5,7 +5,6 @@
 
 package org.whispersystems.textsecuregcm.grpc;
 
-import io.grpc.Status;
 import org.whispersystems.textsecuregcm.storage.DeviceCapability;
 
 public class DeviceCapabilityUtil {
@@ -17,11 +16,13 @@ public class DeviceCapabilityUtil {
     return switch (grpcDeviceCapability) {
       case DEVICE_CAPABILITY_STORAGE -> DeviceCapability.STORAGE;
       case DEVICE_CAPABILITY_TRANSFER -> DeviceCapability.TRANSFER;
-      case DEVICE_CAPABILITY_DELETE_SYNC -> DeviceCapability.DELETE_SYNC;
-      case DEVICE_CAPABILITY_STORAGE_SERVICE_RECORD_KEY_ROTATION -> DeviceCapability.STORAGE_SERVICE_RECORD_KEY_ROTATION;
       case DEVICE_CAPABILITY_ATTACHMENT_BACKFILL -> DeviceCapability.ATTACHMENT_BACKFILL;
       case DEVICE_CAPABILITY_SPARSE_POST_QUANTUM_RATCHET -> DeviceCapability.SPARSE_POST_QUANTUM_RATCHET;
-      case DEVICE_CAPABILITY_UNSPECIFIED, UNRECOGNIZED -> throw Status.INVALID_ARGUMENT.withDescription("Unrecognized device capability").asRuntimeException();
+      case DEVICE_CAPABILITY_PROFILES_V2 -> DeviceCapability.PROFILES_V2;
+      case DEVICE_CAPABILITY_USERNAME_CHANGE_SYNC_MESSAGE ->  DeviceCapability.USERNAME_CHANGE_SYNC_MESSAGE;
+      case DEVICE_CAPABILITY_OPTIONAL_PHONE_NUMBER -> DeviceCapability.OPTIONAL_PHONE_NUMBER;
+      case DEVICE_CAPABILITY_UNSPECIFIED, UNRECOGNIZED ->
+          throw GrpcExceptions.invalidArguments("unrecognized device capability");
     };
   }
 
@@ -29,10 +30,11 @@ public class DeviceCapabilityUtil {
     return switch (deviceCapability) {
       case STORAGE -> org.signal.chat.common.DeviceCapability.DEVICE_CAPABILITY_STORAGE;
       case TRANSFER -> org.signal.chat.common.DeviceCapability.DEVICE_CAPABILITY_TRANSFER;
-      case DELETE_SYNC -> org.signal.chat.common.DeviceCapability.DEVICE_CAPABILITY_DELETE_SYNC;
-      case STORAGE_SERVICE_RECORD_KEY_ROTATION -> org.signal.chat.common.DeviceCapability.DEVICE_CAPABILITY_STORAGE_SERVICE_RECORD_KEY_ROTATION;
       case ATTACHMENT_BACKFILL -> org.signal.chat.common.DeviceCapability.DEVICE_CAPABILITY_ATTACHMENT_BACKFILL;
       case SPARSE_POST_QUANTUM_RATCHET -> org.signal.chat.common.DeviceCapability.DEVICE_CAPABILITY_SPARSE_POST_QUANTUM_RATCHET;
+      case PROFILES_V2 -> org.signal.chat.common.DeviceCapability.DEVICE_CAPABILITY_PROFILES_V2;
+      case USERNAME_CHANGE_SYNC_MESSAGE -> org.signal.chat.common.DeviceCapability.DEVICE_CAPABILITY_USERNAME_CHANGE_SYNC_MESSAGE;
+      case OPTIONAL_PHONE_NUMBER -> org.signal.chat.common.DeviceCapability.DEVICE_CAPABILITY_OPTIONAL_PHONE_NUMBER;
     };
   }
 }

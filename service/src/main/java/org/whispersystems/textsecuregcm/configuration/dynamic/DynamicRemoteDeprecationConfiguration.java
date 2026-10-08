@@ -5,74 +5,52 @@
 
 package org.whispersystems.textsecuregcm.configuration.dynamic;
 
-import com.fasterxml.jackson.annotation.JsonProperty;
-import com.google.common.annotations.VisibleForTesting;
 import com.vdurmont.semver4j.Semver;
-import org.whispersystems.textsecuregcm.util.ua.ClientPlatform;
-
+import jakarta.validation.constraints.NotNull;
 import java.util.Collections;
 import java.util.Map;
 import java.util.Set;
+import org.whispersystems.textsecuregcm.util.ua.ClientPlatform;
 
-public class DynamicRemoteDeprecationConfiguration {
+public record DynamicRemoteDeprecationConfiguration(
+    @NotNull Map<ClientPlatform, Semver> minimumVersions,
+    @NotNull Map<ClientPlatform, Semver> versionsPendingDeprecation,
+    @NotNull Map<ClientPlatform, Set<Semver>> blockedVersions,
+    @NotNull Map<ClientPlatform, Set<Semver>> versionsPendingBlock,
+    @NotNull Boolean spqrEnforcementPending,
+    @NotNull Boolean requireSpqr) {
 
-    @JsonProperty
-    private Map<ClientPlatform, Semver> minimumVersions = Collections.emptyMap();
+  public static DynamicRemoteDeprecationConfiguration DEFAULT = new DynamicRemoteDeprecationConfiguration(
+      Collections.emptyMap(),
+      Collections.emptyMap(),
+      Collections.emptyMap(),
+      Collections.emptyMap(),
+      false,
+      false);
 
-    @JsonProperty
-    private Map<ClientPlatform, Semver> versionsPendingDeprecation = Collections.emptyMap();
-
-    @JsonProperty
-    private Map<ClientPlatform, Set<Semver>> blockedVersions = Collections.emptyMap();
-
-    @JsonProperty
-    private Map<ClientPlatform, Set<Semver>> versionsPendingBlock = Collections.emptyMap();
-
-    @JsonProperty
-    private boolean unrecognizedUserAgentAllowed = true;
-
-    @VisibleForTesting
-    public void setMinimumVersions(final Map<ClientPlatform, Semver> minimumVersions) {
-        this.minimumVersions = minimumVersions;
+  public DynamicRemoteDeprecationConfiguration {
+    if (minimumVersions == null) {
+      minimumVersions = DEFAULT.minimumVersions();
     }
 
-    public Map<ClientPlatform, Semver> getMinimumVersions() {
-        return minimumVersions;
+    if (versionsPendingDeprecation == null) {
+      versionsPendingDeprecation = DEFAULT.versionsPendingDeprecation();
     }
 
-    @VisibleForTesting
-    public void setVersionsPendingDeprecation(final Map<ClientPlatform, Semver> versionsPendingDeprecation) {
-        this.versionsPendingDeprecation = versionsPendingDeprecation;
+    if (blockedVersions == null) {
+      blockedVersions = DEFAULT.blockedVersions();
     }
 
-    public Map<ClientPlatform, Semver> getVersionsPendingDeprecation() {
-        return versionsPendingDeprecation;
+    if (versionsPendingBlock == null) {
+      versionsPendingBlock = DEFAULT.versionsPendingBlock();
     }
 
-    @VisibleForTesting
-    public void setUnrecognizedUserAgentAllowed(final boolean allowUnrecognizedUserAgents) {
-        this.unrecognizedUserAgentAllowed = allowUnrecognizedUserAgents;
+    if (spqrEnforcementPending == null) {
+      spqrEnforcementPending = DEFAULT.spqrEnforcementPending();
     }
 
-    public boolean isUnrecognizedUserAgentAllowed() {
-        return unrecognizedUserAgentAllowed;
+    if (requireSpqr == null) {
+      requireSpqr = DEFAULT.requireSpqr();
     }
-
-    @VisibleForTesting
-    public void setBlockedVersions(final Map<ClientPlatform, Set<Semver>> blockedVersions) {
-        this.blockedVersions = blockedVersions;
-    }
-
-    public Map<ClientPlatform, Set<Semver>> getBlockedVersions() {
-        return blockedVersions;
-    }
-
-    @VisibleForTesting
-    public void setVersionsPendingBlock(final Map<ClientPlatform, Set<Semver>> versionsPendingBlock) {
-        this.versionsPendingBlock = versionsPendingBlock;
-    }
-
-    public Map<ClientPlatform, Set<Semver>> getVersionsPendingBlock() {
-        return versionsPendingBlock;
-    }
+  }
 }

@@ -7,6 +7,7 @@ package org.whispersystems.textsecuregcm.configuration.dynamic;
 
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.google.common.annotations.VisibleForTesting;
+import java.time.Duration;
 
 public class DynamicMessagePersisterConfiguration {
 
@@ -19,12 +20,24 @@ public class DynamicMessagePersisterConfiguration {
   @JsonProperty
   private double trimOversizedQueueExtraRoomRatio = 1.5;
 
+  @JsonProperty
+  private Duration nodeClaimTtl = Duration.ofMinutes(5);
+
+  @JsonProperty
+  private Duration sleepBetweenNodes = Duration.ofSeconds(5);
+
   public DynamicMessagePersisterConfiguration() {}
 
   @VisibleForTesting
-  public DynamicMessagePersisterConfiguration(final boolean persistenceEnabled, final double trimOversizedQueueExtraRoomRatio) {
+  public DynamicMessagePersisterConfiguration(final boolean persistenceEnabled,
+      final double trimOversizedQueueExtraRoomRatio,
+      final Duration nodeClaimTtl,
+      final Duration sleepBetweenNodes) {
+
     this.persistenceEnabled = persistenceEnabled;
     this.trimOversizedQueueExtraRoomRatio = trimOversizedQueueExtraRoomRatio;
+    this.nodeClaimTtl = nodeClaimTtl;
+    this.sleepBetweenNodes = sleepBetweenNodes;
   }
 
   public boolean isPersistenceEnabled() {
@@ -35,4 +48,11 @@ public class DynamicMessagePersisterConfiguration {
     return trimOversizedQueueExtraRoomRatio;
   }
 
+  public Duration getNodeClaimTtl() {
+    return nodeClaimTtl;
+  }
+
+  public Duration getSleepBetweenNodes() {
+    return sleepBetweenNodes;
+  }
 }

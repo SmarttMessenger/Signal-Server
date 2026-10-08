@@ -13,6 +13,7 @@ import java.io.UncheckedIOException;
 import java.time.Clock;
 import java.util.Arrays;
 import java.util.Map;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import org.apache.commons.lang3.tuple.Pair;
@@ -30,11 +31,12 @@ public abstract class BaseRateLimiters<T extends RateLimiterDescriptor> {
       final DynamicConfigurationManager<DynamicConfiguration> dynamicConfigurationManager,
       final ClusterLuaScript validateScript,
       final FaultTolerantRedisClusterClient cacheCluster,
+      final ScheduledExecutorService retryExecutor,
       final Clock clock) {
     this.rateLimiterByDescriptor = Arrays.stream(values)
         .map(descriptor -> Pair.of(
             descriptor,
-            createForDescriptor(descriptor, dynamicConfigurationManager, validateScript, cacheCluster, clock)))
+            createForDescriptor(descriptor, dynamicConfigurationManager, validateScript, cacheCluster, retryExecutor, clock)))
         .collect(Collectors.toUnmodifiableMap(Pair::getKey, Pair::getValue));
   }
 
@@ -42,7 +44,7 @@ public abstract class BaseRateLimiters<T extends RateLimiterDescriptor> {
     return requireNonNull(rateLimiterByDescriptor.get(handle));
   }
 
-  protected static ClusterLuaScript defaultScript(final FaultTolerantRedisClusterClient cacheCluster) {
+  public static ClusterLuaScript defaultScript(final FaultTolerantRedisClusterClient cacheCluster) {
     try {
       return ClusterLuaScript.fromResource(
           cacheCluster, "lua/validate_rate_limit.lua", ScriptOutputType.INTEGER);
@@ -56,9 +58,10 @@ public abstract class BaseRateLimiters<T extends RateLimiterDescriptor> {
       final DynamicConfigurationManager<DynamicConfiguration> dynamicConfigurationManager,
       final ClusterLuaScript validateScript,
       final FaultTolerantRedisClusterClient cacheCluster,
+      final ScheduledExecutorService retryExecutor,
       final Clock clock) {
     final Supplier<RateLimiterConfig> configResolver =
         () -> dynamicConfigurationManager.getConfiguration().getLimits().getOrDefault(descriptor.id(), descriptor.defaultConfig());
-    return new DynamicRateLimiter(descriptor.id(), configResolver, validateScript, cacheCluster, clock);
+    return new LeakyBucketRateLimiter(descriptor.id(), configResolver, validateScript, cacheCluster, retryExecutor, clock);
   }
 }

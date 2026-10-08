@@ -8,6 +8,7 @@ package org.whispersystems.textsecuregcm.storage;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.mockito.Mockito.mock;
 
 import io.lettuce.core.RedisCommandExecutionException;
 import io.lettuce.core.ScriptOutputType;
@@ -16,11 +17,13 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.ScheduledExecutorService;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.whispersystems.textsecuregcm.entities.MessageProtos;
 import org.whispersystems.textsecuregcm.redis.ClusterLuaScript;
 import org.whispersystems.textsecuregcm.redis.RedisClusterExtension;
+import org.whispersystems.textsecuregcm.util.UUIDUtil;
 
 class MessagesCacheGetItemsScriptTest {
 
@@ -30,30 +33,30 @@ class MessagesCacheGetItemsScriptTest {
   @Test
   void testCacheGetItemsScript() throws Exception {
     final MessagesCacheInsertScript insertScript = new MessagesCacheInsertScript(
-        REDIS_CLUSTER_EXTENSION.getRedisCluster());
+        REDIS_CLUSTER_EXTENSION.getRedisCluster(),
+        mock(ScheduledExecutorService.class));
 
     final UUID destinationUuid = UUID.randomUUID();
     final byte deviceId = 1;
-    final String serverGuid = UUID.randomUUID().toString();
+    final UUID serverGuid = UUID.randomUUID();
     final MessageProtos.Envelope envelope1 = MessageProtos.Envelope.newBuilder()
         .setServerTimestamp(Instant.now().getEpochSecond())
-        .setServerGuid(serverGuid)
+        .setServerGuid(UUIDUtil.toByteString(serverGuid))
         .build();
 
-    insertScript.executeAsync(destinationUuid, deviceId, envelope1);
+    insertScript.executeAsync(destinationUuid, deviceId, envelope1).toCompletableFuture().join();
 
     final MessagesCacheGetItemsScript getItemsScript = new MessagesCacheGetItemsScript(
         REDIS_CLUSTER_EXTENSION.getRedisCluster());
 
-    final List<byte[]> messageAndScores = getItemsScript.execute(destinationUuid, deviceId, 1, -1)
+    final List<byte[]> messageAndScores = getItemsScript.execute(destinationUuid, deviceId, 1, -1, false)
         .block(Duration.ofSeconds(1));
 
     assertNotNull(messageAndScores);
     assertEquals(2, messageAndScores.size());
-    final MessageProtos.Envelope resultEnvelope =
-        EnvelopeUtil.expand(MessageProtos.Envelope.parseFrom(messageAndScores.getFirst()));
+    final MessageProtos.Envelope resultEnvelope = MessageProtos.Envelope.parseFrom(messageAndScores.getFirst());
 
-    assertEquals(serverGuid, resultEnvelope.getServerGuid());
+    assertEquals(serverGuid, UUIDUtil.fromByteString(resultEnvelope.getServerGuid()));
   }
 
   @Test

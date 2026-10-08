@@ -5,11 +5,12 @@
 
 package org.whispersystems.textsecuregcm.controllers;
 
-import static com.codahale.metrics.MetricRegistry.name;
+import static org.whispersystems.textsecuregcm.metrics.MetricsUtil.name;
 
 import com.google.common.annotations.VisibleForTesting;
 import io.dropwizard.auth.Auth;
 import io.micrometer.core.instrument.Metrics;
+import io.swagger.v3.oas.annotations.Parameter;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.ws.rs.BadRequestException;
 import jakarta.ws.rs.DefaultValue;
@@ -20,14 +21,13 @@ import jakarta.ws.rs.QueryParam;
 import jakarta.ws.rs.WebApplicationException;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
-import java.security.InvalidKeyException;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
-import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 import javax.annotation.Nonnull;
 import org.signal.libsignal.protocol.ServiceId;
 import org.signal.libsignal.zkgroup.GenericServerSecretParams;
@@ -36,13 +36,12 @@ import org.signal.libsignal.zkgroup.auth.ServerZkAuthOperations;
 import org.signal.libsignal.zkgroup.calllinks.CallLinkAuthCredentialResponse;
 import org.whispersystems.textsecuregcm.auth.AuthenticatedDevice;
 import org.whispersystems.textsecuregcm.auth.CertificateGenerator;
+import org.whispersystems.textsecuregcm.auth.RedemptionRange;
 import org.whispersystems.textsecuregcm.entities.DeliveryCertificate;
 import org.whispersystems.textsecuregcm.entities.GroupCredentials;
-import org.whispersystems.textsecuregcm.identity.IdentityType;
 import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.storage.AccountsManager;
 
-@SuppressWarnings("OptionalUsedAsFieldOrParameterType")
 @Path("/v1/certificate")
 @Tag(name = "Certificate")
 public class CertificateController {
@@ -51,11 +50,12 @@ public class CertificateController {
   private final CertificateGenerator certificateGenerator;
   private final ServerZkAuthOperations serverZkAuthOperations;
   private final GenericServerSecretParams genericServerSecretParams;
+  private final GenericServerSecretParams genericServerSecretParamsPreV101;
   private final Clock clock;
 
   @VisibleForTesting
   public static final Duration MAX_REDEMPTION_DURATION = Duration.ofDays(7);
-  private static final String GENERATE_DELIVERY_CERTIFICATE_COUNTER_NAME = name(CertificateGenerator.class, "generateCertificate");
+  private static final String GENERATE_DELIVERY_CERTIFICATE_COUNTER_NAME = name(CertificateController.class, "generateCertificate");
   private static final String INCLUDE_E164_TAG_NAME = "includeE164";
 
   public CertificateController(
@@ -63,12 +63,14 @@ public class CertificateController {
       @Nonnull CertificateGenerator certificateGenerator,
       @Nonnull ServerZkAuthOperations serverZkAuthOperations,
       @Nonnull GenericServerSecretParams genericServerSecretParams,
+      @Nonnull GenericServerSecretParams genericServerSecretParamsPreV101,
       @Nonnull Clock clock) {
 
     this.accountsManager = accountsManager;
     this.certificateGenerator = Objects.requireNonNull(certificateGenerator);
     this.serverZkAuthOperations = Objects.requireNonNull(serverZkAuthOperations);
     this.genericServerSecretParams = genericServerSecretParams;
+    this.genericServerSecretParamsPreV101 = genericServerSecretParamsPreV101;
     this.clock = Objects.requireNonNull(clock);
   }
 
@@ -76,8 +78,7 @@ public class CertificateController {
   @Produces(MediaType.APPLICATION_JSON)
   @Path("/delivery")
   public DeliveryCertificate getDeliveryCertificate(@Auth AuthenticatedDevice auth,
-      @QueryParam("includeE164") @DefaultValue("true") boolean includeE164)
-      throws InvalidKeyException {
+      @QueryParam("includeE164") @DefaultValue("true") boolean includeE164) {
 
     Metrics.counter(GENERATE_DELIVERY_CERTIFICATE_COUNTER_NAME, INCLUDE_E164_TAG_NAME, String.valueOf(includeE164))
         .increment();
@@ -85,8 +86,11 @@ public class CertificateController {
     final Account account = accountsManager.getByAccountIdentifier(auth.accountIdentifier())
         .orElseThrow(() -> new WebApplicationException(Response.Status.UNAUTHORIZED));
 
-    return new DeliveryCertificate(
-        certificateGenerator.createFor(account, auth.deviceId(), includeE164));
+    try {
+      return new DeliveryCertificate(certificateGenerator.createFor(account, auth.deviceId(), includeE164));
+    } catch (final IllegalArgumentException _) {
+      throw new BadRequestException();
+    }
   }
 
   @GET
@@ -95,19 +99,17 @@ public class CertificateController {
   public GroupCredentials getGroupAuthenticationCredentials(
       @Auth AuthenticatedDevice auth,
       @QueryParam("redemptionStartSeconds") long startSeconds,
-      @QueryParam("redemptionEndSeconds") long endSeconds) {
+      @QueryParam("redemptionEndSeconds") long endSeconds,
+      @Parameter(description = "Whether to use libsignal v0.101.0+ secret params")
+      @QueryParam("v101") boolean v101) {
 
-    final Instant startOfDay = clock.instant().truncatedTo(ChronoUnit.DAYS);
-    final Instant redemptionStart = Instant.ofEpochSecond(startSeconds);
-    final Instant redemptionEnd = Instant.ofEpochSecond(endSeconds);
-
-    if (redemptionStart.isAfter(redemptionEnd) ||
-        redemptionStart.isBefore(startOfDay) ||
-        redemptionEnd.isAfter(startOfDay.plus(MAX_REDEMPTION_DURATION)) ||
-        !redemptionStart.equals(redemptionStart.truncatedTo(ChronoUnit.DAYS)) ||
-        !redemptionEnd.equals(redemptionEnd.truncatedTo(ChronoUnit.DAYS))) {
-
-      throw new BadRequestException();
+    final RedemptionRange redemptionRange;
+    try {
+      final Instant redemptionStart = Instant.ofEpochSecond(startSeconds);
+      final Instant redemptionEnd = Instant.ofEpochSecond(endSeconds);
+      redemptionRange = RedemptionRange.inclusive(clock, redemptionStart, redemptionEnd);
+    } catch (IllegalArgumentException e) {
+      throw new BadRequestException(e.getCause());
     }
 
     final Account account = accountsManager.getByAccountIdentifier(auth.accountIdentifier())
@@ -116,24 +118,25 @@ public class CertificateController {
     final List<GroupCredentials.GroupCredential> credentials = new ArrayList<>();
     final List<GroupCredentials.CallLinkAuthCredential> callLinkAuthCredentials = new ArrayList<>();
 
-    Instant redemption = redemptionStart;
+    final ServiceId.Aci aci = new ServiceId.Aci(account.getAccountIdentifier());
+    final Optional<ServiceId.Pni> maybePni = account.getPhoneNumberIdentifier().map(ServiceId.Pni::new);
 
-    final ServiceId.Aci aci = new ServiceId.Aci(account.getIdentifier(IdentityType.ACI));
-    final ServiceId.Pni pni = new ServiceId.Pni(account.getIdentifier(IdentityType.PNI));
-
-    while (!redemption.isAfter(redemptionEnd)) {
-      AuthCredentialWithPniResponse authCredentialWithPni = serverZkAuthOperations.issueAuthCredentialWithPniZkc(aci, pni, redemption);
+    for (Instant redemption : redemptionRange) {
+      final AuthCredentialWithPniResponse authCredentialWithPni =
+          maybePni.map(pni -> serverZkAuthOperations.issueAuthCredentialWithPniZkc(aci, pni, redemption))
+              .orElseGet(() -> serverZkAuthOperations.issueAuthCredentialZkcWithoutPni(aci,
+                  account.getAuthCredentialSalt()
+                      .orElseThrow(() -> new IllegalStateException("account without PNI must have auth credential salt")),
+                  redemption));
       credentials.add(new GroupCredentials.GroupCredential(
           authCredentialWithPni.serialize(),
           (int) redemption.getEpochSecond()));
 
       callLinkAuthCredentials.add(new GroupCredentials.CallLinkAuthCredential(
-          CallLinkAuthCredentialResponse.issueCredential(aci, redemption, genericServerSecretParams).serialize(),
+          CallLinkAuthCredentialResponse.issueCredential(aci, redemption, v101 ? genericServerSecretParams : genericServerSecretParamsPreV101).serialize(),
           redemption.getEpochSecond()));
-
-      redemption = redemption.plus(Duration.ofDays(1));
     }
 
-    return new GroupCredentials(credentials, callLinkAuthCredentials, pni.getRawUUID());
+    return new GroupCredentials(credentials, callLinkAuthCredentials, maybePni.map(ServiceId.Pni::getRawUUID).orElse(null));
   }
 }

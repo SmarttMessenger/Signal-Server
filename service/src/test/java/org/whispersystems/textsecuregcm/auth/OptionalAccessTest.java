@@ -13,6 +13,7 @@ import static org.mockito.Mockito.when;
 
 import jakarta.ws.rs.WebApplicationException;
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.Base64;
 import java.util.List;
 import java.util.Optional;
@@ -28,6 +29,7 @@ import org.whispersystems.textsecuregcm.identity.PniServiceIdentifier;
 import org.whispersystems.textsecuregcm.identity.ServiceIdentifier;
 import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.storage.Device;
+import org.whispersystems.textsecuregcm.util.TestRandomUtil;
 
 class OptionalAccessTest {
 
@@ -51,20 +53,23 @@ class OptionalAccessTest {
   }
 
   private static List<Arguments> verify() {
-    final String unidentifiedAccessKey = RandomStringUtils.secure().nextAlphanumeric(16);
+    final byte[] unidentifiedAccessKey = TestRandomUtil.nextBytes(16);
 
     final Anonymous correctUakHeader =
-        new Anonymous(Base64.getEncoder().encodeToString(unidentifiedAccessKey.getBytes()));
+        new Anonymous(Base64.getEncoder().encodeToString(unidentifiedAccessKey));
+
+    final byte[] incorrectUnidentifiedAccessKey = Arrays.copyOf(unidentifiedAccessKey, unidentifiedAccessKey.length);
+    incorrectUnidentifiedAccessKey[0] = (byte)(incorrectUnidentifiedAccessKey[0]+1);
 
     final Anonymous incorrectUakHeader =
-        new Anonymous(Base64.getEncoder().encodeToString((unidentifiedAccessKey + "-incorrect").getBytes()));
+        new Anonymous(Base64.getEncoder().encodeToString(incorrectUnidentifiedAccessKey));
 
     final Account targetAccount = mock(Account.class);
     final ServiceIdentifier targetAccountAciIdentifier = new AciServiceIdentifier(UUID.randomUUID());
     final ServiceIdentifier targetAccountPniIdentifier = new PniServiceIdentifier(UUID.randomUUID());
     when(targetAccount.getDevice(Device.PRIMARY_ID)).thenReturn(Optional.of(mock(Device.class)));
     when(targetAccount.getUnidentifiedAccessKey())
-        .thenReturn(Optional.of(unidentifiedAccessKey.getBytes(StandardCharsets.UTF_8)));
+        .thenReturn(Optional.of(unidentifiedAccessKey));
     when(targetAccount.isIdentifiedBy(targetAccountAciIdentifier)).thenReturn(true);
     when(targetAccount.isIdentifiedBy(targetAccountPniIdentifier)).thenReturn(true);
 
@@ -84,92 +89,92 @@ class OptionalAccessTest {
     final ServiceIdentifier inactiveTargetAccountAciIdentifier = new AciServiceIdentifier(UUID.randomUUID());
     when(inactiveTargetAccount.getDevice(Device.PRIMARY_ID)).thenReturn(Optional.of(mock(Device.class)));
     when(inactiveTargetAccount.getUnidentifiedAccessKey())
-        .thenReturn(Optional.of(unidentifiedAccessKey.getBytes(StandardCharsets.UTF_8)));
+        .thenReturn(Optional.of(unidentifiedAccessKey));
     when(inactiveTargetAccount.isIdentifiedBy(inactiveTargetAccountAciIdentifier)).thenReturn(true);
 
     return List.of(
-        // Unidentified caller; correct UAK
-        Arguments.of(Optional.empty(),
+        Arguments.argumentSet("Unidentified caller; correct UAK",
+            Optional.empty(),
             Optional.of(correctUakHeader),
             Optional.of(targetAccount),
             targetAccountAciIdentifier,
             OptionalAccess.ALL_DEVICES_SELECTOR,
             OptionalInt.empty()),
 
-        // Identified caller; no UAK needed
-        Arguments.of(Optional.of(mock(Account.class)),
+        Arguments.argumentSet("Identified caller; no UAK needed",
+            Optional.of(mock(Account.class)),
             Optional.empty(),
             Optional.of(targetAccount),
             targetAccountAciIdentifier,
             OptionalAccess.ALL_DEVICES_SELECTOR,
             OptionalInt.empty()),
 
-        // Unidentified caller; target account not found
-        Arguments.of(Optional.empty(),
+        Arguments.argumentSet("Unidentified caller; target account not found",
+            Optional.empty(),
             Optional.empty(),
             Optional.empty(),
             new AciServiceIdentifier(UUID.randomUUID()),
             OptionalAccess.ALL_DEVICES_SELECTOR,
             OptionalInt.of(401)),
 
-        // Identified caller; target account not found
-        Arguments.of(Optional.of(mock(Account.class)),
+        Arguments.argumentSet("Identified caller; target account not found",
+            Optional.of(mock(Account.class)),
             Optional.empty(),
             Optional.empty(),
             new AciServiceIdentifier(UUID.randomUUID()),
             OptionalAccess.ALL_DEVICES_SELECTOR,
             OptionalInt.of(404)),
 
-        // Unidentified caller; target account found, but target device not found
-        Arguments.of(Optional.empty(),
+        Arguments.argumentSet("Unidentified caller; target account found, but target device not found",
+            Optional.empty(),
             Optional.of(correctUakHeader),
             Optional.of(targetAccount),
             targetAccountAciIdentifier,
             String.valueOf(Device.PRIMARY_ID + 1),
             OptionalInt.of(401)),
 
-        // Unidentified caller; target account found, but incorrect UAK provided
-        Arguments.of(Optional.empty(),
+        Arguments.argumentSet("Unidentified caller; target account found, but incorrect UAK provided",
+            Optional.empty(),
             Optional.of(incorrectUakHeader),
             Optional.of(targetAccount),
             targetAccountAciIdentifier,
             OptionalAccess.ALL_DEVICES_SELECTOR,
             OptionalInt.of(401)),
 
-        // Unidentified caller; target account found, but has no UAK
-        Arguments.of(Optional.empty(),
+        Arguments.argumentSet("Unidentified caller; target account found, but has no UAK",
+            Optional.empty(),
             Optional.of(correctUakHeader),
             Optional.of(noUakTargetAccount),
             noUakTargetAccountAciIdentifier,
             OptionalAccess.ALL_DEVICES_SELECTOR,
             OptionalInt.of(401)),
 
-        // Unidentified caller; target account found, allows unrestricted unidentified access, so PNI target doesn't matter
-        Arguments.of(Optional.empty(),
+        Arguments.argumentSet("Unidentified caller; target account found, PNI target has priority over allows-unrestricted-unidentified-access",
+            Optional.empty(),
             Optional.of(incorrectUakHeader),
             Optional.of(allowAllTargetAccount),
             allowAllTargetAccountPniIdentifier,
             OptionalAccess.ALL_DEVICES_SELECTOR,
-            OptionalInt.empty()),
+            OptionalInt.of(401)),
 
-        // Unidentified caller; target account found, but inactive
-        Arguments.of(Optional.empty(),
+        Arguments.argumentSet("Unidentified caller; target account found, but inactive",
+            Optional.empty(),
             Optional.of(correctUakHeader),
             Optional.of(inactiveTargetAccount),
             inactiveTargetAccountAciIdentifier,
             OptionalAccess.ALL_DEVICES_SELECTOR,
             OptionalInt.empty()),
 
-        // Malformed device ID
-        Arguments.of(Optional.empty(),
+        Arguments.argumentSet("Malformed device ID",
+            Optional.empty(),
             Optional.of(correctUakHeader),
             Optional.of(targetAccount),
             targetAccountAciIdentifier,
             "not a valid identifier",
             OptionalInt.of(422)),
 
-        // Unidentified caller; target account found, but PNI identifier
-        Arguments.of(Optional.empty(),
+        Arguments.argumentSet("Unidentified caller; target account found, but PNI identifier",
+            Optional.empty(),
             Optional.of(correctUakHeader),
             Optional.of(targetAccount),
             targetAccountPniIdentifier,

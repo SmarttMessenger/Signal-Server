@@ -7,6 +7,7 @@ package org.whispersystems.textsecuregcm.configuration.dynamic;
 
 import com.fasterxml.jackson.annotation.JsonProperty;
 import jakarta.validation.Valid;
+import java.math.BigDecimal;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -30,11 +31,11 @@ public class DynamicConfiguration {
 
   @JsonProperty
   @Valid
-  private DynamicRemoteDeprecationConfiguration remoteDeprecation = new DynamicRemoteDeprecationConfiguration();
+  private DynamicRemoteDeprecationConfiguration remoteDeprecation = DynamicRemoteDeprecationConfiguration.DEFAULT;
 
   @JsonProperty
   @Valid
-  private DynamicPaymentsConfiguration payments = new DynamicPaymentsConfiguration();
+  private DynamicPaymentsConfiguration payments = DynamicPaymentsConfiguration.DEFAULT;
 
   @JsonProperty
   @Valid
@@ -43,6 +44,10 @@ public class DynamicConfiguration {
   @JsonProperty
   @Valid
   DynamicMessagePersisterConfiguration messagePersister = new DynamicMessagePersisterConfiguration();
+
+  @JsonProperty
+  @Valid
+  DynamicMessageDeliveryConfiguration messageDelivery = new DynamicMessageDeliveryConfiguration();
 
   @JsonProperty
   @Valid
@@ -63,6 +68,26 @@ public class DynamicConfiguration {
   @JsonProperty
   @Valid
   DynamicRestDeprecationConfiguration restDeprecation = new DynamicRestDeprecationConfiguration(Map.of());
+
+  @JsonProperty
+  @Valid
+  private DynamicCarrierDataLookupConfiguration carrierDataLookup = new DynamicCarrierDataLookupConfiguration();
+
+  @JsonProperty
+  @Valid
+  private DynamicGrpcAllowListConfiguration grpcAllowList = new DynamicGrpcAllowListConfiguration();
+
+  @JsonProperty
+  @Valid
+  private DynamicOmnibusConfiguration omnibus = new DynamicOmnibusConfiguration(BigDecimal.ZERO);
+
+  @JsonProperty
+  @Valid
+  private DynamicTurnConfiguration turn = new DynamicTurnConfiguration();
+
+  @JsonProperty
+  @Valid
+  private DynamicLoginPurchaseConfiguration loginPurchase = new DynamicLoginPurchaseConfiguration(false);
 
   public Optional<DynamicExperimentEnrollmentConfiguration> getExperimentEnrollmentConfiguration(
       final String experimentName) {
@@ -94,6 +119,10 @@ public class DynamicConfiguration {
     return messagePersister;
   }
 
+  public DynamicMessageDeliveryConfiguration getMessageDeliveryConfiguration() {
+    return messageDelivery;
+  }
+
   public DynamicRegistrationConfiguration getRegistrationConfiguration() {
     return registrationConfiguration;
   }
@@ -114,4 +143,23 @@ public class DynamicConfiguration {
     return restDeprecation;
   }
 
+  public DynamicCarrierDataLookupConfiguration getCarrierDataLookupConfiguration() {
+    return carrierDataLookup;
+  }
+
+  public DynamicGrpcAllowListConfiguration getGrpcAllowList() {
+    return grpcAllowList;
+  }
+
+  public DynamicOmnibusConfiguration getOmnibus() {
+    return omnibus;
+  }
+
+  public DynamicTurnConfiguration getTurnConfiguration() {
+    return turn;
+  }
+
+  public DynamicLoginPurchaseConfiguration getLoginPurchaseConfiguration() {
+    return loginPurchase;
+  }
 }

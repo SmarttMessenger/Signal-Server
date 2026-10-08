@@ -8,6 +8,7 @@ package org.whispersystems.textsecuregcm.redis;
 import io.lettuce.core.FlushMode;
 import io.lettuce.core.RedisClient;
 import io.lettuce.core.RedisURI;
+import io.lettuce.core.cluster.RedisClusterClient;
 import io.lettuce.core.internal.HostAndPort;
 import io.lettuce.core.resource.ClientResources;
 import io.lettuce.core.resource.DnsResolvers;
@@ -22,6 +23,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
+import org.apache.commons.lang3.RandomStringUtils;
 import org.junit.jupiter.api.extension.AfterEachCallback;
 import org.junit.jupiter.api.extension.BeforeAllCallback;
 import org.junit.jupiter.api.extension.BeforeEachCallback;
@@ -30,20 +32,22 @@ import org.testcontainers.containers.ComposeContainer;
 import org.testcontainers.containers.wait.strategy.Wait;
 import org.testcontainers.containers.wait.strategy.WaitStrategy;
 import org.whispersystems.textsecuregcm.configuration.CircuitBreakerConfiguration;
-import org.whispersystems.textsecuregcm.configuration.RetryConfiguration;
+import org.whispersystems.textsecuregcm.util.ResilienceUtil;
 import org.whispersystems.textsecuregcm.util.TestcontainersImages;
 
-public class RedisClusterExtension implements BeforeAllCallback, BeforeEachCallback, AfterEachCallback, ExtensionContext.Store.CloseableResource {
+public class RedisClusterExtension implements AutoCloseable, BeforeAllCallback, BeforeEachCallback, AfterEachCallback {
 
   private static ComposeContainer composeContainer;
   private static Map<HostAndPort, HostAndPort> exposedAddressesByInternalAddress;
   private static List<RedisURI> redisUris;
 
   private final Duration timeout;
-  private final RetryConfiguration retryConfiguration;
 
   private ClientResources redisClientResources;
   private FaultTolerantRedisClusterClient redisClusterClient;
+
+  private static final String CIRCUIT_BREAKER_CONFIGURATION_NAME =
+      RedisClusterExtension.class.getSimpleName() + "-" + RandomStringUtils.insecure().nextAlphanumeric(8);
 
   private static final Duration DEFAULT_TIMEOUT = Duration.ofSeconds(2);
 
@@ -79,9 +83,8 @@ public class RedisClusterExtension implements BeforeAllCallback, BeforeEachCallb
             - 'REDIS_CLUSTER_CREATOR=yes'
       """, TestcontainersImages.getRedisCluster());
 
-  public RedisClusterExtension(final Duration timeout, final RetryConfiguration retryConfiguration) {
+  public RedisClusterExtension(final Duration timeout) {
     this.timeout = timeout;
-    this.retryConfiguration = retryConfiguration;
   }
 
 
@@ -90,7 +93,7 @@ public class RedisClusterExtension implements BeforeAllCallback, BeforeEachCallb
   }
 
   @Override
-  public void close() throws Throwable {
+  public void close() {
     if (composeContainer != null) {
       composeContainer.stop();
       composeContainer = null;
@@ -100,6 +103,11 @@ public class RedisClusterExtension implements BeforeAllCallback, BeforeEachCallb
   @Override
   public void beforeAll(final ExtensionContext context) throws Exception {
     if (composeContainer == null) {
+      final CircuitBreakerConfiguration circuitBreakerConfig = new CircuitBreakerConfiguration();
+      circuitBreakerConfig.setWaitDurationInOpenState(Duration.ofMillis(500));
+
+      ResilienceUtil.getCircuitBreakerRegistry().addConfiguration(CIRCUIT_BREAKER_CONFIGURATION_NAME, circuitBreakerConfig.toCircuitBreakerConfig());
+
       final File clusterComposeFile = File.createTempFile("redis-cluster", ".yml");
       clusterComposeFile.deleteOnExit();
 
@@ -184,17 +192,16 @@ public class RedisClusterExtension implements BeforeAllCallback, BeforeEachCallb
         .socketAddressResolver(getSocketAddressResolver())
         .build();
 
-    final CircuitBreakerConfiguration circuitBreakerConfig = new CircuitBreakerConfiguration();
-    circuitBreakerConfig.setWaitDurationInOpenState(Duration.ofMillis(500));
-
     redisClusterClient = new FaultTolerantRedisClusterClient("test-cluster",
         redisClientResources.mutate(),
         getRedisURIs(),
         timeout,
-        circuitBreakerConfig,
-        retryConfiguration);
+        CIRCUIT_BREAKER_CONFIGURATION_NAME);
 
-    redisClusterClient.useCluster(connection -> connection.sync().flushall(FlushMode.SYNC));
+    // Bypass circuit breakers and configured timeouts for initial setup operations
+    try (final RedisClusterClient flushClusterClient = RedisClusterClient.create(redisClientResources, getRedisURIs())) {
+      flushClusterClient.connect().sync().flushall(FlushMode.SYNC);
+    }
   }
 
   @Override
@@ -226,7 +233,6 @@ public class RedisClusterExtension implements BeforeAllCallback, BeforeEachCallb
   public static class Builder {
 
     private Duration timeout = DEFAULT_TIMEOUT;
-    private RetryConfiguration retryConfiguration = new RetryConfiguration();
 
     private Builder() {
     }
@@ -236,13 +242,8 @@ public class RedisClusterExtension implements BeforeAllCallback, BeforeEachCallb
       return this;
     }
 
-    Builder retryConfiguration(RetryConfiguration retryConfiguration) {
-      this.retryConfiguration = retryConfiguration;
-      return this;
-    }
-
     public RedisClusterExtension build() {
-      return new RedisClusterExtension(timeout, retryConfiguration);
+      return new RedisClusterExtension(timeout);
     }
   }
 }

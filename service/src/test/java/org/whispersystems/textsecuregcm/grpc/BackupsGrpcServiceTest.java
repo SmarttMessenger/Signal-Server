@@ -8,11 +8,13 @@ package org.whispersystems.textsecuregcm.grpc;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.google.protobuf.ByteString;
+import com.google.protobuf.Empty;
 import io.grpc.Status;
 import java.time.Clock;
 import java.time.Duration;
@@ -28,14 +30,15 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.CsvSource;
-import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
-import org.junitpioneer.jupiter.cartesian.CartesianTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.Mock;
 import org.signal.chat.backup.BackupsGrpc;
 import org.signal.chat.backup.GetBackupAuthCredentialsRequest;
 import org.signal.chat.backup.GetBackupAuthCredentialsResponse;
+import org.signal.chat.backup.GetBackupIdLimitsResponse;
 import org.signal.chat.backup.RedeemReceiptRequest;
+import org.signal.chat.backup.RedeemReceiptResponse;
 import org.signal.chat.backup.SetBackupIdRequest;
 import org.signal.chat.common.ZkCredential;
 import org.signal.libsignal.zkgroup.InvalidInputException;
@@ -51,8 +54,15 @@ import org.signal.libsignal.zkgroup.receipts.ReceiptCredentialRequestContext;
 import org.signal.libsignal.zkgroup.receipts.ReceiptCredentialResponse;
 import org.signal.libsignal.zkgroup.receipts.ReceiptSerial;
 import org.signal.libsignal.zkgroup.receipts.ServerZkReceiptOperations;
+import org.whispersystems.textsecuregcm.auth.RedemptionRange;
 import org.whispersystems.textsecuregcm.backup.BackupAuthManager;
 import org.whispersystems.textsecuregcm.backup.BackupAuthTestUtil;
+import org.whispersystems.textsecuregcm.backup.BackupBadReceiptException;
+import org.whispersystems.textsecuregcm.backup.BackupException;
+import org.whispersystems.textsecuregcm.backup.BackupInvalidArgumentException;
+import org.whispersystems.textsecuregcm.backup.BackupMissingIdCommitmentException;
+import org.whispersystems.textsecuregcm.backup.BackupNotFoundException;
+import org.whispersystems.textsecuregcm.backup.BackupPermissionException;
 import org.whispersystems.textsecuregcm.controllers.RateLimitExceededException;
 import org.whispersystems.textsecuregcm.metrics.BackupMetrics;
 import org.whispersystems.textsecuregcm.storage.Account;
@@ -60,6 +70,7 @@ import org.whispersystems.textsecuregcm.storage.AccountsManager;
 import org.whispersystems.textsecuregcm.storage.Device;
 import org.whispersystems.textsecuregcm.util.EnumMapUtil;
 import org.whispersystems.textsecuregcm.util.TestRandomUtil;
+import javax.annotation.Nullable;
 
 class BackupsGrpcServiceTest extends SimpleBaseGrpcTest<BackupsGrpcService, BackupsGrpc.BackupsBlockingStub> {
 
@@ -90,45 +101,43 @@ class BackupsGrpcServiceTest extends SimpleBaseGrpcTest<BackupsGrpcService, Back
     when(device.isPrimary()).thenReturn(true);
     when(accountsManager.getByAccountIdentifierAsync(AUTHENTICATED_ACI))
         .thenReturn(CompletableFuture.completedFuture(Optional.of(account)));
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
+        .thenReturn(Optional.of(account));
     when(account.getDevice(AUTHENTICATED_DEVICE_ID)).thenReturn(Optional.of(device));
   }
 
 
   @Test
-  void setBackupId() {
-    when(backupAuthManager.commitBackupId(any(), any(), any(), any()))
-        .thenReturn(CompletableFuture.completedFuture(null));
-
+  void setBackupId() throws RateLimitExceededException, BackupInvalidArgumentException, BackupPermissionException {
     authenticatedServiceStub().setBackupId(
         SetBackupIdRequest.newBuilder()
             .setMediaBackupAuthCredentialRequest(ByteString.copyFrom(mediaAuthCredRequest.serialize()))
             .setMessagesBackupAuthCredentialRequest(ByteString.copyFrom(messagesAuthCredRequest.serialize()))
             .build());
 
-    verify(backupAuthManager).commitBackupId(account, device, messagesAuthCredRequest, mediaAuthCredRequest);
+    verify(backupAuthManager)
+        .commitBackupId(account, device, Optional.of(messagesAuthCredRequest), Optional.of(mediaAuthCredRequest));
+  }
+
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  void setBackupIdPartial(boolean media)
+      throws RateLimitExceededException, BackupInvalidArgumentException, BackupPermissionException {
+    final SetBackupIdRequest.Builder builder = SetBackupIdRequest.newBuilder();
+    if (media) {
+      builder.setMediaBackupAuthCredentialRequest(ByteString.copyFrom(mediaAuthCredRequest.serialize()));
+    } else {
+      builder.setMessagesBackupAuthCredentialRequest(ByteString.copyFrom(messagesAuthCredRequest.serialize()));
+    }
+    authenticatedServiceStub().setBackupId(builder.build());
+    verify(backupAuthManager)
+        .commitBackupId(account, device,
+            Optional.ofNullable(media ? null : messagesAuthCredRequest),
+            Optional.ofNullable(media ? mediaAuthCredRequest: null));
   }
 
   @Test
   void setBackupIdInvalid() {
-    // missing media credential
-    GrpcTestUtils.assertStatusException(
-        Status.INVALID_ARGUMENT, () -> authenticatedServiceStub().setBackupId(SetBackupIdRequest.newBuilder()
-            .setMessagesBackupAuthCredentialRequest(ByteString.copyFrom(messagesAuthCredRequest.serialize()))
-            .build())
-    );
-
-    // missing message credential
-    GrpcTestUtils.assertStatusException(
-        Status.INVALID_ARGUMENT, () -> authenticatedServiceStub().setBackupId(SetBackupIdRequest.newBuilder()
-            .setMediaBackupAuthCredentialRequest(ByteString.copyFrom(mediaAuthCredRequest.serialize()))
-            .build())
-    );
-
-    // missing all credentials
-    GrpcTestUtils.assertStatusException(
-        Status.INVALID_ARGUMENT, () -> authenticatedServiceStub().setBackupId(SetBackupIdRequest.newBuilder().build())
-    );
-
     // invalid serialization
     GrpcTestUtils.assertStatusException(
         Status.INVALID_ARGUMENT, () -> authenticatedServiceStub().setBackupId(
@@ -142,23 +151,16 @@ class BackupsGrpcServiceTest extends SimpleBaseGrpcTest<BackupsGrpcService, Back
 
   public static Stream<Arguments> setBackupIdException() {
     return Stream.of(
-        Arguments.of(new RateLimitExceededException(null), false, Status.RESOURCE_EXHAUSTED),
-        Arguments.of(Status.INVALID_ARGUMENT.withDescription("async").asRuntimeException(), false,
-            Status.INVALID_ARGUMENT),
-        Arguments.of(Status.INVALID_ARGUMENT.withDescription("sync").asRuntimeException(), true,
-            Status.INVALID_ARGUMENT)
-    );
+        Arguments.of(new RateLimitExceededException(null), Status.RESOURCE_EXHAUSTED),
+        Arguments.of(new BackupPermissionException("test"), Status.INVALID_ARGUMENT),
+        Arguments.of(new BackupInvalidArgumentException("test"), Status.INVALID_ARGUMENT));
   }
 
   @ParameterizedTest
   @MethodSource
-  void setBackupIdException(final Exception ex, final boolean sync, final Status expected) {
-    if (sync) {
-      when(backupAuthManager.commitBackupId(any(), any(), any(), any())).thenThrow(ex);
-    } else {
-      when(backupAuthManager.commitBackupId(any(), any(), any(), any()))
-          .thenReturn(CompletableFuture.failedFuture(ex));
-    }
+  void setBackupIdException(final Exception ex, final Status expected)
+      throws RateLimitExceededException, BackupInvalidArgumentException, BackupPermissionException {
+    doThrow(ex).when(backupAuthManager).commitBackupId(any(), any(), any(), any());
 
     GrpcTestUtils.assertStatusException(
         expected, () -> authenticatedServiceStub().setBackupId(SetBackupIdRequest.newBuilder()
@@ -168,8 +170,18 @@ class BackupsGrpcServiceTest extends SimpleBaseGrpcTest<BackupsGrpcService, Back
     );
   }
 
-  @Test
-  void redeemReceipt() throws InvalidInputException, VerificationFailedException {
+  public static Stream<Arguments> redeemReceipt() {
+    return Stream.of(
+        Arguments.of(null, RedeemReceiptResponse.ResponseCase.SUCCESS),
+        Arguments.of(new BackupBadReceiptException("test"), RedeemReceiptResponse.ResponseCase.INVALID_RECEIPT),
+        Arguments.of(new BackupMissingIdCommitmentException(), RedeemReceiptResponse.ResponseCase.ACCOUNT_MISSING_COMMITMENT));
+  }
+
+  @ParameterizedTest
+  @MethodSource
+  void redeemReceipt(@Nullable final BackupException exception, final RedeemReceiptResponse.ResponseCase expectedOutcome)
+      throws InvalidInputException, VerificationFailedException, BackupInvalidArgumentException, BackupMissingIdCommitmentException, BackupBadReceiptException {
+
     final ServerSecretParams params = ServerSecretParams.generate();
     final ServerZkReceiptOperations serverOps = new ServerZkReceiptOperations(params);
     final ClientZkReceiptOperations clientOps = new ClientZkReceiptOperations(params.getPublicParams());
@@ -179,29 +191,33 @@ class BackupsGrpcServiceTest extends SimpleBaseGrpcTest<BackupsGrpcService, Back
     final ReceiptCredential receiptCredential = clientOps.receiveReceiptCredential(rcrc, rcr);
     final ReceiptCredentialPresentation presentation = clientOps.createReceiptCredentialPresentation(receiptCredential);
 
-    when(backupAuthManager.redeemReceipt(any(), any())).thenReturn(CompletableFuture.completedFuture(null));
+    if (exception != null) {
+      doThrow(exception).when(backupAuthManager).redeemReceipt(any(), any());
+    }
 
-    authenticatedServiceStub().redeemReceipt(RedeemReceiptRequest.newBuilder()
-        .setPresentation(ByteString.copyFrom(presentation.serialize()))
-        .build());
+    final RedeemReceiptResponse redeemReceiptResponse = authenticatedServiceStub().redeemReceipt(
+        RedeemReceiptRequest.newBuilder()
+            .setPresentation(ByteString.copyFrom(presentation.serialize()))
+            .build());
+    assertThat(redeemReceiptResponse.getResponseCase()).isEqualTo(expectedOutcome);
 
     verify(backupAuthManager).redeemReceipt(account, presentation);
   }
 
 
   @Test
-  void getCredentials() {
+  void getCredentials() throws BackupNotFoundException {
     final Instant start = Instant.now().truncatedTo(ChronoUnit.DAYS);
     final Instant end = start.plus(Duration.ofDays(1));
+    final RedemptionRange expectedRange = RedemptionRange.inclusive(Clock.systemUTC(), start, end);
 
     final Map<BackupCredentialType, List<BackupAuthManager.Credential>> expectedCredentialsByType =
         EnumMapUtil.toEnumMap(BackupCredentialType.class, credentialType -> backupAuthTestUtil.getCredentials(
             BackupLevel.PAID, backupAuthTestUtil.getRequest(messagesBackupKey, AUTHENTICATED_ACI), credentialType,
             start, end));
 
-    expectedCredentialsByType.forEach((credentialType, expectedCredentials) ->
-        when(backupAuthManager.getBackupAuthCredentials(any(), eq(credentialType), eq(start), eq(end)))
-            .thenReturn(CompletableFuture.completedFuture(expectedCredentials)));
+    when(backupAuthManager.getBackupAuthCredentials(any(), eq(expectedRange)))
+        .thenReturn(expectedCredentialsByType);
 
     final GetBackupAuthCredentialsResponse credentialResponse = authenticatedServiceStub().getBackupAuthCredentials(
         GetBackupAuthCredentialsRequest.newBuilder()
@@ -211,8 +227,8 @@ class BackupsGrpcServiceTest extends SimpleBaseGrpcTest<BackupsGrpcService, Back
     expectedCredentialsByType.forEach((credentialType, expectedCredentials) -> {
 
       final Map<Long, ZkCredential> creds = switch (credentialType) {
-        case MESSAGES -> credentialResponse.getMessageCredentialsMap();
-        case MEDIA -> credentialResponse.getMediaCredentialsMap();
+        case MESSAGES -> credentialResponse.getCredentials().getMessageCredentialsMap();
+        case MEDIA -> credentialResponse.getCredentials().getMediaCredentialsMap();
       };
       assertThat(creds).hasSize(expectedCredentials.size()).containsKey(start.getEpochSecond());
 
@@ -247,6 +263,24 @@ class BackupsGrpcServiceTest extends SimpleBaseGrpcTest<BackupsGrpcService, Back
 
     GrpcTestUtils.assertStatusException(Status.INVALID_ARGUMENT,
         () -> authenticatedServiceStub().getBackupAuthCredentials(builder.build()));
+  }
+
+  @ParameterizedTest
+  @CsvSource({
+      "true, 0",
+      "false, 3600"
+  })
+  void getBackupIdLimits(final boolean hasPermitsRemaining, final long retryAfterSeconds) {
+    when(backupAuthManager.checkBackupIdRotationLimit(account))
+        .thenReturn(new BackupAuthManager.BackupIdRotationLimit(
+            hasPermitsRemaining, Duration.ofSeconds(retryAfterSeconds)));
+
+    final GetBackupIdLimitsResponse response =
+        authenticatedServiceStub().getBackupIdLimits(Empty.getDefaultInstance());
+
+    assertThat(response.getHasPermitsRemaining()).isEqualTo(hasPermitsRemaining);
+    assertThat(response.getRetryAfterSeconds()).isEqualTo(retryAfterSeconds);
+    verify(backupAuthManager).checkBackupIdRotationLimit(account);
   }
 
 }

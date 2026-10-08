@@ -20,11 +20,12 @@ import java.util.concurrent.atomic.AtomicLong;
 import net.sourceforge.argparse4j.inf.Subparser;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.whispersystems.textsecuregcm.identity.IdentityType;
 import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.storage.AccountsManager;
-import org.whispersystems.textsecuregcm.util.Util;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
 import reactor.util.retry.Retry;
 
 public class RemoveExpiredUsernameHoldsCommand extends AbstractSinglePassCrawlAccountsCommand {
@@ -85,8 +86,9 @@ public class RemoveExpiredUsernameHoldsCommand extends AbstractSinglePassCrawlAc
           final int holdsToRemove = removeExpired(holds);
           final Mono<Void> purgeMono = isDryRun || holdsToRemove == 0
               ? Mono.empty()
-              : Mono.fromFuture(() ->
-                  accountManager.updateAsync(account, a -> a.setUsernameHolds(holds)).thenRun(Util.NOOP));
+              : Mono.fromRunnable(() -> accountManager.update(account.getAccountIdentifier(), a -> a.setUsernameHolds(holds)))
+                  .subscribeOn(Schedulers.boundedElastic())
+                  .then();
           Metrics.counter(INSPECTED_ACCOUNTS_COUNTER_NAME,
                   "dryRun", String.valueOf(isDryRun),
                   "expiredHolds", String.valueOf(holdsToRemove > 0))
@@ -95,7 +97,7 @@ public class RemoveExpiredUsernameHoldsCommand extends AbstractSinglePassCrawlAc
               .retryWhen(Retry.backoff(3, Duration.ofSeconds(1)))
               .doOnSuccess(ignored -> deletedHoldsCounter.increment(holdsToRemove))
               .onErrorResume(throwable -> {
-                log.warn("Failed to purge {} expired holds on account {}", holdsToRemove, account.getUuid());
+                log.warn("Failed to purge {} expired holds on account {}", holdsToRemove, account.getAccountIdentifier());
                 return Mono.empty();
               });
         }, maxConcurrency)

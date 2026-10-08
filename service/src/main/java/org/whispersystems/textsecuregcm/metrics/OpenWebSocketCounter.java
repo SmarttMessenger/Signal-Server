@@ -2,97 +2,127 @@ package org.whispersystems.textsecuregcm.metrics;
 
 import static org.whispersystems.textsecuregcm.metrics.MetricsUtil.name;
 
+import com.google.common.net.InetAddresses;
 import io.micrometer.core.instrument.Metrics;
-import io.micrometer.core.instrument.Tag;
 import io.micrometer.core.instrument.Tags;
 import io.micrometer.core.instrument.Timer;
+import java.net.InetSocketAddress;
 import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
-import org.whispersystems.textsecuregcm.util.EnumMapUtil;
-import org.whispersystems.textsecuregcm.util.ua.ClientPlatform;
+import java.util.function.Supplier;
+import javax.annotation.Nullable;
+import org.whispersystems.textsecuregcm.asn.AsnInfo;
+import org.whispersystems.textsecuregcm.asn.AsnInfoProvider;
+import org.whispersystems.textsecuregcm.storage.ClientReleaseManager;
 import org.whispersystems.textsecuregcm.util.ua.UnrecognizedUserAgentException;
+import org.whispersystems.textsecuregcm.util.ua.UserAgent;
 import org.whispersystems.textsecuregcm.util.ua.UserAgentUtil;
 import org.whispersystems.websocket.session.WebSocketSessionContext;
 
 public class OpenWebSocketCounter {
 
-  private static final String WEBSOCKET_CLOSED_COUNTER_NAME = name(OpenWebSocketCounter.class, "websocketClosed");
+  private final Supplier<AsnInfoProvider> asnInfoProviderSupplier;
+  private final ClientReleaseManager clientReleaseManager;
 
-  private final String newConnectionCounterName;
-  private final String durationTimerName;
+  private final Tags baseTags;
 
-  private final Tags tags;
+  private final Map<Tags, AtomicInteger> openWebsocketsByTags;
+  private final Map<String, AtomicInteger> openWebsocketsByAsnRegion = new ConcurrentHashMap<>();
+  private final AtomicInteger totalConnections;
 
-  private final Map<ClientPlatform, AtomicInteger> openWebsocketsByClientPlatform;
-  private final AtomicInteger openWebsocketsFromUnknownPlatforms;
+  private static final int MAX_COUNTERS = 4096;
 
-  public OpenWebSocketCounter(final String openWebSocketGaugeName,
-      final String newConnectionCounterName,
-      final String durationTimerName) {
+  private static final String OPEN_WEBSOCKET_GAUGE_NAME = name(OpenWebSocketCounter.class, "openWebsockets");
+  private static final String TOTAL_CONNECTIONS_GAUGE_NAME = name(OpenWebSocketCounter.class, "totalOpenWebsockets");
+  private static final String NEW_CONNECTION_COUNTER_NAME = name(OpenWebSocketCounter.class, "newConnections");
+  private static final String WEB_SOCKET_CLOSED_COUNTER_NAME = name(OpenWebSocketCounter.class, "websocketClosed");
+  private static final String SESSION_DURATION_TIMER_NAME = name(OpenWebSocketCounter.class, "sessionDuration");
+  private static final String GAUGE_COUNT_GAUGE_NAME = name(OpenWebSocketCounter.class, "gaugeCount");
+  private static final String OPEN_WEBSOCKET_BY_ASN_REGION_GAUGE_NAME = name(OpenWebSocketCounter.class, "openWebsocketsByAsnRegion");
 
-    this(openWebSocketGaugeName, newConnectionCounterName, durationTimerName, Tags.empty());
-  }
+  public OpenWebSocketCounter(final String webSocketType,
+      final Supplier<AsnInfoProvider> asnInfoProviderSupplier,
+      final ClientReleaseManager clientReleaseManager) {
 
-  public OpenWebSocketCounter(final String openWebSocketGaugeName,
-      final String newConnectionCounterName,
-      final String durationTimerName,
-      final Tags tags) {
+    this.asnInfoProviderSupplier = asnInfoProviderSupplier;
+    this.clientReleaseManager = clientReleaseManager;
 
-    this.newConnectionCounterName = newConnectionCounterName;
-    this.durationTimerName = durationTimerName;
+    this.baseTags = Tags.of("webSocketType", webSocketType);
+    this.openWebsocketsByTags = Metrics.gaugeMapSize(GAUGE_COUNT_GAUGE_NAME, baseTags, new ConcurrentHashMap<>());
 
-    this.tags = tags;
-
-    openWebsocketsByClientPlatform = EnumMapUtil.toEnumMap(ClientPlatform.class,
-        clientPlatform -> buildGauge(openWebSocketGaugeName, clientPlatform.name().toLowerCase(), tags));
-
-    openWebsocketsFromUnknownPlatforms = buildGauge(openWebSocketGaugeName, "unknown", tags);
-  }
-
-  private static AtomicInteger buildGauge(final String gaugeName, final String clientPlatformName, final Tags tags) {
-    return Metrics.gauge(gaugeName,
-        tags.and(Tag.of(UserAgentTagUtil.PLATFORM_TAG, clientPlatformName)),
-        new AtomicInteger(0));
+    this.totalConnections = Metrics.gauge(TOTAL_CONNECTIONS_GAUGE_NAME, baseTags, new AtomicInteger(0));
   }
 
   public void countOpenWebSocket(final WebSocketSessionContext context) {
     final Timer.Sample sample = Timer.start();
 
-    // We have to jump through some hoops here to have something "effectively final" for the close listener, but
-    // assignable from a `catch` block.
-    final AtomicInteger openWebSocketCounter;
+    final Optional<AtomicInteger> maybeOpenWebSocketsByAsnRegion;
 
-    {
-      AtomicInteger calculatedOpenWebSocketCounter;
-
-      try {
-        final ClientPlatform clientPlatform =
-            UserAgentUtil.parseUserAgentString(context.getClient().getUserAgent()).platform();
-
-        calculatedOpenWebSocketCounter = openWebsocketsByClientPlatform.get(clientPlatform);
-      } catch (final UnrecognizedUserAgentException e) {
-        calculatedOpenWebSocketCounter = openWebsocketsFromUnknownPlatforms;
-      }
-
-      openWebSocketCounter = calculatedOpenWebSocketCounter;
+    if (context.getClient().getRemoteAddress() instanceof InetSocketAddress inetSocketAddress) {
+      maybeOpenWebSocketsByAsnRegion =
+          asnInfoProviderSupplier.get().lookup(InetAddresses.toAddrString(inetSocketAddress.getAddress()))
+              .map(AsnInfo::regionCode)
+              .map(asnRegion -> openWebsocketsByAsnRegion.computeIfAbsent(asnRegion, region ->
+                  Metrics.gauge(OPEN_WEBSOCKET_BY_ASN_REGION_GAUGE_NAME, Tags.of("asnRegion", region),
+                      new AtomicInteger(0))));
+    } else {
+      maybeOpenWebSocketsByAsnRegion = Optional.empty();
     }
 
-    openWebSocketCounter.incrementAndGet();
+    maybeOpenWebSocketsByAsnRegion.ifPresent(AtomicInteger::incrementAndGet);
 
-    final Tags tagsWithClientPlatform = tags.and(UserAgentTagUtil.getPlatformTag(context.getClient().getUserAgent()));
+    @Nullable final UserAgent userAgent;
+    {
+      UserAgent parsedUserAgent;
 
-    Metrics.counter(newConnectionCounterName, tagsWithClientPlatform).increment();
+      try {
+        parsedUserAgent = UserAgentUtil.parseUserAgentString(context.getClient().getUserAgent());
+      } catch (final UnrecognizedUserAgentException e) {
+        parsedUserAgent = null;
+      }
 
-    context.addWebsocketClosedListener((context1, statusCode, reason) -> {
-      sample.stop(Timer.builder(durationTimerName)
-          .publishPercentileHistogram(true)
+      userAgent = parsedUserAgent;
+    }
+
+    final Tags tagsWithClientPlatform = baseTags.and(UserAgentTagUtil.getPlatformTag(userAgent));
+
+    final Optional<AtomicInteger> maybeOpenWebSocketCounter;
+    {
+      final Tags tagsWithAdditionalSpecifiers = tagsWithClientPlatform
+          .and(UserAgentTagUtil.getClientVersionTag(userAgent, clientReleaseManager)
+              .map(Tags::of)
+              .orElseGet(Tags::empty))
+          .and(UserAgentTagUtil.getAdditionalSpecifierTags(userAgent));
+
+      maybeOpenWebSocketCounter = getCounter(tagsWithAdditionalSpecifiers);
+    }
+
+    maybeOpenWebSocketCounter.ifPresent(AtomicInteger::incrementAndGet);
+    totalConnections.incrementAndGet();
+
+    Metrics.counter(NEW_CONNECTION_COUNTER_NAME, tagsWithClientPlatform).increment();
+
+    context.addWebsocketClosedListener((_, statusCode, _) -> {
+      sample.stop(Timer.builder(SESSION_DURATION_TIMER_NAME)
           .tags(tagsWithClientPlatform)
           .register(Metrics.globalRegistry));
 
-      openWebSocketCounter.decrementAndGet();
+      maybeOpenWebSocketCounter.ifPresent(AtomicInteger::decrementAndGet);
+      maybeOpenWebSocketsByAsnRegion.ifPresent(AtomicInteger::decrementAndGet);
+      totalConnections.decrementAndGet();
 
-      Metrics.counter(WEBSOCKET_CLOSED_COUNTER_NAME, tagsWithClientPlatform.and("status", String.valueOf(statusCode)))
+      Metrics.counter(WEB_SOCKET_CLOSED_COUNTER_NAME, tagsWithClientPlatform.and("status", String.valueOf(statusCode)))
           .increment();
     });
+  }
+
+  private Optional<AtomicInteger> getCounter(final Tags tags) {
+    // Make a reasonable effort to avoid creating new counters if we're already full
+    return openWebsocketsByTags.size() >= MAX_COUNTERS
+        ? Optional.ofNullable(openWebsocketsByTags.get(tags))
+        : Optional.of(openWebsocketsByTags.computeIfAbsent(tags,
+            t -> Metrics.gauge(OPEN_WEBSOCKET_GAUGE_NAME, t, new AtomicInteger(0))));
   }
 }

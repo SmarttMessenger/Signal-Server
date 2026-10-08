@@ -10,6 +10,6 @@ public interface AttachmentGenerator {
 
   record Descriptor(Map<String, String> headers, String signedUploadLocation) {}
 
-  Descriptor generateAttachment(final String key);
+  Descriptor generateAttachment(final String key, final long uploadLength);
 
 }

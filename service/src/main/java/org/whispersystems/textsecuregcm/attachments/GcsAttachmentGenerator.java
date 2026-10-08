@@ -24,16 +24,16 @@ public class GcsAttachmentGenerator implements AttachmentGenerator {
   private final CanonicalRequestSigner canonicalRequestSigner;
 
   public GcsAttachmentGenerator(@Nonnull String domain, @Nonnull String email,
-      int maxSizeInBytes, @Nonnull String pathPrefix, @Nonnull String rsaSigningKey)
+       @Nonnull String pathPrefix, @Nonnull String rsaSigningKey)
       throws IOException, InvalidKeyException, InvalidKeySpecException {
-    this.canonicalRequestGenerator = new CanonicalRequestGenerator(domain, email, maxSizeInBytes, pathPrefix);
+    this.canonicalRequestGenerator = new CanonicalRequestGenerator(domain, email, pathPrefix);
     this.canonicalRequestSigner = new CanonicalRequestSigner(rsaSigningKey);
   }
 
   @Override
-  public Descriptor generateAttachment(final String key) {
+  public Descriptor generateAttachment(final String key, final long uploadLength) {
     final ZonedDateTime now = ZonedDateTime.now(ZoneOffset.UTC);
-    final CanonicalRequest canonicalRequest = canonicalRequestGenerator.createFor(key, now);
+    final CanonicalRequest canonicalRequest = canonicalRequestGenerator.createFor(key, now, uploadLength);
     return new Descriptor(getHeaderMap(canonicalRequest), getSignedUploadLocation(canonicalRequest));
   }
 
@@ -49,6 +49,5 @@ public class GcsAttachmentGenerator implements AttachmentGenerator {
         "x-goog-content-length-range", "1," + canonicalRequest.getMaxSizeInBytes(),
         "x-goog-resumable", "start");
   }
-
 
 }

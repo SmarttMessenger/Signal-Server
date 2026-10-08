@@ -5,16 +5,20 @@
 
 package org.whispersystems.textsecuregcm.storage;
 
-import static com.codahale.metrics.MetricRegistry.name;
+import static org.whispersystems.textsecuregcm.metrics.MetricsUtil.name;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.InvalidProtocolBufferException;
+import io.github.resilience4j.reactor.retry.RetryOperator;
 import io.lettuce.core.Limit;
 import io.lettuce.core.Range;
+import io.lettuce.core.ScanArgs;
+import io.lettuce.core.ScanStream;
 import io.lettuce.core.ScoredValue;
-import io.lettuce.core.ZAddArgs;
+import io.lettuce.core.SetArgs;
 import io.lettuce.core.cluster.SlotHash;
+import io.lettuce.core.cluster.models.partitions.RedisClusterNode;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.Metrics;
 import io.micrometer.core.instrument.Tag;
@@ -31,11 +35,14 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.function.Function;
 import java.util.function.Predicate;
+import java.util.stream.Collectors;
 import org.reactivestreams.Publisher;
 import org.signal.libsignal.protocol.SealedSenderMultiRecipientMessage;
 import org.signal.libsignal.protocol.ServiceId;
@@ -46,13 +53,13 @@ import org.whispersystems.textsecuregcm.identity.ServiceIdentifier;
 import org.whispersystems.textsecuregcm.metrics.MetricsUtil;
 import org.whispersystems.textsecuregcm.redis.FaultTolerantRedisClusterClient;
 import org.whispersystems.textsecuregcm.util.Pair;
-import org.whispersystems.textsecuregcm.util.RedisClusterUtil;
+import org.whispersystems.textsecuregcm.util.ResilienceUtil;
+import org.whispersystems.textsecuregcm.util.UUIDUtil;
 import reactor.core.observability.micrometer.Micrometer;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Scheduler;
 import reactor.core.scheduler.Schedulers;
-import reactor.util.retry.RetrySpec;
 
 /**
  * Manages short-term storage of messages in Redis. Messages are frequently delivered to their destination and deleted
@@ -82,9 +89,6 @@ import reactor.util.retry.RetrySpec;
  *   <dt>{@code queueLockKey}</dt>
  *   <dd>Used to indicate that a queue is being modified by the {@link MessagePersister} and that {@code get_items} should
  *   return an empty list.</dd>
- *   <dt>{@code queueTotalIndexKey}</dt>
- *   <dd>A sorted set of all queues in a shard. A queue’s score is the timestamp of its oldest message, which is used by
- *   the {@link MessagePersister} to prioritize queues to persist.</dd>
  * </dl>
  * <p>
  * At a high level, the process is:
@@ -123,15 +127,15 @@ public class MessagesCache {
   private final MessagesCacheInsertSharedMultiRecipientPayloadAndViewsScript insertMrmScript;
   private final MessagesCacheRemoveByGuidScript removeByGuidScript;
   private final MessagesCacheGetItemsScript getItemsScript;
+  private final MessagesCacheReleaseNodeClaimScript releaseNodeClaimScript;
   private final MessagesCacheRemoveQueueScript removeQueueScript;
-  private final MessagesCacheGetQueuesToPersistScript getQueuesToPersistScript;
   private final MessagesCacheRemoveRecipientViewFromMrmDataScript removeRecipientViewFromMrmDataScript;
   private final MessagesCacheUnlockQueueScript unlockQueueScript;
 
+  private int nextNodeRotateDistance = 0;
+
   private final Timer insertTimer = Metrics.timer(name(MessagesCache.class, "insert"));
   private final Timer insertSharedMrmPayloadTimer = Metrics.timer(name(MessagesCache.class, "insertSharedMrmPayload"));
-  private final Timer getMessagesTimer = Metrics.timer(name(MessagesCache.class, "get"));
-  private final Timer getQueuesToPersistTimer = Metrics.timer(name(MessagesCache.class, "getQueuesToPersist"));
   private final Timer removeByGuidTimer = Metrics.timer(name(MessagesCache.class, "removeByGuid"));
   private final Timer removeRecipientViewTimer = Metrics.timer(name(MessagesCache.class, "removeRecipientView"));
   private final Timer clearQueueTimer = Metrics.timer(name(MessagesCache.class, "clear"));
@@ -148,7 +152,8 @@ public class MessagesCache {
   private final Counter sharedMrmDataKeyRemovedCounter = Metrics.counter(
       name(MessagesCache.class, "sharedMrmKeyRemoved"));
 
-  static final String NEXT_SLOT_TO_PERSIST_KEY = "user_queue_persist_slot";
+  static final String RETRY_NAME = ResilienceUtil.name(MessagesCache.class);
+
   private static final byte[] LOCK_VALUE = "1".getBytes(StandardCharsets.UTF_8);
 
   @VisibleForTesting
@@ -158,7 +163,9 @@ public class MessagesCache {
   static final Duration MAX_EPHEMERAL_MESSAGE_DELAY = Duration.ofSeconds(10);
 
   private static final String GET_FLUX_NAME = MetricsUtil.name(MessagesCache.class, "get");
-  private static final int PAGE_SIZE = 100;
+
+  @VisibleForTesting
+  static final int PAGE_SIZE = 100;
 
   private static final int REMOVE_MRM_RECIPIENT_VIEW_CONCURRENCY = 8;
 
@@ -167,20 +174,20 @@ public class MessagesCache {
   public MessagesCache(final FaultTolerantRedisClusterClient redisCluster,
       final Scheduler messageDeliveryScheduler,
       final ExecutorService messageDeletionExecutorService,
-      final Clock clock)
-      throws IOException {
+      final ScheduledExecutorService retryExecutor,
+      final Clock clock) throws IOException {
 
     this(
         redisCluster,
         messageDeliveryScheduler,
         messageDeletionExecutorService,
         clock,
-        new MessagesCacheInsertScript(redisCluster),
-        new MessagesCacheInsertSharedMultiRecipientPayloadAndViewsScript(redisCluster),
+        new MessagesCacheInsertScript(redisCluster, retryExecutor),
+        new MessagesCacheInsertSharedMultiRecipientPayloadAndViewsScript(redisCluster, retryExecutor),
         new MessagesCacheGetItemsScript(redisCluster),
-        new MessagesCacheRemoveByGuidScript(redisCluster),
+        new MessagesCacheReleaseNodeClaimScript(redisCluster),
+        new MessagesCacheRemoveByGuidScript(redisCluster, retryExecutor),
         new MessagesCacheRemoveQueueScript(redisCluster),
-        new MessagesCacheGetQueuesToPersistScript(redisCluster),
         new MessagesCacheRemoveRecipientViewFromMrmDataScript(redisCluster),
         new MessagesCacheUnlockQueueScript(redisCluster)
     );
@@ -192,9 +199,10 @@ public class MessagesCache {
                 final ExecutorService messageDeletionExecutorService, final Clock clock,
                 final MessagesCacheInsertScript insertScript,
                 final MessagesCacheInsertSharedMultiRecipientPayloadAndViewsScript insertMrmScript,
-                final MessagesCacheGetItemsScript getItemsScript, final MessagesCacheRemoveByGuidScript removeByGuidScript,
+                final MessagesCacheGetItemsScript getItemsScript,
+                final MessagesCacheReleaseNodeClaimScript releaseNodeClaimScript,
+                final MessagesCacheRemoveByGuidScript removeByGuidScript,
                 final MessagesCacheRemoveQueueScript removeQueueScript,
-                final MessagesCacheGetQueuesToPersistScript getQueuesToPersistScript,
                 final MessagesCacheRemoveRecipientViewFromMrmDataScript removeRecipientViewFromMrmDataScript,
                 final MessagesCacheUnlockQueueScript unlockQueueScript) throws IOException {
 
@@ -209,8 +217,8 @@ public class MessagesCache {
     this.insertMrmScript = insertMrmScript;
     this.removeByGuidScript = removeByGuidScript;
     this.getItemsScript = getItemsScript;
+    this.releaseNodeClaimScript = releaseNodeClaimScript;
     this.removeQueueScript = removeQueueScript;
-    this.getQueuesToPersistScript = getQueuesToPersistScript;
     this.removeRecipientViewFromMrmDataScript = removeRecipientViewFromMrmDataScript;
     this.unlockQueueScript = unlockQueueScript;
   }
@@ -220,23 +228,26 @@ public class MessagesCache {
       final byte destinationDeviceId,
       final MessageProtos.Envelope message) {
 
-    final MessageProtos.Envelope messageWithGuid = message.toBuilder().setServerGuid(messageGuid.toString()).build();
+    final MessageProtos.Envelope messageWithGuid = message.toBuilder().setServerGuid(UUIDUtil.toByteString(messageGuid)).build();
     final Timer.Sample sample = Timer.start();
 
     return insertScript.executeAsync(destinationAccountIdentifier, destinationDeviceId, messageWithGuid)
-        .whenComplete((ignored, throwable) -> sample.stop(insertTimer));
+        .toCompletableFuture()
+        .whenComplete((_, _) -> sample.stop(insertTimer));
   }
 
   public CompletableFuture<byte[]> insertSharedMultiRecipientMessagePayload(
-      final SealedSenderMultiRecipientMessage sealedSenderMultiRecipientMessage) {
+      final SealedSenderMultiRecipientMessage sealedSenderMultiRecipientMessage,
+      final Set<SealedSenderMultiRecipientMessage.Recipient> resolvedRecipients) {
 
     final Timer.Sample sample = Timer.start();
 
     final byte[] sharedMrmKey = getSharedMrmKey(UUID.randomUUID());
 
-    return insertMrmScript.executeAsync(sharedMrmKey, sealedSenderMultiRecipientMessage)
-        .thenApply(ignored -> sharedMrmKey)
-        .whenComplete((ignored, throwable) -> sample.stop(insertSharedMrmPayloadTimer));
+    return insertMrmScript.executeAsync(sharedMrmKey, sealedSenderMultiRecipientMessage, resolvedRecipients)
+        .thenApply(_ -> sharedMrmKey)
+        .toCompletableFuture()
+        .whenComplete((_, _) -> sample.stop(insertSharedMrmPayloadTimer));
   }
 
   public CompletableFuture<Optional<RemovedMessage>> remove(final UUID destinationUuid, final byte destinationDevice,
@@ -263,7 +274,7 @@ public class MessagesCache {
               removedMessages.add(RemovedMessage.fromEnvelope(envelope));
               if (envelope.hasSharedMrmKey()) {
                 serviceIdentifierToMrmKeys.computeIfAbsent(
-                        ServiceIdentifier.valueOf(envelope.getDestinationServiceId()), ignored -> new ArrayList<>())
+                        ServiceIdentifier.fromByteString(envelope.getDestinationServiceId()), _ -> new ArrayList<>())
                     .add(envelope.getSharedMrmKey().toByteArray());
               }
             } catch (final InvalidProtocolBufferException e) {
@@ -275,7 +286,9 @@ public class MessagesCache {
               (serviceId, keysToUpdate) -> removeRecipientViewFromMrmData(keysToUpdate, serviceId, destinationDevice));
 
           return removedMessages;
-        }, messageDeletionExecutorService).whenComplete((removedMessages, throwable) -> {
+        }, messageDeletionExecutorService)
+        .toCompletableFuture()
+        .whenComplete((removedMessages, _) -> {
           if (removedMessages != null) {
             removeMessageCounter.increment(removedMessages.size());
           }
@@ -292,13 +305,30 @@ public class MessagesCache {
         .toCompletableFuture();
   }
 
-  public Publisher<MessageProtos.Envelope> get(final UUID destinationUuid, final byte destinationDevice) {
+  public Publisher<MessageProtos.Envelope> get(final UUID destinationUuid, final byte destinationDeviceId) {
+    return get(destinationUuid,
+        destinationDeviceId,
+        clock.instant().minus(MAX_EPHEMERAL_MESSAGE_DELAY),
+        false);
+  }
 
-    final long earliestAllowableEphemeralTimestamp =
-        clock.millis() - MAX_EPHEMERAL_MESSAGE_DELAY.toMillis();
+  Publisher<MessageProtos.Envelope> getMessagesToPersist(final UUID accountUuid, final byte destinationDeviceId) {
+    return Flux.from(get(accountUuid,
+        destinationDeviceId,
+        // Discard all ephemeral messages when persisting
+        Instant.ofEpochMilli(Long.MAX_VALUE),
+        true));
+  }
 
-    final Flux<MessageProtos.Envelope> allMessages = getAllMessages(destinationUuid, destinationDevice,
-        earliestAllowableEphemeralTimestamp, PAGE_SIZE)
+  private Publisher<MessageProtos.Envelope> get(final UUID destinationUuid,
+      final byte destinationDeviceId,
+      final Instant earliestAllowableEphemeralTimestamp,
+      final boolean bypassLock) {
+
+    final long earliestAllowableEphemeralTimestampMillis = earliestAllowableEphemeralTimestamp.toEpochMilli();
+
+    final Flux<MessageProtos.Envelope> allMessages = getAllMessages(destinationUuid, destinationDeviceId,
+        earliestAllowableEphemeralTimestampMillis, PAGE_SIZE, bypassLock)
         .publish()
         // We expect exactly three subscribers to this base flux:
         // 1. the websocket that delivers messages to clients
@@ -310,25 +340,41 @@ public class MessagesCache {
 
     final Flux<MessageProtos.Envelope> messagesToPublish = allMessages
         .filter(Predicate.not(envelope ->
-            isStaleEphemeralMessage(envelope, earliestAllowableEphemeralTimestamp) || isStaleMrmMessage(envelope)));
+            isStaleEphemeralMessage(envelope, earliestAllowableEphemeralTimestampMillis) || isStaleMrmMessage(envelope)));
 
     final Flux<MessageProtos.Envelope> staleEphemeralMessages = allMessages
-        .filter(envelope -> isStaleEphemeralMessage(envelope, earliestAllowableEphemeralTimestamp));
-    discardStaleMessages(destinationUuid, destinationDevice, staleEphemeralMessages, staleEphemeralMessagesCounter, "ephemeral");
+        .filter(envelope -> isStaleEphemeralMessage(envelope, earliestAllowableEphemeralTimestampMillis));
+    discardStaleMessages(destinationUuid, destinationDeviceId, staleEphemeralMessages, staleEphemeralMessagesCounter, "ephemeral");
 
     final Flux<MessageProtos.Envelope> staleMrmMessages = allMessages.filter(MessagesCache::isStaleMrmMessage)
         // clearing the sharedMrmKey prevents unnecessary calls to update the shared MRM data
         .map(envelope -> envelope.toBuilder().clearSharedMrmKey().build());
-    discardStaleMessages(destinationUuid, destinationDevice, staleMrmMessages, staleMrmMessagesCounter, "mrm");
+    discardStaleMessages(destinationUuid, destinationDeviceId, staleMrmMessages, staleMrmMessagesCounter, "mrm");
 
     return messagesToPublish.name(GET_FLUX_NAME)
         .tap(Micrometer.metrics(Metrics.globalRegistry));
   }
 
-  public Mono<Long> getEarliestUndeliveredTimestamp(final UUID destinationUuid, final byte destinationDevice) {
-    return getAllMessages(destinationUuid, destinationDevice, -1, 1)
+  /// Returns the server-issued timestamp of the earliest message in the queue for the given account/device, regardless
+  /// of the type of message. Note that this method may return a timestamp for a message that would ultimately be
+  /// discarded were a caller to actually fetch messages (i.e. an expired ephemeral message).
+  ///
+  /// @param destinationUuid the account identifier for the queue for which to get a timestamp
+  /// @param destinationDeviceId the device identifier for the queue for which to get a timestamp
+  ///
+  /// @return a `Mono` that publishes the timestamp (in milliseconds since the epoch) of the earliest message in the
+  /// given queue or yields no value if the queue is empty or does not exist
+  public Mono<Long> getEarliestUndeliveredTimestamp(final UUID destinationUuid, final byte destinationDeviceId) {
+    return redisCluster.withBinaryCluster(connection ->
+            connection.reactive().zrange(getMessageQueueKey(destinationUuid, destinationDeviceId), 0, 0))
         .next()
-        .map(MessageProtos.Envelope::getServerTimestamp);
+        .flatMap(serializedEnvelope -> {
+          try {
+            return Mono.just(parseEnvelope(serializedEnvelope).getServerTimestamp());
+          } catch (final InvalidProtocolBufferException e) {
+            return Mono.error(e);
+          }
+        });
   }
 
   private static boolean isStaleEphemeralMessage(final MessageProtos.Envelope message,
@@ -348,7 +394,7 @@ public class MessagesCache {
   private void discardStaleMessages(final UUID destinationUuid, final byte destinationDevice,
       Flux<MessageProtos.Envelope> staleMessages, final Counter counter, final String context) {
     staleMessages
-        .map(e -> UUID.fromString(e.getServerGuid()))
+        .map(e -> UUIDUtil.fromByteString(e.getServerGuid()))
         .buffer(PAGE_SIZE)
         .subscribeOn(messageDeletionScheduler)
         .subscribe(messageGuids ->
@@ -358,18 +404,21 @@ public class MessagesCache {
   }
 
   @VisibleForTesting
-  Flux<MessageProtos.Envelope> getAllMessages(final UUID destinationUuid, final byte destinationDevice,
-      final long earliestAllowableEphemeralTimestamp, final int pageSize) {
+  Flux<MessageProtos.Envelope> getAllMessages(final UUID destinationUuid,
+      final byte destinationDevice,
+      final long earliestAllowableEphemeralTimestamp,
+      final int pageSize,
+      final boolean bypassLock) {
 
     // fetch messages by page
-    return getNextMessagePage(destinationUuid, destinationDevice, -1, pageSize)
+    return getNextMessagePage(destinationUuid, destinationDevice, -1, pageSize, bypassLock)
         .expand(queueItemsAndLastMessageId -> {
           // expand() is breadth-first, so each page will be published in order
           if (queueItemsAndLastMessageId.first().isEmpty()) {
             return Mono.empty();
           }
 
-          return getNextMessagePage(destinationUuid, destinationDevice, queueItemsAndLastMessageId.second(), pageSize);
+          return getNextMessagePage(destinationUuid, destinationDevice, queueItemsAndLastMessageId.second(), pageSize, bypassLock);
         })
         .limitRate(1)
         // we want to ensure we don’t accidentally block the Lettuce/netty i/o executors
@@ -426,12 +475,13 @@ public class MessagesCache {
     final byte[] key = mrmMessage.getSharedMrmKey().toByteArray();
     final byte[] sharedMrmViewKey = MessagesCache.getSharedMrmViewKey(
         // the message might be addressed to the account's PNI, so use the service ID from the envelope
-        ServiceIdentifier.valueOf(mrmMessage.getDestinationServiceId()), destinationDevice);
+        ServiceIdentifier.fromByteString(mrmMessage.getDestinationServiceId()), destinationDevice);
 
-    return Mono.from(redisCluster.withBinaryClusterReactive(
+    return Mono.from(redisCluster.withBinaryCluster(
             conn -> conn.reactive().hmget(key, "data".getBytes(StandardCharsets.UTF_8), sharedMrmViewKey)
                 .collectList()
                 .publishOn(messageDeliveryScheduler)))
+        .transformDeferred(RetryOperator.of(ResilienceUtil.getGeneralRedisRetry(RETRY_NAME)))
         .<MessageProtos.Envelope>handle((mrmDataAndView, sink) -> {
           try {
             assert mrmDataAndView.size() == 2;
@@ -513,11 +563,13 @@ public class MessagesCache {
         .subscribe();
   }
 
-  private Mono<Pair<List<byte[]>, Long>> getNextMessagePage(final UUID destinationUuid, final byte destinationDevice,
-      long messageId, int pageSize) {
+  private Mono<Pair<List<byte[]>, Long>> getNextMessagePage(final UUID destinationUuid,
+      final byte destinationDevice,
+      final long messageId,
+      final int pageSize,
+      final boolean bypassLock) {
 
-    return getItemsScript.execute(destinationUuid, destinationDevice, pageSize, messageId)
-        .retryWhen(RetrySpec.backoff(4, Duration.ofSeconds(1)).maxBackoff(Duration.ofSeconds(4)))
+    return getItemsScript.execute(destinationUuid, destinationDevice, pageSize, messageId, bypassLock)
         .map(queueItems -> {
           logger.trace("Processing page: {}", messageId);
 
@@ -568,35 +620,6 @@ public class MessagesCache {
         .toFuture();
   }
 
-  List<MessageProtos.Envelope> getMessagesToPersist(final UUID accountUuid, final byte destinationDevice,
-      final int limit) {
-
-    final Timer.Sample sample = Timer.start();
-
-    final List<byte[]> messages = redisCluster.withBinaryCluster(connection ->
-        connection.sync().zrange(getMessageQueueKey(accountUuid, destinationDevice), 0, limit));
-
-    final Flux<MessageProtos.Envelope> allMessages = parseAndFetchMrms(Flux.fromIterable(messages), destinationDevice);
-
-    final Flux<MessageProtos.Envelope> messagesToPersist = allMessages
-        .filter(Predicate.not(envelope ->
-            envelope.getEphemeral() || isStaleMrmMessage(envelope)));
-
-    final Flux<MessageProtos.Envelope> ephemeralMessages = allMessages
-        .filter(MessageProtos.Envelope::getEphemeral);
-    discardStaleMessages(accountUuid, destinationDevice, ephemeralMessages, staleEphemeralMessagesCounter, "ephemeral");
-
-    final Flux<MessageProtos.Envelope> staleMrmMessages = allMessages.filter(MessagesCache::isStaleMrmMessage)
-        // clearing the sharedMrmKey prevents unnecessary calls to update the shared MRM data
-        .map(envelope -> envelope.toBuilder().clearSharedMrmKey().build());
-    discardStaleMessages(accountUuid, destinationDevice, staleMrmMessages, staleMrmMessagesCounter, "mrm");
-
-    return messagesToPersist
-        .collectList()
-        .doOnTerminate(() -> sample.stop(getMessagesTimer))
-        .block(Duration.ofSeconds(5));
-  }
-
   private Flux<MessageProtos.Envelope> parseAndFetchMrms(final Flux<byte[]> serializedMessages, final byte destinationDevice) {
     return serializedMessages
         .mapNotNull(message -> {
@@ -643,11 +666,11 @@ public class MessagesCache {
             try {
               final MessageProtos.Envelope message = parseEnvelope(serialized);
 
-              processedMessages.add(message.getServerGuid());
+              processedMessages.add(UUIDUtil.fromByteString(message.getServerGuid()).toString());
 
               if (message.hasSharedMrmKey()) {
-                serviceIdentifierToMrmKeys.computeIfAbsent(ServiceIdentifier.valueOf(message.getDestinationServiceId()),
-                        ignored -> new ArrayList<>())
+                serviceIdentifierToMrmKeys.computeIfAbsent(ServiceIdentifier.fromByteString(message.getDestinationServiceId()),
+                        _ -> new ArrayList<>())
                     .add(message.getSharedMrmKey().toByteArray());
               }
             } catch (final InvalidProtocolBufferException e) {
@@ -665,37 +688,47 @@ public class MessagesCache {
         .thenRun(() -> sample.stop(clearQueueTimer));
   }
 
-  public String shardForSlot(int slot) {
-    try {
-      return redisCluster.withBinaryCluster(
-          connection -> connection.getPartitions().getPartitionBySlot(slot).getUri().getHost());
-    } catch (Throwable ignored) {
-      return "unknown";
-    }
+  Optional<RedisClusterNode> claimNextNodeToPersist(final String persisterId, final Duration ttl) {
+    final List<RedisClusterNode> primaryNodes =  redisCluster.withCluster(connection -> connection.getPartitions().stream()
+        .filter(node -> node.is(RedisClusterNode.NodeFlag.UPSTREAM))
+        .collect(Collectors.toCollection(ArrayList::new)));
+
+    Collections.rotate(primaryNodes, Math.abs(nextNodeRotateDistance++) % primaryNodes.size());
+
+    return primaryNodes.stream()
+        .filter(node -> claimNode(node, persisterId, ttl))
+        .findFirst();
   }
 
-  int getNextSlotToPersist() {
-    return (int) (redisCluster.withCluster(connection -> connection.sync().incr(NEXT_SLOT_TO_PERSIST_KEY))
-        % SlotHash.SLOT_COUNT);
+  @VisibleForTesting
+  boolean claimNode(final RedisClusterNode node, final String persisterId, final Duration claimTtl) {
+    return redisCluster.withCluster(connection ->
+        "OK".equals(connection.sync().set(getPersisterNodeClaimKey(node), persisterId, SetArgs.Builder.nx().ex(claimTtl))));
   }
 
-  List<String> getQueuesToPersist(final int slot, final Instant maxTime, final int limit) {
-    return getQueuesToPersistTimer.record(() -> getQueuesToPersistScript.execute(slot, maxTime, limit));
+  void releaseNodeClaim(final RedisClusterNode node, final String persisterId) {
+    releaseNodeClaimScript.execute(node, persisterId);
   }
 
-  void addQueueToPersist(final UUID accountUuid, final byte deviceId) {
-    redisCluster.useBinaryCluster(connection -> connection.sync()
-        .zadd(getQueueIndexKey(accountUuid, deviceId), ZAddArgs.Builder.nx(), System.currentTimeMillis(),
-            getMessageQueueKey(accountUuid, deviceId)));
+  @VisibleForTesting
+  static String getPersisterNodeClaimKey(final RedisClusterNode node) {
+    return "persister_node_claim::" + node.getNodeId();
   }
 
-  void lockQueueForPersistence(final UUID accountUuid, final byte deviceId) {
-    redisCluster.useBinaryCluster(
-        connection -> connection.sync().setex(getPersistInProgressKey(accountUuid, deviceId), 30, LOCK_VALUE));
+  Flux<String> getQueues(final RedisClusterNode node, final int scanCount) {
+    return redisCluster.withCluster(connection ->
+        ScanStream.scan(connection.getConnection(node.getNodeId()).reactive(),
+            ScanArgs.Builder.matches("user_queue::*").limit(scanCount)));
   }
 
-  void unlockQueueForPersistence(final UUID accountUuid, final byte deviceId) {
-    unlockQueueScript.execute(accountUuid, deviceId);
+  Mono<Void> lockQueueForPersistence(final UUID accountUuid, final byte deviceId) {
+    return redisCluster.withBinaryCluster(
+        connection -> connection.reactive().setex(getPersistInProgressKey(accountUuid, deviceId), 30, LOCK_VALUE))
+        .then();
+  }
+
+  Mono<Void> unlockQueueForPersistence(final UUID accountUuid, final byte deviceId) {
+    return unlockQueueScript.execute(accountUuid, deviceId);
   }
 
   static byte[] getMessageQueueKey(final UUID accountUuid, final byte deviceId) {
@@ -704,14 +737,6 @@ public class MessagesCache {
 
   static byte[] getMessageQueueMetadataKey(final UUID accountUuid, final byte deviceId) {
     return ("user_queue_metadata::{" + accountUuid.toString() + "::" + deviceId + "}").getBytes(StandardCharsets.UTF_8);
-  }
-
-  static byte[] getQueueIndexKey(final UUID accountUuid, final byte deviceId) {
-    return getQueueIndexKey(SlotHash.getSlot(accountUuid.toString() + "::" + deviceId));
-  }
-
-  static byte[] getQueueIndexKey(final int slot) {
-    return ("user_queue_index::{" + RedisClusterUtil.getMinimalHashTag(slot) + "}").getBytes(StandardCharsets.UTF_8);
   }
 
   static byte[] getSharedMrmKey(final UUID mrmGuid) {
@@ -750,9 +775,9 @@ public class MessagesCache {
     return Byte.parseByte(queueName.substring(queueName.lastIndexOf("::") + 2, queueName.lastIndexOf('}')));
   }
 
-  private static MessageProtos.Envelope parseEnvelope(final byte[] envelopeBytes)
+  private MessageProtos.Envelope parseEnvelope(final byte[] envelopeBytes)
       throws InvalidProtocolBufferException {
 
-    return EnvelopeUtil.expand(MessageProtos.Envelope.parseFrom(envelopeBytes));
+    return MessageProtos.Envelope.parseFrom(envelopeBytes);
   }
 }

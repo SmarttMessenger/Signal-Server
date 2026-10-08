@@ -31,7 +31,10 @@ import jakarta.ws.rs.core.Context;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import java.io.IOException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.whispersystems.textsecuregcm.auth.AuthenticatedDevice;
+import org.whispersystems.textsecuregcm.captcha.InvalidCaptchaArgumentException;
 import org.whispersystems.textsecuregcm.entities.AnswerCaptchaChallengeRequest;
 import org.whispersystems.textsecuregcm.entities.AnswerChallengeRequest;
 import org.whispersystems.textsecuregcm.entities.AnswerPushChallengeRequest;
@@ -51,6 +54,8 @@ public class ChallengeController {
   private final AccountsManager accountsManager;
   private final RateLimitChallengeManager rateLimitChallengeManager;
   private final ChallengeConstraintChecker challengeConstraintChecker;
+
+  private static final Logger logger = LoggerFactory.getLogger(ChallengeController.class);
 
   private static final String CHALLENGE_RESPONSE_COUNTER_NAME = name(ChallengeController.class, "challengeResponse");
   private static final String CHALLENGE_TYPE_TAG = "type";
@@ -78,21 +83,22 @@ public class ChallengeController {
           AnswerCaptchaChallengeRequest.class}))})
   )
   @ApiResponse(responseCode = "200", description = "Indicates the challenge proof was accepted")
-  @ApiResponse(responseCode = "428", description = "Submitted captcha token is invalid")
+  @ApiResponse(responseCode = "400", description = "The request was invalid")
+  @ApiResponse(responseCode = "428", description = "Submitted captcha token was not accepted")
   @ApiResponse(responseCode = "429", description = "Too many attempts", headers = @Header(
       name = "Retry-After",
       description = "If present, an positive integer indicating the number of seconds before a subsequent attempt could succeed"))
   public Response handleChallengeResponse(@Auth final AuthenticatedDevice auth,
       @Valid final AnswerChallengeRequest answerRequest,
-      @Context ContainerRequestContext requestContext,
-      @HeaderParam(HttpHeaders.USER_AGENT) final String userAgent) throws RateLimitExceededException, IOException {
+      @Context final ContainerRequestContext requestContext,
+      @HeaderParam(HttpHeaders.USER_AGENT) final String userAgent) throws RateLimitExceededException {
 
     final Account account = accountsManager.getByAccountIdentifier(auth.accountIdentifier())
         .orElseThrow(() -> new WebApplicationException(Response.Status.UNAUTHORIZED));
 
     Tags tags = Tags.of(UserAgentTagUtil.getPlatformTag(userAgent));
 
-    final ChallengeConstraints constraints = challengeConstraintChecker.challengeConstraints(
+    final ChallengeConstraints constraints = challengeConstraintChecker.challengeConstraintsHttp(
         requestContext, account);
     try {
       if (answerRequest instanceof final AnswerPushChallengeRequest pushChallengeRequest) {
@@ -102,12 +108,12 @@ public class ChallengeController {
           return Response.status(429).build();
         }
         rateLimitChallengeManager.answerPushChallenge(account, pushChallengeRequest.getChallenge());
-      } else if (answerRequest instanceof AnswerCaptchaChallengeRequest captchaChallengeRequest) {
+      } else if (answerRequest instanceof final AnswerCaptchaChallengeRequest captchaChallengeRequest) {
         tags = tags.and(CHALLENGE_TYPE_TAG, "captcha");
 
         final String remoteAddress = (String) requestContext.getProperty(
             RemoteAddressFilter.REMOTE_ADDRESS_ATTRIBUTE_NAME);
-        boolean success = rateLimitChallengeManager.answerCaptchaChallenge(
+        final boolean success = rateLimitChallengeManager.answerCaptchaChallenge(
             account,
             captchaChallengeRequest.getCaptcha(),
             remoteAddress,
@@ -121,6 +127,11 @@ public class ChallengeController {
       } else {
         tags = tags.and(CHALLENGE_TYPE_TAG, "unrecognized");
       }
+    } catch (final InvalidCaptchaArgumentException e) {
+      return Response.status(Response.Status.BAD_REQUEST.getStatusCode(), e.getMessage()).build();
+    } catch (final IOException e) {
+      logger.error("error assessing captcha during challenge response handling", e);
+      return Response.status(Response.Status.SERVICE_UNAVAILABLE).build();
     } finally {
       Metrics.counter(CHALLENGE_RESPONSE_COUNTER_NAME, tags).increment();
     }
@@ -177,7 +188,7 @@ public class ChallengeController {
     final Account account = accountsManager.getByAccountIdentifier(auth.accountIdentifier())
         .orElseThrow(() -> new WebApplicationException(Response.Status.UNAUTHORIZED));
 
-    final ChallengeConstraints constraints = challengeConstraintChecker.challengeConstraints(requestContext, account);
+    final ChallengeConstraints constraints = challengeConstraintChecker.challengeConstraintsHttp(requestContext, account);
     if (!constraints.pushPermitted()) {
       return Response.status(429).build();
     }

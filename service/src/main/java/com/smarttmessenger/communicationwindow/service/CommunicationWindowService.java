@@ -12,7 +12,6 @@ import com.smarttmessenger.communicationwindow.storage.CommunicationWindowsTable
 import com.smarttmessenger.communicationwindow.storage.HeldMessagesTable;
 import org.whispersystems.textsecuregcm.entities.IncomingMessageList;
 import org.whispersystems.textsecuregcm.identity.AciServiceIdentifier;
-import org.whispersystems.textsecuregcm.identity.IdentityType;
 import org.whispersystems.textsecuregcm.identity.ServiceIdentifier;
 import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.storage.AccountsManager;
@@ -78,7 +77,7 @@ public class CommunicationWindowService {
     Account recipient = accountsManager.getByServiceIdentifier(destinationIdentifier).orElse(null);
     if (recipient == null) return Optional.empty();
 
-    String recipientUuid = recipient.getIdentifier(IdentityType.ACI).toString();
+    String recipientUuid = recipient.getAccountIdentifier().toString();
     List<CommunicationWindow> windows = loadWindows(recipientUuid);
     if (windows.isEmpty()) return Optional.empty();
 
@@ -116,7 +115,7 @@ public class CommunicationWindowService {
     Account recipient = accountsManager.getByServiceIdentifier(destinationIdentifier).orElse(null);
     if (recipient == null) return new SealedSenderOutcome(SealedSenderAction.DELIVER, Optional.empty());
 
-    String recipientUuid = recipient.getIdentifier(IdentityType.ACI).toString();
+    String recipientUuid = recipient.getAccountIdentifier().toString();
     List<CommunicationWindow> windows = loadWindows(recipientUuid);
     if (windows.isEmpty()) return new SealedSenderOutcome(SealedSenderAction.DELIVER, Optional.empty());
 
@@ -155,7 +154,7 @@ public class CommunicationWindowService {
     Account recipient = accountsManager.getByServiceIdentifier(destinationIdentifier).orElse(null);
     if (recipient == null) return Optional.empty();
 
-    String recipientUuid = recipient.getIdentifier(IdentityType.ACI).toString();
+    String recipientUuid = recipient.getAccountIdentifier().toString();
     // Must use the same view as checkAndHold, or the banner could contradict the hold decision.
     List<CommunicationWindow> windows = loadWindows(recipientUuid);
 
@@ -285,7 +284,7 @@ public class CommunicationWindowService {
   @VisibleForTesting
   ZoneId deriveTimezone(Account account) {
     try {
-      Phonenumber.PhoneNumber phoneNumber = PhoneNumberUtil.getInstance().parse(account.getNumber(), null);
+      Phonenumber.PhoneNumber phoneNumber = PhoneNumberUtil.getInstance().parse(account.getNumber().orElseThrow(), null);
       List<String> zones = PhoneNumberToTimeZonesMapper.getInstance().getTimeZonesForNumber(phoneNumber);
 
       if (zones.equals(List.of(PhoneNumberToTimeZonesMapper.getUnknownTimeZone()))) {

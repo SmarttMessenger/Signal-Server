@@ -11,36 +11,38 @@ import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyByte;
 import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.ArgumentMatchers.isNotNull;
 import static org.mockito.Mockito.atLeastOnce;
-import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.whispersystems.textsecuregcm.util.MockUtils.exactly;
 
 import com.google.protobuf.ByteString;
+import io.lettuce.core.RedisException;
 import io.lettuce.core.cluster.SlotHash;
-import java.nio.charset.StandardCharsets;
-import java.time.Clock;
+import io.lettuce.core.cluster.models.partitions.RedisClusterNode;
+import io.micrometer.core.instrument.Tags;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.stream.Stream;
 import org.apache.commons.lang3.RandomStringUtils;
 import org.junit.jupiter.api.AfterEach;
@@ -53,12 +55,17 @@ import org.mockito.stubbing.Answer;
 import org.whispersystems.textsecuregcm.configuration.dynamic.DynamicConfiguration;
 import org.whispersystems.textsecuregcm.configuration.dynamic.DynamicMessagePersisterConfiguration;
 import org.whispersystems.textsecuregcm.entities.MessageProtos;
-import org.whispersystems.textsecuregcm.identity.IdentityType;
+import org.whispersystems.textsecuregcm.identity.AciServiceIdentifier;
 import org.whispersystems.textsecuregcm.redis.RedisClusterExtension;
 import org.whispersystems.textsecuregcm.tests.util.DevicesHelper;
+import org.whispersystems.textsecuregcm.util.TestClock;
+import org.whispersystems.textsecuregcm.util.UUIDUtil;
 import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Scheduler;
 import reactor.core.scheduler.Schedulers;
+import reactor.test.StepVerifier;
+import reactor.util.retry.Retry;
 import software.amazon.awssdk.services.dynamodb.model.ItemCollectionSizeLimitExceededException;
 
 @Timeout(value = 15, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
@@ -70,12 +77,19 @@ class MessagePersisterTest {
   private ExecutorService sharedExecutorService;
   private ScheduledExecutorService resubscribeRetryExecutorService;
   private Scheduler messageDeliveryScheduler;
+  private Scheduler persistQueueScheduler;
   private MessagesCache messagesCache;
   private MessagesDynamoDb messagesDynamoDb;
   private MessagePersister messagePersister;
   private AccountsManager accountsManager;
   private MessagesManager messagesManager;
+  private DynamicConfiguration dynamicConfiguration;
+
   private Account destinationAccount;
+
+  private Answer<Integer> persistMessagesAnswer;
+
+  private static final TestClock CLOCK = TestClock.pinned(Instant.now());
 
   private static final UUID DESTINATION_ACCOUNT_UUID = UUID.randomUUID();
   private static final String DESTINATION_ACCOUNT_NUMBER = "+18005551234";
@@ -98,30 +112,40 @@ class MessagePersisterTest {
     destinationAccount = mock(Account.class);
 
     when(accountsManager.getByAccountIdentifier(DESTINATION_ACCOUNT_UUID)).thenReturn(Optional.of(destinationAccount));
+    when(accountsManager.getByAccountIdentifierAsync(DESTINATION_ACCOUNT_UUID))
+        .thenReturn(CompletableFuture.completedFuture(Optional.of(destinationAccount)));
     when(accountsManager.removeDevice(any(), anyByte()))
-        .thenAnswer(invocation -> CompletableFuture.completedFuture(invocation.getArgument(0)));
+        .thenAnswer(invocation -> accountsManager.getByAccountIdentifier(invocation.getArgument(0)).orElseThrow());
 
-    when(destinationAccount.getUuid()).thenReturn(DESTINATION_ACCOUNT_UUID);
-    when(destinationAccount.getIdentifier(IdentityType.ACI)).thenReturn(DESTINATION_ACCOUNT_UUID);
-    when(destinationAccount.getNumber()).thenReturn(DESTINATION_ACCOUNT_NUMBER);
+    when(destinationAccount.getAccountIdentifier()).thenReturn(DESTINATION_ACCOUNT_UUID);
+    when(destinationAccount.getNumber()).thenReturn(Optional.of(DESTINATION_ACCOUNT_NUMBER));
     when(destinationAccount.getDevice(DESTINATION_DEVICE_ID)).thenReturn(Optional.of(DESTINATION_DEVICE));
 
-    final DynamicConfiguration dynamicConfiguration = mock(DynamicConfiguration.class);
+    dynamicConfiguration = mock(DynamicConfiguration.class);
     when(dynamicConfiguration.getMessagePersisterConfiguration())
-        .thenReturn(new DynamicMessagePersisterConfiguration(true, EXTRA_ROOM_RATIO));
+        .thenReturn(new DynamicMessagePersisterConfiguration(true, EXTRA_ROOM_RATIO, Duration.ofHours(1), Duration.ZERO));
     when(dynamicConfigurationManager.getConfiguration()).thenReturn(dynamicConfiguration);
 
     sharedExecutorService = Executors.newSingleThreadExecutor();
     resubscribeRetryExecutorService = Executors.newSingleThreadScheduledExecutor();
     messageDeliveryScheduler = Schedulers.newBoundedElastic(10, 10_000, "messageDelivery");
-    messagesCache = new MessagesCache(REDIS_CLUSTER_EXTENSION.getRedisCluster(),
-        messageDeliveryScheduler, sharedExecutorService, Clock.systemUTC());
-    messagePersister = new MessagePersister(messagesCache, messagesManager, accountsManager,
-        dynamicConfigurationManager, PERSIST_DELAY, 1);
+    persistQueueScheduler = Schedulers.newBoundedElastic(10, 10_000, "persistQueue");
+    messagesCache = spy(new MessagesCache(REDIS_CLUSTER_EXTENSION.getRedisCluster(),
+        messageDeliveryScheduler, sharedExecutorService, mock(ScheduledExecutorService.class), CLOCK));
+    messagePersister = new MessagePersister(messagesCache,
+        messagesManager,
+        accountsManager,
+        dynamicConfigurationManager,
+        persistQueueScheduler,
+        CLOCK,
+        PERSIST_DELAY,
+        1,
+        1024,
+        Retry.backoff(1, Duration.ZERO));
 
     when(messagesManager.clear(any(UUID.class), anyByte())).thenReturn(CompletableFuture.completedFuture(null));
 
-    when(messagesManager.persistMessages(any(UUID.class), any(), any())).thenAnswer(invocation -> {
+    persistMessagesAnswer = invocation -> {
       final UUID destinationUuid = invocation.getArgument(0);
       final Device destinationDevice = invocation.getArgument(1);
       final List<MessageProtos.Envelope> messages = invocation.getArgument(2);
@@ -129,145 +153,284 @@ class MessagePersisterTest {
       messagesDynamoDb.store(messages, destinationUuid, destinationDevice);
 
       for (final MessageProtos.Envelope message : messages) {
-        messagesCache.remove(destinationUuid, destinationDevice.getId(), UUID.fromString(message.getServerGuid())).get();
+        messagesCache.remove(destinationUuid, destinationDevice.getId(), UUIDUtil.fromByteString(message.getServerGuid())).get();
       }
 
       return messages.size();
-    });
+    };
+
+    when(messagesManager.persistMessages(any(UUID.class), any(), any())).thenAnswer(persistMessagesAnswer);
   }
 
   @AfterEach
   void tearDown() throws Exception {
     sharedExecutorService.shutdown();
+    //noinspection ResultOfMethodCallIgnored
     sharedExecutorService.awaitTermination(1, TimeUnit.SECONDS);
 
     messageDeliveryScheduler.dispose();
+    persistQueueScheduler.dispose();
+
     resubscribeRetryExecutorService.shutdown();
+    //noinspection ResultOfMethodCallIgnored
     resubscribeRetryExecutorService.awaitTermination(1, TimeUnit.SECONDS);
   }
 
   @Test
-  void testPersistNextQueuesNoQueues() {
-    messagePersister.persistNextQueues(Instant.now());
+  void persistQueue() {
+    final int messageCount = (MessagePersister.MESSAGE_BATCH_LIMIT * 3) + 7;
+
+    insertMessages(DESTINATION_ACCOUNT_UUID, DESTINATION_DEVICE_ID, messageCount,
+        CLOCK.instant().minus(PERSIST_DELAY.plusSeconds(1)));
+
+    messagePersister.persistQueue(destinationAccount, destinationAccount.getDevice(DESTINATION_DEVICE_ID).orElseThrow(), Tags.empty())
+        .block();
+
+    @SuppressWarnings("unchecked") final ArgumentCaptor<List<MessageProtos.Envelope>> messagesCaptor =
+        ArgumentCaptor.forClass(List.class);
+
+    verify(messagesDynamoDb, atLeastOnce())
+        .store(messagesCaptor.capture(), eq(DESTINATION_ACCOUNT_UUID), eq(DESTINATION_DEVICE));
+
+    assertEquals(messageCount, messagesCaptor.getAllValues().stream().mapToInt(List::size).sum());
+  }
+
+  @Test
+  void persistNextNodeNoQueues() {
+    assertEquals(0, messagePersister.persistNextNode());
 
     verify(accountsManager, never()).getByAccountIdentifier(any(UUID.class));
   }
 
   @Test
-  void testPersistNextQueuesSingleQueue() {
-    final String queueName = new String(
-        MessagesCache.getMessageQueueKey(DESTINATION_ACCOUNT_UUID, DESTINATION_DEVICE_ID), StandardCharsets.UTF_8);
+  void persistNodeSingleQueue() {
     final int messageCount = (MessagePersister.MESSAGE_BATCH_LIMIT * 3) + 7;
-    final Instant now = Instant.now();
 
-    insertMessages(DESTINATION_ACCOUNT_UUID, DESTINATION_DEVICE_ID, messageCount, now);
-    setNextSlotToPersist(SlotHash.getSlot(queueName));
+    insertMessages(DESTINATION_ACCOUNT_UUID, DESTINATION_DEVICE_ID, messageCount,
+        CLOCK.instant().minus(PERSIST_DELAY.plusSeconds(1)));
 
-    messagePersister.persistNextQueues(now.plus(messagePersister.getPersistDelay()));
+    assertEquals(1, messagePersister.persistNode(
+        getNodeWithKey(MessagesCache.getMessageQueueKey(DESTINATION_ACCOUNT_UUID, DESTINATION_DEVICE_ID))));
 
-    final ArgumentCaptor<List<MessageProtos.Envelope>> messagesCaptor = ArgumentCaptor.forClass(List.class);
+    @SuppressWarnings("unchecked") final ArgumentCaptor<List<MessageProtos.Envelope>> messagesCaptor =
+        ArgumentCaptor.forClass(List.class);
 
-    verify(messagesDynamoDb, atLeastOnce()).store(messagesCaptor.capture(), eq(DESTINATION_ACCOUNT_UUID),
-        eq(DESTINATION_DEVICE));
+    verify(messagesDynamoDb, atLeastOnce())
+        .store(messagesCaptor.capture(), eq(DESTINATION_ACCOUNT_UUID), eq(DESTINATION_DEVICE));
+
     assertEquals(messageCount, messagesCaptor.getAllValues().stream().mapToInt(List::size).sum());
   }
 
   @Test
-  void testPersistNextQueuesSingleQueueTooSoon() {
-    final String queueName = new String(
-        MessagesCache.getMessageQueueKey(DESTINATION_ACCOUNT_UUID, DESTINATION_DEVICE_ID), StandardCharsets.UTF_8);
+  void persistNodeSingleQueueTooSoon() {
     final int messageCount = (MessagePersister.MESSAGE_BATCH_LIMIT * 3) + 7;
-    final Instant now = Instant.now();
 
-    insertMessages(DESTINATION_ACCOUNT_UUID, DESTINATION_DEVICE_ID, messageCount, now);
-    setNextSlotToPersist(SlotHash.getSlot(queueName));
+    insertMessages(DESTINATION_ACCOUNT_UUID, DESTINATION_DEVICE_ID, messageCount, CLOCK.instant());
 
-    messagePersister.persistNextQueues(now);
+    assertEquals(0, messagePersister.persistNode(
+        getNodeWithKey(MessagesCache.getMessageQueueKey(DESTINATION_ACCOUNT_UUID, DESTINATION_DEVICE_ID))));
 
     verify(messagesDynamoDb, never()).store(any(), any(), any());
   }
 
   @Test
   void testPersistNextQueuesMultiplePages() {
-    final int slot = 7;
     final int queueCount = (MessagePersister.QUEUE_BATCH_LIMIT * 3) + 7;
     final int messagesPerQueue = 10;
-    final Instant now = Instant.now();
 
     for (int i = 0; i < queueCount; i++) {
-      final String queueName = generateRandomQueueNameForSlot(slot);
-      final UUID accountUuid = MessagesCache.getAccountUuidFromQueueName(queueName);
-      final byte deviceId = MessagesCache.getDeviceIdFromQueueName(queueName);
-      final String accountNumber = "+1" + RandomStringUtils.randomNumeric(10);
+      final UUID accountUuid = UUID.randomUUID();
+      final byte deviceId = Device.PRIMARY_ID;
 
       final Account account = mock(Account.class);
 
-      when(accountsManager.getByAccountIdentifier(accountUuid)).thenReturn(Optional.of(account));
-      when(account.getUuid()).thenReturn(accountUuid);
-      when(account.getNumber()).thenReturn(accountNumber);
+      when(accountsManager.getByAccountIdentifierAsync(accountUuid))
+          .thenReturn(CompletableFuture.completedFuture(Optional.of(account)));
+
+      when(account.getAccountIdentifier()).thenReturn(accountUuid);
+      when(account.getAccountIdentifier()).thenReturn(accountUuid);
       when(account.getDevice(anyByte())).thenAnswer(invocation -> Optional.of(DevicesHelper.createDevice(invocation.getArgument(0))));
 
-      insertMessages(accountUuid, deviceId, messagesPerQueue, now);
+      insertMessages(accountUuid, deviceId, messagesPerQueue, CLOCK.instant().minus(PERSIST_DELAY.plusSeconds(1)));
     }
 
-    setNextSlotToPersist(slot);
+    final Set<RedisClusterNode> persistedNodes = new HashSet<>();
+    boolean addedNode;
+    int queuesPersisted = 0;
 
-    messagePersister.persistNextQueues(now.plus(messagePersister.getPersistDelay()));
+    do {
+      final RedisClusterNode node =
+          messagesCache.claimNextNodeToPersist(messagePersister.getPersisterId(), Duration.ofHours(1)).orElseThrow();
 
-    final ArgumentCaptor<List<MessageProtos.Envelope>> messagesCaptor = ArgumentCaptor.forClass(List.class);
+      queuesPersisted += messagePersister.persistNode(node);
+
+      messagesCache.releaseNodeClaim(node, messagePersister.getPersisterId());
+      addedNode = persistedNodes.add(node);
+    } while (addedNode);
+
+    assertEquals(queueCount, queuesPersisted);
+
+    @SuppressWarnings("unchecked") final ArgumentCaptor<List<MessageProtos.Envelope>> messagesCaptor =
+        ArgumentCaptor.forClass(List.class);
 
     verify(messagesDynamoDb, atLeastOnce()).store(messagesCaptor.capture(), any(UUID.class), any());
     assertEquals(queueCount * messagesPerQueue, messagesCaptor.getAllValues().stream().mapToInt(List::size).sum());
   }
 
   @Test
-  void testPersistQueueRetry() {
-    final String queueName = new String(
-        MessagesCache.getMessageQueueKey(DESTINATION_ACCOUNT_UUID, DESTINATION_DEVICE_ID), StandardCharsets.UTF_8);
+  void testPersistNodePersistenceDisabled() {
     final int messageCount = (MessagePersister.MESSAGE_BATCH_LIMIT * 3) + 7;
-    final Instant now = Instant.now();
 
-    insertMessages(DESTINATION_ACCOUNT_UUID, DESTINATION_DEVICE_ID, messageCount, now);
-    setNextSlotToPersist(SlotHash.getSlot(queueName));
+    insertMessages(DESTINATION_ACCOUNT_UUID, DESTINATION_DEVICE_ID, messageCount,
+        CLOCK.instant().minus(PERSIST_DELAY.plusSeconds(1)));
 
-    doAnswer((Answer<Void>) invocation -> {
-      throw new RuntimeException("OH NO.");
-        }).when(messagesDynamoDb).store(any(), eq(DESTINATION_ACCOUNT_UUID), eq(DESTINATION_DEVICE));
+    when(dynamicConfiguration.getMessagePersisterConfiguration())
+        .thenReturn(new DynamicMessagePersisterConfiguration(false, EXTRA_ROOM_RATIO, Duration.ofHours(1), Duration.ZERO));
 
-    messagePersister.persistNextQueues(now.plus(messagePersister.getPersistDelay()));
+    assertEquals(0, messagePersister.persistNode(
+        getNodeWithKey(MessagesCache.getMessageQueueKey(DESTINATION_ACCOUNT_UUID, DESTINATION_DEVICE_ID))));
 
-    assertEquals(List.of(queueName),
-        messagesCache.getQueuesToPersist(SlotHash.getSlot(queueName),
-            Instant.now().plus(messagePersister.getPersistDelay()), 1));
+    verify(messagesDynamoDb, never()).store(any(), any(), any());
   }
 
   @Test
-  void testPersistQueueRetryLoop() {
-    final String queueName = new String(
-        MessagesCache.getMessageQueueKey(DESTINATION_ACCOUNT_UUID, DESTINATION_DEVICE_ID), StandardCharsets.UTF_8);
+  void testPersistNodeShouldPersistException() {
     final int messageCount = (MessagePersister.MESSAGE_BATCH_LIMIT * 3) + 7;
-    final Instant now = Instant.now();
 
-    insertMessages(DESTINATION_ACCOUNT_UUID, DESTINATION_DEVICE_ID, messageCount, now);
-    setNextSlotToPersist(SlotHash.getSlot(queueName));
+    insertMessages(DESTINATION_ACCOUNT_UUID, DESTINATION_DEVICE_ID, messageCount,
+        CLOCK.instant().minus(PERSIST_DELAY.plusSeconds(1)));
 
-    // returning `0` indicates something not working correctly
-    when(messagesManager.persistMessages(any(UUID.class), any(), anyList())).thenReturn(0);
+    doReturn(Mono.error(new RedisException("Badness 10,000")))
+        .when(messagesCache).getEarliestUndeliveredTimestamp(any(), anyByte());
 
-    assertTimeoutPreemptively(Duration.ofSeconds(1), () ->
-        assertThrows(MessagePersistenceException.class,
-            () -> messagePersister.persistQueue(destinationAccount, DESTINATION_DEVICE, "test")));
+    assertEquals(0, messagePersister.persistNode(
+        getNodeWithKey(MessagesCache.getMessageQueueKey(DESTINATION_ACCOUNT_UUID, DESTINATION_DEVICE_ID))));
+
+    verify(messagesDynamoDb, never()).store(any(), any(), any());
+  }
+
+  @Test
+  void testPersistNodeShouldPersistExceptionRetry() {
+    final int messageCount = (MessagePersister.MESSAGE_BATCH_LIMIT * 3) + 7;
+
+    insertMessages(DESTINATION_ACCOUNT_UUID, DESTINATION_DEVICE_ID, messageCount,
+        CLOCK.instant().minus(PERSIST_DELAY.plusSeconds(1)));
+
+    doReturn(Mono.error(new RedisException("Badness 10,000")))
+        .doReturn(Mono.fromSupplier(() -> CLOCK.instant().minus(PERSIST_DELAY.plusSeconds(1)).toEpochMilli()))
+        .when(messagesCache).getEarliestUndeliveredTimestamp(any(), anyByte());
+
+    assertEquals(1, messagePersister.persistNode(
+        getNodeWithKey(MessagesCache.getMessageQueueKey(DESTINATION_ACCOUNT_UUID, DESTINATION_DEVICE_ID))));
+
+    @SuppressWarnings("unchecked") final ArgumentCaptor<List<MessageProtos.Envelope>> messagesCaptor =
+        ArgumentCaptor.forClass(List.class);
+
+    verify(messagesDynamoDb, atLeastOnce())
+        .store(messagesCaptor.capture(), eq(DESTINATION_ACCOUNT_UUID), eq(DESTINATION_DEVICE));
+
+    assertEquals(messageCount, messagesCaptor.getAllValues().stream().mapToInt(List::size).sum());
+  }
+
+  @Test
+  void persistNodeAccountNotFound() {
+    final int messageCount = (MessagePersister.MESSAGE_BATCH_LIMIT * 3) + 7;
+
+    insertMessages(DESTINATION_ACCOUNT_UUID, DESTINATION_DEVICE_ID, messageCount,
+        CLOCK.instant().minus(PERSIST_DELAY.plusSeconds(1)));
+
+    when(accountsManager.getByAccountIdentifierAsync(any()))
+        .thenReturn(CompletableFuture.completedFuture(Optional.empty()));
+
+    assertEquals(0, messagePersister.persistNode(
+        getNodeWithKey(MessagesCache.getMessageQueueKey(DESTINATION_ACCOUNT_UUID, DESTINATION_DEVICE_ID))));
+
+    verify(messagesDynamoDb, never()).store(any(), any(), any());
+  }
+
+  @Test
+  void persistNodeFetchAccountException() {
+    final int messageCount = (MessagePersister.MESSAGE_BATCH_LIMIT * 3) + 7;
+
+    insertMessages(DESTINATION_ACCOUNT_UUID, DESTINATION_DEVICE_ID, messageCount,
+        CLOCK.instant().minus(PERSIST_DELAY.plusSeconds(1)));
+
+    when(accountsManager.getByAccountIdentifierAsync(any()))
+        .thenReturn(CompletableFuture.failedFuture(new RuntimeException("Badness 10,000")));
+
+    assertEquals(0, messagePersister.persistNode(
+        getNodeWithKey(MessagesCache.getMessageQueueKey(DESTINATION_ACCOUNT_UUID, DESTINATION_DEVICE_ID))));
+
+    verify(messagesDynamoDb, never()).store(any(), any(), any());
+  }
+
+  @Test
+  void persistNodeFetchAccountExceptionRetry() {
+    final int messageCount = (MessagePersister.MESSAGE_BATCH_LIMIT * 3) + 7;
+
+    insertMessages(DESTINATION_ACCOUNT_UUID, DESTINATION_DEVICE_ID, messageCount,
+        CLOCK.instant().minus(PERSIST_DELAY.plusSeconds(1)));
+
+    when(accountsManager.getByAccountIdentifierAsync(DESTINATION_ACCOUNT_UUID))
+        .thenReturn(CompletableFuture.failedFuture(new RuntimeException("Badness 10,000")))
+        .thenReturn(CompletableFuture.completedFuture(Optional.of(destinationAccount)));
+
+    assertEquals(1, messagePersister.persistNode(
+        getNodeWithKey(MessagesCache.getMessageQueueKey(DESTINATION_ACCOUNT_UUID, DESTINATION_DEVICE_ID))));
+
+    @SuppressWarnings("unchecked") final ArgumentCaptor<List<MessageProtos.Envelope>> messagesCaptor =
+        ArgumentCaptor.forClass(List.class);
+
+    verify(messagesDynamoDb, atLeastOnce())
+        .store(messagesCaptor.capture(), eq(DESTINATION_ACCOUNT_UUID), eq(DESTINATION_DEVICE));
+
+    assertEquals(messageCount, messagesCaptor.getAllValues().stream().mapToInt(List::size).sum());
+  }
+
+  @Test
+  void persistNodePersistQueueException() {
+    final int messageCount = (MessagePersister.MESSAGE_BATCH_LIMIT * 3) + 7;
+
+    insertMessages(DESTINATION_ACCOUNT_UUID, DESTINATION_DEVICE_ID, messageCount,
+        CLOCK.instant().minus(PERSIST_DELAY.plusSeconds(1)));
+
+    when(messagesManager.persistMessages(any(), any(), any()))
+        .thenThrow(new RuntimeException("Badness 10,000"));
+
+    assertEquals(0, messagePersister.persistNode(
+        getNodeWithKey(MessagesCache.getMessageQueueKey(DESTINATION_ACCOUNT_UUID, DESTINATION_DEVICE_ID))));
+
+    verify(messagesDynamoDb, never()).store(any(), any(), any());
+  }
+
+  @Test
+  void persistNodePersistQueueExceptionRetry() {
+    final int messageCount = (MessagePersister.MESSAGE_BATCH_LIMIT * 3) + 7;
+
+    insertMessages(DESTINATION_ACCOUNT_UUID, DESTINATION_DEVICE_ID, messageCount,
+        CLOCK.instant().minus(PERSIST_DELAY.plusSeconds(1)));
+
+    when(messagesManager.persistMessages(any(), any(), any()))
+        .thenThrow(new RuntimeException("Badness 10,000"))
+        .thenAnswer(persistMessagesAnswer);
+
+    assertEquals(1, messagePersister.persistNode(
+        getNodeWithKey(MessagesCache.getMessageQueueKey(DESTINATION_ACCOUNT_UUID, DESTINATION_DEVICE_ID))));
+
+    @SuppressWarnings("unchecked") final ArgumentCaptor<List<MessageProtos.Envelope>> messagesCaptor =
+        ArgumentCaptor.forClass(List.class);
+
+    verify(messagesDynamoDb, atLeastOnce())
+        .store(messagesCaptor.capture(), eq(DESTINATION_ACCOUNT_UUID), eq(DESTINATION_DEVICE));
+
+    assertEquals(messageCount, messagesCaptor.getAllValues().stream().mapToInt(List::size).sum());
   }
 
   @Test
   void testUnlinkOnFullQueue() {
-    final String queueName = new String(
-        MessagesCache.getMessageQueueKey(DESTINATION_ACCOUNT_UUID, DESTINATION_DEVICE_ID), StandardCharsets.UTF_8);
     final int messageCount = 1;
-    final Instant now = Instant.now();
 
-    insertMessages(DESTINATION_ACCOUNT_UUID, DESTINATION_DEVICE_ID, messageCount, now);
-    setNextSlotToPersist(SlotHash.getSlot(queueName));
+    insertMessages(DESTINATION_ACCOUNT_UUID, DESTINATION_DEVICE_ID, messageCount, CLOCK.instant().minus(PERSIST_DELAY.plusSeconds(1)));
 
     final Device primary = mock(Device.class);
     when(primary.getId()).thenReturn((byte) 1);
@@ -292,27 +455,27 @@ class MessagePersisterTest {
     final Device destination = mock(Device.class);
     when(destination.getId()).thenReturn(DESTINATION_DEVICE_ID);
 
-    when(destinationAccount.getDevices()).thenReturn(List.of(primary, activeA, inactiveB, inactiveC, activeD, destination));
+    when(destinationAccount.getDevices())
+        .thenReturn(List.of(primary, activeA, inactiveB, inactiveC, activeD, destination));
 
-    when(messagesManager.persistMessages(any(UUID.class), any(), anyList())).thenThrow(ItemCollectionSizeLimitExceededException.builder().build());
+    when(messagesManager.persistMessages(any(), any(), any()))
+        .thenThrow(ItemCollectionSizeLimitExceededException.builder().build());
 
     assertTimeoutPreemptively(Duration.ofSeconds(1), () ->
-        messagePersister.persistQueue(destinationAccount, DESTINATION_DEVICE, "test"));
-    verify(accountsManager, exactly()).removeDevice(destinationAccount, DESTINATION_DEVICE_ID);
+        messagePersister.persistQueue(destinationAccount, DESTINATION_DEVICE, Tags.empty()).block());
+
+    verify(accountsManager, exactly()).removeDevice(DESTINATION_ACCOUNT_UUID, DESTINATION_DEVICE_ID);
   }
 
   @Test
   void testTrimOnFullPrimaryQueue() {
-    final byte[] queueName = MessagesCache.getMessageQueueKey(DESTINATION_ACCOUNT_UUID, Device.PRIMARY_ID);
-    final Instant now = Instant.now();
-
     final List<MessageProtos.Envelope> cachedMessages = Stream.generate(() -> generateMessage(
-            DESTINATION_ACCOUNT_UUID, UUID.randomUUID(), now.getEpochSecond(), ThreadLocalRandom.current().nextInt(100)))
+            DESTINATION_ACCOUNT_UUID, UUID.randomUUID(), CLOCK.instant().getEpochSecond(), ThreadLocalRandom.current().nextInt(100)))
         .limit(10)
         .toList();
     final long cacheSize = cachedMessages.stream().mapToLong(MessageProtos.Envelope::getSerializedSize).sum();
-    for (MessageProtos.Envelope envelope : cachedMessages) {
-      messagesCache.insert(UUID.fromString(envelope.getServerGuid()), DESTINATION_ACCOUNT_UUID, Device.PRIMARY_ID, envelope).join();
+    for (final MessageProtos.Envelope envelope : cachedMessages) {
+      messagesCache.insert(UUIDUtil.fromByteString(envelope.getServerGuid()), DESTINATION_ACCOUNT_UUID, Device.PRIMARY_ID, envelope).join();
     }
 
     final long expectedClearedBytes = (long) (cacheSize * EXTRA_ROOM_RATIO);
@@ -323,15 +486,13 @@ class MessagePersisterTest {
     long total = 0L;
     for (int i = 0; i < 100; i++) {
       final UUID guid = UUID.randomUUID();
-      final MessageProtos.Envelope envelope = generateMessage(DESTINATION_ACCOUNT_UUID, guid, now.getEpochSecond(), 13);
+      final MessageProtos.Envelope envelope = generateMessage(DESTINATION_ACCOUNT_UUID, guid, CLOCK.instant().getEpochSecond(), 13);
       persistedMessages.add(envelope);
       if (total < expectedClearedBytes) {
         total += envelope.getSerializedSize();
         expectedClearedGuids.add(guid);
       }
     }
-
-    setNextSlotToPersist(SlotHash.getSlot(queueName));
 
     final Device primary = mock(Device.class);
     when(primary.getId()).thenReturn((byte) 1);
@@ -341,35 +502,28 @@ class MessagePersisterTest {
 
     when(messagesManager.persistMessages(any(UUID.class), any(), anyList()))
         .thenThrow(ItemCollectionSizeLimitExceededException.builder().build());
-    when(messagesManager.getMessagesForDeviceReactive(DESTINATION_ACCOUNT_UUID, primary, false))
+    when(messagesManager.getMessagesForDevice(DESTINATION_ACCOUNT_UUID, primary))
         .thenReturn(Flux.concat(
             Flux.fromIterable(persistedMessages),
             Flux.fromIterable(cachedMessages)));
-    when(messagesManager.delete(any(), any(), any(), any()))
+    when(messagesManager.delete(any(), any(), any(), anyLong()))
         .thenReturn(CompletableFuture.completedFuture(Optional.empty()));
 
-    assertTimeoutPreemptively(Duration.ofSeconds(10), () ->
-        messagePersister.persistNextQueues(Clock.systemUTC().instant()));
+    StepVerifier.create(messagePersister.persistQueue(destinationAccount, primary, Tags.empty()))
+        .expectError(MessagePersistenceException.class)
+        .verify();
 
     verify(messagesManager, times(expectedClearedGuids.size()))
-        .delete(eq(DESTINATION_ACCOUNT_UUID), eq(primary), argThat(expectedClearedGuids::contains), isNotNull());
-    verify(messagesManager, never()).delete(any(), any(), argThat(guid -> !expectedClearedGuids.contains(guid)), any());
-
-    final List<String> queuesToPersist = messagesCache.getQueuesToPersist(SlotHash.getSlot(queueName),
-        Clock.systemUTC().instant(), 1);
-    assertEquals(queuesToPersist.size(), 1);
-    assertEquals(queuesToPersist.getFirst(), new String(queueName, StandardCharsets.UTF_8));
+        .delete(eq(DESTINATION_ACCOUNT_UUID), eq(primary), argThat(expectedClearedGuids::contains), anyLong());
+    verify(messagesManager, never())
+        .delete(any(), any(), argThat(guid -> !expectedClearedGuids.contains(guid)), anyLong());
   }
 
   @Test
   void testFailedUnlinkOnFullQueueThrowsForRetry() {
-    final String queueName = new String(
-        MessagesCache.getMessageQueueKey(DESTINATION_ACCOUNT_UUID, DESTINATION_DEVICE_ID), StandardCharsets.UTF_8);
     final int messageCount = 1;
-    final Instant now = Instant.now();
 
-    insertMessages(DESTINATION_ACCOUNT_UUID, DESTINATION_DEVICE_ID, messageCount, now);
-    setNextSlotToPersist(SlotHash.getSlot(queueName));
+    insertMessages(DESTINATION_ACCOUNT_UUID, DESTINATION_DEVICE_ID, messageCount, CLOCK.instant().minus(PERSIST_DELAY.plusSeconds(1)));
 
     final Device primary = mock(Device.class);
     when(primary.getId()).thenReturn((byte) 1);
@@ -397,27 +551,15 @@ class MessagePersisterTest {
     when(destinationAccount.getDevices()).thenReturn(List.of(primary, activeA, inactiveB, inactiveC, activeD, destination));
 
     when(messagesManager.persistMessages(any(UUID.class), any(), anyList())).thenThrow(ItemCollectionSizeLimitExceededException.builder().build());
-    when(accountsManager.removeDevice(destinationAccount, DESTINATION_DEVICE_ID)).thenReturn(CompletableFuture.failedFuture(new TimeoutException()));
+    when(accountsManager.removeDevice(DESTINATION_ACCOUNT_UUID, DESTINATION_DEVICE_ID)).thenThrow(new RuntimeException());
 
-    assertThrows(CompletionException.class, () -> messagePersister.persistQueue(destinationAccount, DESTINATION_DEVICE, "test"));
+    assertThrows(RuntimeException.class, () -> messagePersister.persistQueue(destinationAccount, DESTINATION_DEVICE, Tags.empty()).block());
   }
 
-  @SuppressWarnings("SameParameterValue")
-  private static String generateRandomQueueNameForSlot(final int slot) {
-
-    while (true) {
-
-      final UUID uuid = UUID.randomUUID();
-      final String queueNameBase = "user_queue::{" + uuid + "::";
-
-      for (byte deviceId = 1; deviceId < Device.MAXIMUM_DEVICE_ID; deviceId++) {
-        final String queueName = queueNameBase + deviceId + "}";
-
-        if (SlotHash.getSlot(queueName) == slot) {
-          return queueName;
-        }
-      }
-    }
+  private static RedisClusterNode getNodeWithKey(final byte[] key) {
+    return REDIS_CLUSTER_EXTENSION.getRedisCluster().withCluster(connection ->
+            connection.getPartitions().stream().filter(node -> node.hasSlot(SlotHash.getSlot(key))).findFirst())
+        .orElseThrow();
   }
 
   private void insertMessages(final UUID accountUuid, final byte deviceId, final int messageCount,
@@ -432,17 +574,12 @@ class MessagePersisterTest {
 
   private MessageProtos.Envelope generateMessage(UUID accountUuid, UUID messageGuid, long messageTimestamp, int contentSize) {
     return MessageProtos.Envelope.newBuilder()
-        .setDestinationServiceId(accountUuid.toString())
+        .setDestinationServiceId(new AciServiceIdentifier(accountUuid).toCompactByteString())
         .setClientTimestamp(messageTimestamp)
         .setServerTimestamp(messageTimestamp)
         .setContent(ByteString.copyFromUtf8(RandomStringUtils.secure().nextAlphanumeric(contentSize)))
         .setType(MessageProtos.Envelope.Type.CIPHERTEXT)
-        .setServerGuid(messageGuid.toString())
+        .setServerGuid(UUIDUtil.toByteString(messageGuid))
         .build();
-  }
-
-  private void setNextSlotToPersist(final int nextSlot) {
-    REDIS_CLUSTER_EXTENSION.getRedisCluster().useCluster(
-        connection -> connection.sync().set(MessagesCache.NEXT_SLOT_TO_PERSIST_KEY, String.valueOf(nextSlot - 1)));
   }
 }

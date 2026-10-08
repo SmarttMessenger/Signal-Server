@@ -8,7 +8,6 @@ package org.whispersystems.textsecuregcm.configuration;
 import com.fasterxml.jackson.annotation.JsonAnyGetter;
 import com.fasterxml.jackson.annotation.JsonAnySetter;
 import com.fasterxml.jackson.annotation.JsonProperty;
-
 import io.micrometer.registry.otlp.HistogramFlavor;
 import io.micrometer.registry.otlp.OtlpConfig;
 import java.time.Duration;
@@ -19,6 +18,7 @@ public record OpenTelemetryConfiguration(
   @JsonProperty Duration shutdownWaitDuration,
   @JsonProperty int maxBucketCount,
   @JsonProperty Map<String, Integer> maxBucketsPerMeter,
+  @JsonProperty boolean publishMaxGaugeForHistograms,
   @JsonAnyGetter @JsonAnySetter Map<String, String> otlpConfig
 ) implements OtlpConfig {
 

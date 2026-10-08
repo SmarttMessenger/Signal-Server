@@ -44,9 +44,9 @@ public class ReceiptSender {
             destinationAccount -> {
               final Envelope message = Envelope.newBuilder()
                   .setServerTimestamp(System.currentTimeMillis())
-                  .setSourceServiceId(sourceIdentifier.toServiceIdentifierString())
+                  .setSourceServiceId(sourceIdentifier.toCompactByteString())
                   .setSourceDevice(sourceDeviceId)
-                  .setDestinationServiceId(destinationIdentifier.toServiceIdentifierString())
+                  .setDestinationServiceId(destinationIdentifier.toCompactByteString())
                   .setClientTimestamp(messageId)
                   .setType(Envelope.Type.SERVER_DELIVERY_RECEIPT)
                   .setUrgent(false)
@@ -57,7 +57,11 @@ public class ReceiptSender {
 
               final Map<Byte, Integer> registrationIdsByDeviceId = destinationAccount.getDevices().stream()
                   .collect(Collectors.toMap(Device::getId,
-                      device -> device.getRegistrationId(destinationIdentifier.identityType())));
+                      device -> switch (destinationIdentifier.identityType()) {
+                        case ACI -> device.getAccountRegistrationId();
+                        case PNI -> device.getPhoneNumberIdentityRegistrationId()
+                            .orElseThrow(() -> new IllegalStateException("Destination account identified by PNI has device without PNI registration ID"));
+                      }));
 
               try {
                 messageSender.sendMessages(destinationAccount,

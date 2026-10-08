@@ -5,7 +5,7 @@
 
 package org.whispersystems.textsecuregcm.limits;
 
-import static com.codahale.metrics.MetricRegistry.name;
+import static org.whispersystems.textsecuregcm.metrics.MetricsUtil.name;
 
 import io.micrometer.core.instrument.Metrics;
 import java.security.SecureRandom;
@@ -53,7 +53,7 @@ public class PushChallengeManager {
     final boolean sent;
     final String platform;
 
-    if (pushChallengeDynamoDb.add(account.getUuid(), token, CHALLENGE_TTL)) {
+    if (pushChallengeDynamoDb.add(account.getAccountIdentifier(), token, CHALLENGE_TTL)) {
       pushNotificationManager.sendRateLimitChallengeNotification(account, HexFormat.of().formatHex(token));
 
       sent = true;
@@ -74,7 +74,7 @@ public class PushChallengeManager {
 
     Metrics.counter(CHALLENGE_REQUESTED_COUNTER_NAME,
         PLATFORM_TAG_NAME, platform,
-        SOURCE_COUNTRY_TAG_NAME, Util.getCountryCode(account.getNumber()),
+        SOURCE_COUNTRY_TAG_NAME, Util.getCountryCode(account),
         SENT_TAG_NAME, String.valueOf(sent)).increment();
   }
 
@@ -82,7 +82,7 @@ public class PushChallengeManager {
     boolean success = false;
 
     try {
-      success = pushChallengeDynamoDb.remove(account.getUuid(), HexFormat.of().parseHex(challengeTokenHex));
+      success = pushChallengeDynamoDb.remove(account.getAccountIdentifier(), HexFormat.of().parseHex(challengeTokenHex));
     } catch (final IllegalArgumentException ignored) {
     }
 
@@ -98,7 +98,7 @@ public class PushChallengeManager {
 
     Metrics.counter(CHALLENGE_ANSWERED_COUNTER_NAME,
         PLATFORM_TAG_NAME, platform,
-        SOURCE_COUNTRY_TAG_NAME, Util.getCountryCode(account.getNumber()),
+        SOURCE_COUNTRY_TAG_NAME, Util.getCountryCode(account),
         SUCCESS_TAG_NAME, String.valueOf(success)).increment();
 
     return success;

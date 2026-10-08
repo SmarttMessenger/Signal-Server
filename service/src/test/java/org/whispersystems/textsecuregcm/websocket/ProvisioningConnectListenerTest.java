@@ -11,7 +11,6 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.when;
 
 import com.google.protobuf.InvalidProtocolBufferException;
 import java.time.Duration;
@@ -22,8 +21,10 @@ import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.whispersystems.textsecuregcm.asn.AsnInfoProvider;
 import org.whispersystems.textsecuregcm.entities.MessageProtos;
 import org.whispersystems.textsecuregcm.push.ProvisioningManager;
+import org.whispersystems.textsecuregcm.storage.ClientReleaseManager;
 import org.whispersystems.websocket.WebSocketClient;
 import org.whispersystems.websocket.session.WebSocketSessionContext;
 
@@ -40,7 +41,7 @@ class ProvisioningConnectListenerTest {
     provisioningManager = mock(ProvisioningManager.class);
     scheduledExecutorService = mock(ScheduledExecutorService.class);
     provisioningConnectListener =
-        new ProvisioningConnectListener(provisioningManager, scheduledExecutorService, TIMEOUT);
+        new ProvisioningConnectListener(provisioningManager, () -> mock(AsnInfoProvider.class), mock(ClientReleaseManager.class), scheduledExecutorService, TIMEOUT);
   }
 
   @Test

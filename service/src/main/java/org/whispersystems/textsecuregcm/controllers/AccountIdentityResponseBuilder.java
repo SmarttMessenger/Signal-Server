@@ -18,18 +18,18 @@ public class AccountIdentityResponseBuilder {
   private boolean storageCapable;
   private Clock clock;
 
-  public AccountIdentityResponseBuilder(Account account) {
+  public AccountIdentityResponseBuilder(final Account account) {
     this.account = account;
     this.storageCapable = account.hasCapability(DeviceCapability.STORAGE);
     this.clock = Clock.systemUTC();
   }
 
-  public AccountIdentityResponseBuilder storageCapable(boolean storageCapable) {
+  public AccountIdentityResponseBuilder storageCapable(final boolean storageCapable) {
     this.storageCapable = storageCapable;
     return this;
   }
 
-  public AccountIdentityResponseBuilder clock(Clock clock) {
+  public AccountIdentityResponseBuilder clock(final Clock clock) {
     this.clock = clock;
     return this;
   }
@@ -47,13 +47,14 @@ public class AccountIdentityResponseBuilder {
         .map(bv -> new Entitlements.BackupEntitlement(bv.receiptLevel(), bv.expiration()))
         .orElse(null);
 
-    return new AccountIdentityResponse(account.getUuid(),
+    return new AccountIdentityResponse(account.getAccountIdentifier(),
         account.getNumber(),
         account.getPhoneNumberIdentifier(),
         account.getUsernameHash().filter(h -> h.length > 0).orElse(null),
         account.getUsernameLinkHandle(),
         storageCapable,
-        new Entitlements(badges, backupEntitlement));
+        new Entitlements(badges, backupEntitlement),
+        account.getAuthCredentialSalt().orElse(null));
   }
 
   public static AccountIdentityResponse fromAccount(final Account account) {

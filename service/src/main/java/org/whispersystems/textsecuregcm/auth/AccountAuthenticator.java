@@ -5,12 +5,11 @@
 
 package org.whispersystems.textsecuregcm.auth;
 
-import static com.codahale.metrics.MetricRegistry.name;
+import static org.whispersystems.textsecuregcm.metrics.MetricsUtil.name;
 
 import com.google.common.annotations.VisibleForTesting;
 import io.dropwizard.auth.Authenticator;
 import io.dropwizard.auth.basic.BasicCredentials;
-import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.Metrics;
 import io.micrometer.core.instrument.Tags;
 import java.time.Clock;
@@ -20,7 +19,6 @@ import java.time.temporal.ChronoUnit;
 import java.util.Optional;
 import java.util.UUID;
 import org.apache.commons.lang3.StringUtils;
-import org.whispersystems.textsecuregcm.identity.IdentityType;
 import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.storage.AccountsManager;
 import org.whispersystems.textsecuregcm.storage.Device;
@@ -29,17 +27,12 @@ import org.whispersystems.textsecuregcm.util.Util;
 
 public class AccountAuthenticator implements Authenticator<BasicCredentials, AuthenticatedDevice> {
 
-  private static final String LEGACY_NAME_PREFIX = "org.whispersystems.textsecuregcm.auth.BaseAccountAuthenticator";
-
-  private static final String AUTHENTICATION_COUNTER_NAME = name(LEGACY_NAME_PREFIX, "authentication");
+  private static final String AUTHENTICATION_COUNTER_NAME = name(AccountAuthenticator.class, "authentication");
   private static final String AUTHENTICATION_SUCCEEDED_TAG_NAME = "succeeded";
   private static final String AUTHENTICATION_FAILURE_REASON_TAG_NAME = "reason";
 
-  private static final String DAYS_SINCE_LAST_SEEN_DISTRIBUTION_NAME = name(LEGACY_NAME_PREFIX, "daysSinceLastSeen");
+  private static final String DAYS_SINCE_LAST_SEEN_DISTRIBUTION_NAME = name(AccountAuthenticator.class, "daysSinceLastSeen");
   private static final String IS_PRIMARY_DEVICE_TAG = "isPrimary";
-
-  private static final Counter OLD_TOKEN_VERSION_COUNTER =
-      Metrics.counter(name(AccountAuthenticator.class, "oldTokenVersionCounter"));
 
   @VisibleForTesting
   static final char DEVICE_ID_SEPARATOR = '.';
@@ -106,15 +99,8 @@ public class AccountAuthenticator implements Authenticator<BasicCredentials, Aut
       SaltedTokenHash deviceSaltedTokenHash = device.get().getAuthTokenHash();
       if (deviceSaltedTokenHash.verify(basicCredentials.getPassword())) {
         succeeded = true;
-        Account authenticatedAccount = updateLastSeen(account.get(), device.get());
-        if (deviceSaltedTokenHash.getVersion() != SaltedTokenHash.CURRENT_VERSION) {
-          OLD_TOKEN_VERSION_COUNTER.increment();
-          authenticatedAccount = accountsManager.updateDeviceAuthentication(
-              authenticatedAccount,
-              device.get(),
-              SaltedTokenHash.generateFor(basicCredentials.getPassword()));  // new credentials have current version
-        }
-        return Optional.of(new AuthenticatedDevice(authenticatedAccount.getIdentifier(IdentityType.ACI),
+        final Account authenticatedAccount = updateLastSeen(account.get(), device.get());
+        return Optional.of(new AuthenticatedDevice(authenticatedAccount.getAccountIdentifier(),
             device.get().getId(),
             Instant.ofEpochMilli(authenticatedAccount.getPrimaryDevice().getLastSeen())));
       } else {
@@ -139,7 +125,7 @@ public class AccountAuthenticator implements Authenticator<BasicCredentials, Aut
   @VisibleForTesting
   public Account updateLastSeen(Account account, Device device) {
     // compute a non-negative integer between 0 and 86400.
-    long n = Util.ensureNonNegativeLong(account.getUuid().getLeastSignificantBits());
+    long n = Util.ensureNonNegativeLong(account.getAccountIdentifier().getLeastSignificantBits());
     final long lastSeenOffsetSeconds = n % ChronoUnit.DAYS.getDuration().toSeconds();
 
     // produce a truncated timestamp which is either today at UTC midnight
@@ -155,7 +141,7 @@ public class AccountAuthenticator implements Authenticator<BasicCredentials, Aut
       Metrics.summary(DAYS_SINCE_LAST_SEEN_DISTRIBUTION_NAME, IS_PRIMARY_DEVICE_TAG, String.valueOf(device.isPrimary()))
           .record(Duration.ofMillis(todayInMillisWithOffset - device.getLastSeen()).toDays());
 
-      return accountsManager.updateDeviceLastSeen(account, device, Util.todayInMillis(clock));
+      return accountsManager.updateDeviceLastSeen(account.getAccountIdentifier(), device, Util.todayInMillis(clock));
     }
 
     return account;

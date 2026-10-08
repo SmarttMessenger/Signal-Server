@@ -6,7 +6,6 @@ package org.whispersystems.textsecuregcm.controllers;
 
 import com.google.common.net.HttpHeaders;
 import io.dropwizard.auth.Auth;
-import io.micrometer.core.instrument.DistributionSummary;
 import io.micrometer.core.instrument.Metrics;
 import io.micrometer.core.instrument.Tag;
 import io.micrometer.core.instrument.Tags;
@@ -39,18 +38,18 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import javax.annotation.Nullable;
+import org.glassfish.jersey.server.ManagedAsync;
 import org.signal.libsignal.protocol.IdentityKey;
 import org.signal.libsignal.zkgroup.ServerSecretParams;
 import org.signal.libsignal.zkgroup.VerificationFailedException;
 import org.signal.libsignal.zkgroup.groupsend.GroupSendDerivedKeyPair;
 import org.signal.libsignal.zkgroup.groupsend.GroupSendFullToken;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import org.whispersystems.textsecuregcm.auth.Anonymous;
 import org.whispersystems.textsecuregcm.auth.AuthenticatedDevice;
 import org.whispersystems.textsecuregcm.auth.GroupSendTokenHeader;
@@ -83,7 +82,6 @@ import reactor.core.publisher.Mono;
 @io.swagger.v3.oas.annotations.tags.Tag(name = "Keys")
 public class KeysController {
 
-  private static final Logger log = LoggerFactory.getLogger(KeysController.class);
   private final RateLimiters rateLimiters;
   private final KeysManager keysManager;
   private final AccountsManager accounts;
@@ -91,8 +89,6 @@ public class KeysController {
   private final Clock clock;
 
   private static final String STORE_KEYS_COUNTER_NAME = MetricsUtil.name(KeysController.class, "storeKeys");
-  private static final String STORE_KEY_BUNDLE_SIZE_DISTRIBUTION_NAME =
-      MetricsUtil.name(KeysController.class, "storeKeyBundleSize");
   private static final String PRIMARY_DEVICE_TAG_NAME = "isPrimary";
   private static final String IDENTITY_TYPE_TAG_NAME = "identityType";
   private static final String KEY_TYPE_TAG_NAME = "keyType";
@@ -112,6 +108,7 @@ public class KeysController {
   @Operation(summary = "Get prekey count",
       description = "Gets the number of one-time prekeys uploaded for this device and still available")
   @ApiResponse(responseCode = "200", description = "Body contains the number of available one-time prekeys for the device.", useReturnTypeSchema = true)
+  @ApiResponse(responseCode = "400", description = "The request was malformed or the account does not support the requested identityType")
   @ApiResponse(responseCode = "401", description = "Account authentication check failed.")
   public CompletableFuture<PreKeyCount> getStatus(@Auth final AuthenticatedDevice auth,
       @QueryParam("identity") @DefaultValue("aci") final IdentityType identityType) {
@@ -119,12 +116,13 @@ public class KeysController {
     return accounts.getByAccountIdentifierAsync(auth.accountIdentifier())
         .thenCompose(maybeAccount -> {
           final Account account = maybeAccount.orElseThrow(() -> new WebApplicationException(Response.Status.UNAUTHORIZED));
+          final UUID identifier = getIdentifier(account, identityType);
 
           final CompletableFuture<Integer> ecCountFuture =
-              keysManager.getEcCount(account.getIdentifier(identityType), auth.deviceId());
+              keysManager.getEcCount(identifier, auth.deviceId());
 
           final CompletableFuture<Integer> pqCountFuture =
-              keysManager.getPqCount(account.getIdentifier(identityType), auth.deviceId());
+              keysManager.getPqCount(identifier, auth.deviceId());
 
           return ecCountFuture.thenCombine(pqCountFuture, PreKeyCount::new);
         });
@@ -135,6 +133,7 @@ public class KeysController {
   @Produces(MediaType.APPLICATION_JSON)
   @Operation(summary = "Upload new prekeys", description = "Upload new pre-keys for this device.")
   @ApiResponse(responseCode = "200", description = "Indicates that new keys were successfully stored.")
+  @ApiResponse(responseCode = "400", description = "The request was malformed or the account does not support the requested identityType")
   @ApiResponse(responseCode = "401", description = "Account authentication check failed.")
   @ApiResponse(responseCode = "403", description = "Attempt to change identity key from a non-primary device.")
   @ApiResponse(responseCode = "422", description = "Invalid request format.")
@@ -158,9 +157,9 @@ public class KeysController {
           final Device device = account.getDevice(auth.deviceId())
               .orElseThrow(() -> new WebApplicationException(Response.Status.UNAUTHORIZED));
 
-          final UUID identifier = account.getIdentifier(identityType);
+          final UUID identifier = getIdentifier(account, identityType);
 
-          checkSignedPreKeySignatures(setKeysRequest, account.getIdentityKey(identityType), userAgent);
+          checkSignedPreKeySignatures(setKeysRequest, getIdentityKey(account, identityType), userAgent);
 
           final Tag platformTag = UserAgentTagUtil.getPlatformTag(userAgent);
           final Tag primaryDeviceTag = Tag.of(PRIMARY_DEVICE_TAG_NAME, String.valueOf(auth.deviceId() == Device.PRIMARY_ID));
@@ -172,12 +171,6 @@ public class KeysController {
             final Tags tags = Tags.of(platformTag, primaryDeviceTag, identityTypeTag, Tag.of(KEY_TYPE_TAG_NAME, "ec"));
 
             Metrics.counter(STORE_KEYS_COUNTER_NAME, tags).increment();
-
-            DistributionSummary.builder(STORE_KEY_BUNDLE_SIZE_DISTRIBUTION_NAME)
-                .tags(tags)
-                .publishPercentileHistogram()
-                .register(Metrics.globalRegistry)
-                .record(setKeysRequest.preKeys().size());
 
             storeFutures.add(keysManager.storeEcOneTimePreKeys(identifier, device.getId(), setKeysRequest.preKeys()));
           }
@@ -193,12 +186,6 @@ public class KeysController {
           if (!setKeysRequest.pqPreKeys().isEmpty()) {
             final Tags tags = Tags.of(platformTag, primaryDeviceTag, identityTypeTag, Tag.of(KEY_TYPE_TAG_NAME, "kyber"));
             Metrics.counter(STORE_KEYS_COUNTER_NAME, tags).increment();
-
-            DistributionSummary.builder(STORE_KEY_BUNDLE_SIZE_DISTRIBUTION_NAME)
-                .tags(tags)
-                .publishPercentileHistogram()
-                .register(Metrics.globalRegistry)
-                .record(setKeysRequest.pqPreKeys().size());
 
             storeFutures.add(keysManager.storeKemOneTimePreKeys(identifier, device.getId(), setKeysRequest.pqPreKeys()));
           }
@@ -260,6 +247,7 @@ public class KeysController {
         version byte followed by 1568 bytes of key material for a total of 1569 bytes)
       """)
   @ApiResponse(responseCode = "200", description = "Indicates that client and server have consistent views of repeated-use keys")
+  @ApiResponse(responseCode = "400", description = "The request was malformed or the account does not support the requested identityType")
   @ApiResponse(responseCode = "401", description = "Account authentication check failed")
   @ApiResponse(responseCode = "409", description = """
     Indicates that client and server have inconsistent views of repeated-use keys or one or more repeated-use keys could
@@ -274,7 +262,7 @@ public class KeysController {
         .thenCompose(maybeAccount -> {
           final Account account = maybeAccount.orElseThrow(() -> new WebApplicationException(Response.Status.UNAUTHORIZED));
 
-          final UUID identifier = account.getIdentifier(checkKeysRequest.identityType());
+          final UUID identifier = getIdentifier(account, checkKeysRequest.identityType());
           final byte deviceId = auth.deviceId();
 
           final CompletableFuture<Optional<ECSignedPreKey>> ecSignedPreKeyFuture =
@@ -291,7 +279,7 @@ public class KeysController {
                 final boolean digestsMatch;
 
                 if (maybeSignedPreKey.isPresent() && maybeLastResortKey.isPresent()) {
-                  final IdentityKey identityKey = account.getIdentityKey(checkKeysRequest.identityType());
+                  final IdentityKey identityKey = getIdentityKey(account, checkKeysRequest.identityType());
                   final ECSignedPreKey ecSignedPreKey = maybeSignedPreKey.get();
                   final KEMSignedPreKey lastResortKey = maybeLastResortKey.get();
 
@@ -334,6 +322,7 @@ public class KeysController {
   }
 
   @GET
+  @ManagedAsync
   @Path("/{identifier}/{device_id}")
   @Produces(MediaType.APPLICATION_JSON)
   @Operation(summary = "Fetch public keys for another user",
@@ -385,9 +374,8 @@ public class KeysController {
     final Account target = maybeTarget.orElseThrow(NotFoundException::new);
 
     if (account.isPresent()) {
-      rateLimiters.getPreKeysLimiter().validate(
-          account.get().getUuid() + "." + maybeAuthenticatedDevice.get().deviceId() + "__" + targetIdentifier.uuid()
-              + "." + deviceId);
+      rateLimiters.getPreKeysLimiter().validate(getPreKeysLimiterKey(account.get(), maybeAuthenticatedDevice.get(),
+          targetIdentifier, target, deviceId));
     }
 
     final List<Device> devices = parseDeviceId(deviceId, target);
@@ -396,14 +384,24 @@ public class KeysController {
             .fromCompletionStage(keysManager.takeDevicePreKeys(device.getId(), targetIdentifier, userAgent))
             .flatMap(Mono::justOrEmpty)
             .map(devicePreKeys -> new PreKeyResponseItem(
-                device.getId(), device.getRegistrationId(targetIdentifier.identityType()),
+                device.getId(),
+                switch (targetIdentifier.identityType()) {
+                  case ACI -> device.getAccountRegistrationId();
+                  case PNI -> device.getPhoneNumberIdentityRegistrationId()
+                      .orElseThrow(() -> new IllegalStateException("Device on account retrieved by PNI does not have a PNI registration ID"));
+                },
                 devicePreKeys.ecSignedPreKey(),
                 devicePreKeys.ecPreKey().orElse(null),
                 devicePreKeys.kemSignedPreKey())))
         .collectList()
-        .block();
+        .blockOptional()
+        .orElseGet(Collections::emptyList);
 
-    final IdentityKey identityKey = target.getIdentityKey(targetIdentifier.identityType());
+    final IdentityKey identityKey = switch (targetIdentifier.identityType()) {
+      case ACI -> target.getAccountIdentityKey();
+      case PNI -> target.getPhoneNumberIdentityKey()
+          .orElseThrow(() -> new IllegalStateException("Account retrieved by PNI does not have a PNI identity key"));
+    };
 
     if (responseItems.isEmpty()) {
       throw new WebApplicationException(Response.Status.NOT_FOUND);
@@ -413,14 +411,58 @@ public class KeysController {
   }
 
   private List<Device> parseDeviceId(String deviceId, Account account) {
+    return parseDeviceId(deviceId)
+        .map(id -> account.getDevice(id).map(List::of).orElse(List.of()))
+        .orElseGet(account::getDevices);
+  }
+
+  private Optional<Byte> parseDeviceId(final String deviceId) {
     if (deviceId.equals("*")) {
-      return account.getDevices();
+      return Optional.empty();
     }
     try {
-      byte id = Byte.parseByte(deviceId);
-      return account.getDevice(id).map(List::of).orElse(List.of());
+      return Optional.of(Byte.parseByte(deviceId));
     } catch (NumberFormatException e) {
       throw new WebApplicationException(Response.status(422).build());
     }
+  }
+
+
+  private String getPreKeysLimiterKey(
+      final Account account,
+      final AuthenticatedDevice authenticatedDevice,
+      final ServiceIdentifier targetIdentifier,
+      final Account targetAccount,
+      final String targetDeviceId) {
+    final Optional<Byte> parsedTargetDeviceId = parseDeviceId(targetDeviceId);
+    final Optional<Integer> targetRegistrationId = parsedTargetDeviceId
+        .flatMap(targetAccount::getDevice)
+        .flatMap(device -> switch (targetIdentifier.identityType()) {
+          case ACI -> Optional.of(device.getAccountRegistrationId());
+          case PNI -> device.getPhoneNumberIdentityRegistrationId();
+        });
+    return RateLimitKeys.preKeyLimiterKey(
+        account.getAccountIdentifier(),
+        authenticatedDevice.deviceId(),
+        targetIdentifier,
+        parsedTargetDeviceId, targetRegistrationId);
+  }
+
+  /// Get the identity of the requested `idenityType`, or throw a [BadRequestException] if `account` does not contain
+  /// that type.
+  private static UUID getIdentifier(final Account account, final IdentityType identityType) {
+    return switch (identityType) {
+      case ACI -> account.getAccountIdentifier();
+      case PNI -> account.getPhoneNumberIdentifier()
+          .orElseThrow(() -> new BadRequestException("Cannot set PNI identity keys on an account without a number"));
+    };
+  }
+
+  private static IdentityKey getIdentityKey(final Account account, final IdentityType identityType) {
+    return switch (identityType) {
+      case ACI -> account.getAccountIdentityKey();
+      case PNI -> account.getPhoneNumberIdentityKey()
+          .orElseThrow(() -> new BadRequestException("Account does not have a phone number"));
+    };
   }
 }

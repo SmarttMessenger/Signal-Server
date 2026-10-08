@@ -37,6 +37,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
@@ -54,11 +55,13 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.signal.libsignal.protocol.IdentityKey;
 import org.signal.libsignal.protocol.ecc.ECKeyPair;
 import org.signal.libsignal.zkgroup.ServerSecretParams;
 import org.whispersystems.textsecuregcm.auth.AuthenticatedDevice;
+import org.whispersystems.textsecuregcm.auth.UnidentifiedAccessUtil;
 import org.whispersystems.textsecuregcm.entities.CheckKeysRequest;
 import org.whispersystems.textsecuregcm.entities.ECPreKey;
 import org.whispersystems.textsecuregcm.entities.ECSignedPreKey;
@@ -93,20 +96,22 @@ import org.whispersystems.textsecuregcm.util.TestClock;
 class KeysControllerTest {
 
   private static final String EXISTS_NUMBER = "+14152222222";
-  private static final UUID   EXISTS_UUID   = UUID.randomUUID();
-  private static final UUID   EXISTS_PNI    = UUID.randomUUID();
+  private static final UUID EXISTS_UUID = UUID.randomUUID();
+  private static final UUID EXISTS_PNI = UUID.randomUUID();
   private static final AciServiceIdentifier EXISTS_ACI = new AciServiceIdentifier(EXISTS_UUID);
   private static final PniServiceIdentifier EXISTS_PNI_SERVICE_ID = new PniServiceIdentifier(EXISTS_PNI);
+  private static final byte[] EXISTS_UAK = Arrays.copyOf(
+      "1337".getBytes(), UnidentifiedAccessUtil.UNIDENTIFIED_ACCESS_KEY_LENGTH);
 
-  private static final UUID   OTHER_UUID   = UUID.randomUUID();
+  private static final UUID OTHER_UUID = UUID.randomUUID();
   private static final AciServiceIdentifier OTHER_ACI = new AciServiceIdentifier(OTHER_UUID);
 
-  private static final UUID   NOT_EXISTS_UUID   = UUID.randomUUID();
+  private static final UUID NOT_EXISTS_UUID = UUID.randomUUID();
   private static final AciServiceIdentifier NOT_EXISTS_ACI = new AciServiceIdentifier(NOT_EXISTS_UUID);
 
   private static final byte SAMPLE_DEVICE_ID = 1;
 
-  private static final int SAMPLE_REGISTRATION_ID  =  999;
+  private static final int SAMPLE_REGISTRATION_ID = 999;
   private static final int SAMPLE_PNI_REGISTRATION_ID = 1717;
 
   private final ECKeyPair IDENTITY_KEY_PAIR = ECKeyPair.generate();
@@ -181,8 +186,8 @@ class KeysControllerTest {
 
   private Device createSampleDevice(byte deviceId, int registrationId, int pniRegistrationId) {
     final Device sampleDevice = mock(Device.class);
-    when(sampleDevice.getRegistrationId(IdentityType.ACI)).thenReturn(registrationId);
-    when(sampleDevice.getRegistrationId(IdentityType.PNI)).thenReturn(pniRegistrationId);
+    when(sampleDevice.getAccountRegistrationId()).thenReturn(registrationId);
+    when(sampleDevice.getPhoneNumberIdentityRegistrationId()).thenReturn(Optional.of(pniRegistrationId));
     when(sampleDevice.getId()).thenReturn(deviceId);
 
     return sampleDevice;
@@ -207,18 +212,16 @@ class KeysControllerTest {
     when(KEYS.takeDevicePreKeys(eq(SAMPLE_DEVICE_ID), eq(EXISTS_PNI_SERVICE_ID), any()))
         .thenReturn(CompletableFuture.completedFuture(Optional.of(pniKeys)));
 
-    when(existsAccount.getUuid()).thenReturn(EXISTS_UUID);
     when(existsAccount.isIdentifiedBy(new AciServiceIdentifier(EXISTS_UUID))).thenReturn(true);
-    when(existsAccount.getPhoneNumberIdentifier()).thenReturn(EXISTS_PNI);
     when(existsAccount.isIdentifiedBy(new PniServiceIdentifier(EXISTS_PNI))).thenReturn(true);
-    when(existsAccount.getIdentifier(IdentityType.ACI)).thenReturn(EXISTS_UUID);
-    when(existsAccount.getIdentifier(IdentityType.PNI)).thenReturn(EXISTS_PNI);
+    when(existsAccount.getAccountIdentifier()).thenReturn(EXISTS_ACI.uuid());
+    when(existsAccount.getPhoneNumberIdentifier()).thenReturn(Optional.of(EXISTS_PNI));
     when(existsAccount.getDevice(SAMPLE_DEVICE_ID)).thenReturn(Optional.of(sampleDevice));
     when(existsAccount.getDevices()).thenReturn(List.of(sampleDevice));
-    when(existsAccount.getIdentityKey(IdentityType.ACI)).thenReturn(IDENTITY_KEY);
-    when(existsAccount.getIdentityKey(IdentityType.PNI)).thenReturn(PNI_IDENTITY_KEY);
-    when(existsAccount.getNumber()).thenReturn(EXISTS_NUMBER);
-    when(existsAccount.getUnidentifiedAccessKey()).thenReturn(Optional.of("1337".getBytes()));
+    when(existsAccount.getAccountIdentityKey()).thenReturn(IDENTITY_KEY);
+    when(existsAccount.getPhoneNumberIdentityKey()).thenReturn(Optional.of(PNI_IDENTITY_KEY));
+    when(existsAccount.getNumber()).thenReturn(Optional.of(EXISTS_NUMBER));
+    when(existsAccount.getUnidentifiedAccessKey()).thenReturn(Optional.of(EXISTS_UAK));
 
     when(accounts.getByServiceIdentifier(any())).thenReturn(Optional.empty());
     when(accounts.getByServiceIdentifierAsync(any())).thenReturn(CompletableFuture.completedFuture(Optional.empty()));
@@ -235,6 +238,11 @@ class KeysControllerTest {
     when(accounts.getByAccountIdentifier(AuthHelper.VALID_UUID)).thenReturn(Optional.of(AuthHelper.VALID_ACCOUNT));
     when(accounts.getByAccountIdentifierAsync(AuthHelper.VALID_UUID))
         .thenReturn(CompletableFuture.completedFuture(Optional.of(AuthHelper.VALID_ACCOUNT)));
+
+    when(accounts.getByAccountIdentifier(AuthHelper.NUMBERLESS_UUID))
+        .thenReturn(Optional.of(AuthHelper.NUMBERLESS_ACCOUNT));
+    when(accounts.getByAccountIdentifierAsync(AuthHelper.NUMBERLESS_UUID))
+        .thenReturn(CompletableFuture.completedFuture(Optional.of(AuthHelper.NUMBERLESS_ACCOUNT)));
 
     when(rateLimiters.getPreKeysLimiter()).thenReturn(rateLimiter);
 
@@ -290,7 +298,7 @@ class KeysControllerTest {
         .header("Authorization", AuthHelper.getAuthHeader(AuthHelper.VALID_UUID, AuthHelper.VALID_PASSWORD))
         .get(PreKeyResponse.class);
 
-    assertThat(result.getIdentityKey()).isEqualTo(existsAccount.getIdentityKey(IdentityType.ACI));
+    assertThat(result.getIdentityKey()).isEqualTo(existsAccount.getAccountIdentityKey());
     assertThat(result.getDevicesCount()).isEqualTo(1);
     assertEquals(SAMPLE_KEY, result.getDevice(SAMPLE_DEVICE_ID).getPreKey());
     assertThat(result.getDevice(SAMPLE_DEVICE_ID).getPqPreKey()).isEqualTo(SAMPLE_PQ_KEY);
@@ -310,7 +318,7 @@ class KeysControllerTest {
         .header("Authorization", AuthHelper.getAuthHeader(AuthHelper.VALID_UUID, AuthHelper.VALID_PASSWORD))
         .get(PreKeyResponse.class);
 
-    assertThat(result.getIdentityKey()).isEqualTo(existsAccount.getIdentityKey(IdentityType.ACI));
+    assertThat(result.getIdentityKey()).isEqualTo(existsAccount.getAccountIdentityKey());
     assertThat(result.getDevicesCount()).isEqualTo(1);
     assertEquals(SAMPLE_KEY, result.getDevice(SAMPLE_DEVICE_ID).getPreKey());
     assertEquals(SAMPLE_PQ_KEY, result.getDevice(SAMPLE_DEVICE_ID).getPqPreKey());
@@ -329,7 +337,7 @@ class KeysControllerTest {
         .header("Authorization", AuthHelper.getAuthHeader(AuthHelper.VALID_UUID, AuthHelper.VALID_PASSWORD))
         .get(PreKeyResponse.class);
 
-    assertThat(result.getIdentityKey()).isEqualTo(existsAccount.getIdentityKey(IdentityType.PNI));
+    assertThat(result.getIdentityKey()).isEqualTo(existsAccount.getPhoneNumberIdentityKey().orElseThrow());
     assertThat(result.getDevicesCount()).isEqualTo(1);
     assertEquals(SAMPLE_KEY_PNI, result.getDevice(SAMPLE_DEVICE_ID).getPreKey());
     assertThat(result.getDevice(SAMPLE_DEVICE_ID).getPqPreKey()).isEqualTo(SAMPLE_PQ_KEY_PNI);
@@ -349,7 +357,7 @@ class KeysControllerTest {
         .header("Authorization", AuthHelper.getAuthHeader(AuthHelper.VALID_UUID, AuthHelper.VALID_PASSWORD))
         .get(PreKeyResponse.class);
 
-    assertThat(result.getIdentityKey()).isEqualTo(existsAccount.getIdentityKey(IdentityType.PNI));
+    assertThat(result.getIdentityKey()).isEqualTo(existsAccount.getPhoneNumberIdentityKey().orElseThrow());
     assertThat(result.getDevicesCount()).isEqualTo(1);
     assertEquals(SAMPLE_KEY_PNI, result.getDevice(SAMPLE_DEVICE_ID).getPreKey());
     assertThat(result.getDevice(SAMPLE_DEVICE_ID).getPqPreKey()).isEqualTo(SAMPLE_PQ_KEY_PNI);
@@ -371,8 +379,16 @@ class KeysControllerTest {
         .header("Authorization", AuthHelper.getAuthHeader(AuthHelper.VALID_UUID, AuthHelper.VALID_PASSWORD))
         .get();
 
+    final String expectedRatelimitKey = String.format("%s.%s__%s.%s.%s",
+        AuthHelper.VALID_UUID,
+        AuthHelper.VALID_DEVICE.getId(),
+        EXISTS_PNI,
+        "*",
+        "*");
+
     assertThat(result.getStatus()).isEqualTo(429);
     assertThat(result.getHeaderString("Retry-After")).isEqualTo(String.valueOf(retryAfter.toSeconds()));
+    verify(rateLimiter).validate(expectedRatelimitKey);
   }
 
   @Test
@@ -381,10 +397,10 @@ class KeysControllerTest {
         .target(String.format("/v2/keys/%s/1", EXISTS_UUID))
         .queryParam("pq", "true")
         .request()
-        .header(HeaderUtils.UNIDENTIFIED_ACCESS_KEY, AuthHelper.getUnidentifiedAccessHeader("1337".getBytes()))
+        .header(HeaderUtils.UNIDENTIFIED_ACCESS_KEY, AuthHelper.getUnidentifiedAccessHeader(EXISTS_UAK))
         .get(PreKeyResponse.class);
 
-    assertThat(result.getIdentityKey()).isEqualTo(existsAccount.getIdentityKey(IdentityType.ACI));
+    assertThat(result.getIdentityKey()).isEqualTo(existsAccount.getAccountIdentityKey());
     assertThat(result.getDevicesCount()).isEqualTo(1);
     assertEquals(SAMPLE_KEY, result.getDevice(SAMPLE_DEVICE_ID).getPreKey());
     assertEquals(SAMPLE_PQ_KEY, result.getDevice(SAMPLE_DEVICE_ID).getPqPreKey());
@@ -440,7 +456,7 @@ class KeysControllerTest {
         .header(HeaderUtils.GROUP_SEND_TOKEN, AuthHelper.validGroupSendTokenHeader(serverSecretParams, List.of(authorizedTarget), expiration));
 
     if (includeUak) {
-      builder = builder.header(HeaderUtils.UNIDENTIFIED_ACCESS_KEY, AuthHelper.getUnidentifiedAccessHeader("1337".getBytes()));
+      builder = builder.header(HeaderUtils.UNIDENTIFIED_ACCESS_KEY, AuthHelper.getUnidentifiedAccessHeader(EXISTS_UAK));
     }
 
     Response response = builder.get();
@@ -449,7 +465,7 @@ class KeysControllerTest {
     if (expectedResponse == 200) {
       PreKeyResponse result = response.readEntity(PreKeyResponse.class);
 
-      assertThat(result.getIdentityKey()).isEqualTo(existsAccount.getIdentityKey(IdentityType.ACI));
+      assertThat(result.getIdentityKey()).isEqualTo(existsAccount.getAccountIdentityKey());
       assertThat(result.getDevicesCount()).isEqualTo(1);
       assertEquals(SAMPLE_KEY, result.getDevice(SAMPLE_DEVICE_ID).getPreKey());
       assertEquals(SAMPLE_PQ_KEY, result.getDevice(SAMPLE_DEVICE_ID).getPqPreKey());
@@ -493,7 +509,7 @@ class KeysControllerTest {
     Response result = resources.getJerseyTest()
         .target(String.format("/v2/keys/%s/*", EXISTS_UUID))
         .request()
-        .header(HeaderUtils.UNIDENTIFIED_ACCESS_KEY, AuthHelper.getUnidentifiedAccessHeader("1337".getBytes()))
+        .header(HeaderUtils.UNIDENTIFIED_ACCESS_KEY, AuthHelper.getUnidentifiedAccessHeader(EXISTS_UAK))
         .get();
 
     assertThat(result).isNotNull();
@@ -505,7 +521,7 @@ class KeysControllerTest {
     Response response = resources.getJerseyTest()
                                      .target(String.format("/v2/keys/%s/1", EXISTS_UUID))
                                      .request()
-                                     .header(HeaderUtils.UNIDENTIFIED_ACCESS_KEY, AuthHelper.getUnidentifiedAccessHeader("9999".getBytes()))
+                                     .header(HeaderUtils.UNIDENTIFIED_ACCESS_KEY, AuthHelper.getUnidentifiedAccessHeader(Arrays.copyOf("9999".getBytes(), UnidentifiedAccessUtil.UNIDENTIFIED_ACCESS_KEY_LENGTH)))
                                      .get();
 
     assertThat(response.getStatus()).isEqualTo(401);
@@ -556,14 +572,20 @@ class KeysControllerTest {
         .get(PreKeyResponse.class);
 
     assertThat(results.getDevicesCount()).isEqualTo(4);
-    assertThat(results.getIdentityKey()).isEqualTo(existsAccount.getIdentityKey(identityType));
+    assertThat(results.getIdentityKey()).isEqualTo(switch (identityType) {
+      case ACI -> existsAccount.getAccountIdentityKey();
+      case PNI -> existsAccount.getPhoneNumberIdentityKey().orElseThrow();
+    });
 
     for (int i = 0; i < 4; i++) {
       final PreKeyResponseItem result = results.getDevice((byte) i);
       final KeysManager.DevicePreKeys expectedPreKeys = devicePreKeys.get(i);
       final Device expectedDevice = devices.get(i);
 
-      assertEquals(expectedDevice.getRegistrationId(identityType), result.getRegistrationId());
+      assertEquals(switch (identityType) {
+        case ACI -> expectedDevice.getAccountRegistrationId();
+        case PNI -> (int) expectedDevice.getPhoneNumberIdentityRegistrationId().orElseThrow();
+      }, result.getRegistrationId());
       assertEquals(expectedPreKeys.ecPreKey().orElseThrow(), result.getPreKey());
       assertEquals(expectedPreKeys.ecSignedPreKey(), result.getSignedPreKey());
       assertEquals(expectedPreKeys.kemSignedPreKey(), result.getPqPreKey());
@@ -830,6 +852,23 @@ class KeysControllerTest {
   }
 
   @Test
+  void putKeysNoPhoneNumberTest() {
+    final ECPreKey preKey = KeysHelper.ecPreKey(31337);
+    final ECSignedPreKey signedPreKey = KeysHelper.signedECPreKey(31338, AuthHelper.VALID_PNI_IDENTITY_KEY_PAIR);
+
+    final SetKeysRequest setKeysRequest = new SetKeysRequest(List.of(preKey), signedPreKey, null, null);
+    final Response response =
+        resources.getJerseyTest()
+            .target("/v2/keys")
+            .queryParam("identity", "pni")
+            .request()
+            .header("Authorization", AuthHelper.getAuthHeader(AuthHelper.NUMBERLESS_UUID, AuthHelper.NUMBERLESS_PASSWORD))
+            .put(Entity.entity(setKeysRequest, MediaType.APPLICATION_JSON_TYPE));
+
+    assertThat(response.getStatus()).isEqualTo(400);
+  }
+
+  @Test
   void putKeysByPhoneNumberIdentifierPqTestV2() {
     final ECPreKey preKey = KeysHelper.ecPreKey(31337);
     final ECSignedPreKey signedPreKey = KeysHelper.signedECPreKey(31338, AuthHelper.VALID_PNI_IDENTITY_KEY_PAIR);
@@ -1032,6 +1071,37 @@ class KeysControllerTest {
             .post(Entity.entity(new CheckKeysRequest(IdentityType.ACI, new byte[33]), MediaType.APPLICATION_JSON_TYPE))) {
 
       assertEquals(422, response.getStatus());
+    }
+  }
+
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  void checkKeysPni(final boolean hasE164) throws NoSuchAlgorithmException {
+    final ECSignedPreKey ecSignedPreKey = KeysHelper.signedECPreKey(17, AuthHelper.VALID_PNI_IDENTITY_KEY_PAIR);
+    final KEMSignedPreKey lastResortKey = KeysHelper.signedKEMPreKey(19, AuthHelper.VALID_PNI_IDENTITY_KEY_PAIR);
+
+    if (hasE164) {
+      when(KEYS.getEcSignedPreKey(AuthHelper.VALID_PNI, Device.PRIMARY_ID))
+          .thenReturn(CompletableFuture.completedFuture(Optional.of(ecSignedPreKey)));
+
+      when(KEYS.getLastResort(AuthHelper.VALID_PNI, Device.PRIMARY_ID))
+          .thenReturn(CompletableFuture.completedFuture(Optional.of(lastResortKey)));
+    }
+
+    final UUID accountIdentifier = hasE164 ? AuthHelper.VALID_UUID : AuthHelper.NUMBERLESS_UUID;
+    final String password = hasE164 ? AuthHelper.VALID_PASSWORD : AuthHelper.NUMBERLESS_PASSWORD;
+
+    final CheckKeysRequest checkKeysRequest =
+        new CheckKeysRequest(IdentityType.PNI, getKeyDigest(AuthHelper.VALID_PNI_IDENTITY, ecSignedPreKey, lastResortKey));
+
+    try (final Response response =
+        resources.getJerseyTest()
+            .target("/v2/keys/check")
+            .request()
+            .header("Authorization", AuthHelper.getAuthHeader(accountIdentifier, password))
+            .post(Entity.entity(checkKeysRequest, MediaType.APPLICATION_JSON_TYPE))) {
+
+      assertEquals(hasE164 ? 200 : 400, response.getStatus());
     }
   }
 }

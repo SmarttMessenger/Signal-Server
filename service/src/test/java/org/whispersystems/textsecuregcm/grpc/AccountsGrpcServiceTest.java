@@ -5,80 +5,162 @@
 
 package org.whispersystems.textsecuregcm.grpc;
 
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.anyBoolean;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.google.i18n.phonenumbers.PhoneNumberUtil;
 import com.google.protobuf.ByteString;
+import com.google.protobuf.Empty;
+import com.webauthn4j.data.attestation.authenticator.AAGUID;
+import com.webauthn4j.data.attestation.authenticator.AttestedCredentialData;
+import com.webauthn4j.data.attestation.statement.COSEAlgorithmIdentifier;
+import com.webauthn4j.test.TestDataUtil;
 import io.grpc.Status;
+import java.io.IOException;
 import java.time.Duration;
+import java.time.Instant;
+import java.util.Collections;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
-import java.util.concurrent.CompletableFuture;
-import java.util.function.Consumer;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.ArgumentsSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.signal.chat.account.AccountsGrpc;
+import org.signal.chat.account.Capabilities;
+import org.signal.chat.account.ChangeNumberRequest;
+import org.signal.chat.account.ChangeNumberResponse;
 import org.signal.chat.account.ClearRegistrationLockRequest;
 import org.signal.chat.account.ClearRegistrationLockResponse;
 import org.signal.chat.account.ConfigureUnidentifiedAccessRequest;
+import org.signal.chat.account.ConfirmTotpKeyRequest;
+import org.signal.chat.account.ConfirmTotpKeyResponse;
 import org.signal.chat.account.ConfirmUsernameHashRequest;
 import org.signal.chat.account.ConfirmUsernameHashResponse;
 import org.signal.chat.account.DeleteAccountRequest;
 import org.signal.chat.account.DeleteAccountResponse;
 import org.signal.chat.account.DeleteUsernameHashRequest;
 import org.signal.chat.account.DeleteUsernameLinkRequest;
+import org.signal.chat.account.ExternalServiceCredentials;
+import org.signal.chat.account.FinishMfaVerificationRequest;
+import org.signal.chat.account.FinishMfaVerificationResponse;
+import org.signal.chat.account.FinishWebAuthnRegistrationRequest;
+import org.signal.chat.account.FinishWebAuthnRegistrationResponse;
+import org.signal.chat.account.GenerateTotpKeyRequest;
+import org.signal.chat.account.GenerateTotpKeyResponse;
+import org.signal.chat.account.GetAccountDataReportRequest;
+import org.signal.chat.account.GetAccountDataReportResponse;
 import org.signal.chat.account.GetAccountIdentityRequest;
 import org.signal.chat.account.GetAccountIdentityResponse;
-import org.signal.chat.account.ReserveUsernameHashError;
-import org.signal.chat.account.ReserveUsernameHashErrorType;
+import org.signal.chat.account.GetCapabilitiesRequest;
+import org.signal.chat.account.GetCapabilitiesResponse;
+import org.signal.chat.account.GetEntitlementsRequest;
+import org.signal.chat.account.GetEntitlementsResponse;
+import org.signal.chat.account.ListMfaKeysRequest;
+import org.signal.chat.account.ListMfaKeysResponse;
+import org.signal.chat.account.ListMfaKeysResponse.MfaKeyMetadata.MfaKeyType;
+import org.signal.chat.account.RegistrationLockFailure;
+import org.signal.chat.account.RemoveMfaKeyRequest;
 import org.signal.chat.account.ReserveUsernameHashRequest;
 import org.signal.chat.account.ReserveUsernameHashResponse;
 import org.signal.chat.account.SetDiscoverableByPhoneNumberRequest;
+import org.signal.chat.account.SetMfaKeyMetadataRequest;
+import org.signal.chat.account.SetMfaKeyMetadataResponse;
 import org.signal.chat.account.SetRegistrationLockRequest;
 import org.signal.chat.account.SetRegistrationLockResponse;
 import org.signal.chat.account.SetRegistrationRecoveryPasswordRequest;
 import org.signal.chat.account.SetUsernameLinkRequest;
 import org.signal.chat.account.SetUsernameLinkResponse;
+import org.signal.chat.account.SetZkCredentialKeyRequest;
+import org.signal.chat.account.SetZkCredentialKeyResponse;
+import org.signal.chat.account.StaleDevices;
+import org.signal.chat.account.StartMfaVerificationRequest;
+import org.signal.chat.account.StartMfaVerificationResponse;
+import org.signal.chat.account.StartWebAuthnRegistrationRequest;
+import org.signal.chat.account.StartWebAuthnRegistrationResponse;
+import org.signal.chat.account.UsernameNotAvailable;
 import org.signal.chat.common.AccountIdentifiers;
+import org.signal.chat.common.EcSignedPreKey;
+import org.signal.chat.common.KemSignedPreKey;
+import org.signal.chat.errors.FailedPrecondition;
+import org.signal.libsignal.protocol.IdentityKey;
+import org.signal.libsignal.protocol.ecc.ECKeyPair;
 import org.signal.libsignal.usernames.BaseUsernameException;
+import org.signal.libsignal.zkgroup.ZkCredentialKeyPair;
+import org.signal.libsignal.zkgroup.ZkCredentialPublicKey;
+import org.whispersystems.textsecuregcm.auth.InvalidRegistrationSessionException;
+import org.whispersystems.textsecuregcm.auth.RecoveryPasswordVerificationFailedException;
+import org.whispersystems.textsecuregcm.auth.RegistrationLockFailureException;
 import org.whispersystems.textsecuregcm.auth.SaltedTokenHash;
 import org.whispersystems.textsecuregcm.auth.UnidentifiedAccessUtil;
+import org.whispersystems.textsecuregcm.auth.UnverifiedRegistrationSessionException;
+import org.whispersystems.textsecuregcm.auth.webauthn.AuthenticationCeremonyParameters;
+import org.whispersystems.textsecuregcm.auth.webauthn.RegistrationCeremonyParameters;
 import org.whispersystems.textsecuregcm.controllers.AccountController;
+import org.whispersystems.textsecuregcm.controllers.MessageDeliveryNotAllowedException;
+import org.whispersystems.textsecuregcm.controllers.MismatchedDevices;
+import org.whispersystems.textsecuregcm.controllers.MismatchedDevicesException;
 import org.whispersystems.textsecuregcm.controllers.RateLimitExceededException;
+import org.whispersystems.textsecuregcm.entities.ECSignedPreKey;
 import org.whispersystems.textsecuregcm.entities.EncryptedUsername;
+import org.whispersystems.textsecuregcm.entities.KEMSignedPreKey;
 import org.whispersystems.textsecuregcm.identity.AciServiceIdentifier;
-import org.whispersystems.textsecuregcm.identity.IdentityType;
 import org.whispersystems.textsecuregcm.identity.PniServiceIdentifier;
 import org.whispersystems.textsecuregcm.limits.RateLimiter;
 import org.whispersystems.textsecuregcm.limits.RateLimiters;
+import org.whispersystems.textsecuregcm.push.MessageTooLargeException;
 import org.whispersystems.textsecuregcm.storage.Account;
+import org.whispersystems.textsecuregcm.storage.AccountBadge;
+import org.whispersystems.textsecuregcm.storage.AccountNotFoundException;
 import org.whispersystems.textsecuregcm.storage.AccountsManager;
+import org.whispersystems.textsecuregcm.storage.AnnotatedMfaKey;
+import org.whispersystems.textsecuregcm.storage.AnnotatedTotpKey;
+import org.whispersystems.textsecuregcm.storage.AnnotatedWebAuthnCredential;
+import org.whispersystems.textsecuregcm.storage.ChangeNumberManager;
 import org.whispersystems.textsecuregcm.storage.Device;
-import org.whispersystems.textsecuregcm.storage.RegistrationRecoveryPasswordsManager;
+import org.whispersystems.textsecuregcm.storage.DeviceCapability;
+import org.whispersystems.textsecuregcm.storage.KeyIdUtil;
+import org.whispersystems.textsecuregcm.storage.PhoneNumberRecoveryPasswordsManager;
+import org.whispersystems.textsecuregcm.storage.TooManyMfaKeysException;
+import org.whispersystems.textsecuregcm.storage.TooManyTotpKeysException;
+import org.whispersystems.textsecuregcm.storage.TotpKey;
+import org.whispersystems.textsecuregcm.storage.TotpManager;
 import org.whispersystems.textsecuregcm.storage.UsernameHashNotAvailableException;
 import org.whispersystems.textsecuregcm.storage.UsernameReservationNotFoundException;
+import org.whispersystems.textsecuregcm.tests.util.AccountsHelper;
+import org.whispersystems.textsecuregcm.tests.util.AccountsTestHelper;
+import org.whispersystems.textsecuregcm.tests.util.KeysHelper;
+import org.whispersystems.textsecuregcm.util.TestClock;
 import org.whispersystems.textsecuregcm.util.TestRandomUtil;
 import org.whispersystems.textsecuregcm.util.UUIDUtil;
 import org.whispersystems.textsecuregcm.util.UsernameHashZkProofVerifier;
-import reactor.core.publisher.Mono;
+import software.amazon.awssdk.services.dynamodb.model.TransactWriteItem;
 
 class AccountsGrpcServiceTest extends SimpleBaseGrpcTest<AccountsGrpcService, AccountsGrpc.AccountsBlockingStub> {
 
@@ -92,99 +174,110 @@ class AccountsGrpcServiceTest extends SimpleBaseGrpcTest<AccountsGrpcService, Ac
   private UsernameHashZkProofVerifier usernameHashZkProofVerifier;
 
   @Mock
-  private RegistrationRecoveryPasswordsManager registrationRecoveryPasswordsManager;
+  private PhoneNumberRecoveryPasswordsManager phoneNumberRecoveryPasswordsManager;
+
+  private final TestClock testClock = TestClock.pinned(Instant.now());
+
+  @Mock
+  private ChangeNumberManager changeNumberManager;
+
+  private static final org.whispersystems.textsecuregcm.storage.TotpParameters TOTP_PARAMETERS =
+      new org.whispersystems.textsecuregcm.storage.TotpParameters(
+          TotpManager.TOTP.getAlgorithm(),
+          TotpManager.TOTP.getPasswordLength(),
+          TotpManager.TOTP.getTimeStep());
+
+  private static final int MFA_KEY_METADATA_SIZE = 160;
 
   @Override
   protected AccountsGrpcService createServiceBeforeEachTest() {
-    when(accountsManager.updateAsync(any(), any()))
-        .thenAnswer(invocation -> {
-          final Account account = invocation.getArgument(0);
-          final Consumer<Account> updater = invocation.getArgument(1);
-
-          updater.accept(account);
-
-          return CompletableFuture.completedFuture(account);
-        });
+    AccountsHelper.setupMockUpdate(accountsManager);
 
     final RateLimiters rateLimiters = mock(RateLimiters.class);
     when(rateLimiters.getUsernameReserveLimiter()).thenReturn(rateLimiter);
     when(rateLimiters.getUsernameSetLimiter()).thenReturn(rateLimiter);
     when(rateLimiters.getUsernameLinkOperationLimiter()).thenReturn(rateLimiter);
-
-    when(rateLimiter.validateReactive(any(UUID.class))).thenReturn(Mono.empty());
-    when(rateLimiter.validateReactive(anyString())).thenReturn(Mono.empty());
-
-    when(registrationRecoveryPasswordsManager.store(any(), any()))
-        .thenReturn(CompletableFuture.completedFuture(null));
+    when(rateLimiters.getCheckMfaLimiter()).thenReturn(rateLimiter);
+    when(rateLimiters.getSetZkCredentialKeyLimiter()).thenReturn(rateLimiter);
 
     return new AccountsGrpcService(accountsManager,
         rateLimiters,
         usernameHashZkProofVerifier,
-        registrationRecoveryPasswordsManager);
+        phoneNumberRecoveryPasswordsManager,
+        testClock,
+        changeNumberManager);
   }
 
-  @Test
-  void getAccountIdentity() {
-    final UUID phoneNumberIdentifier = UUID.randomUUID();
-    final String e164 = PhoneNumberUtil.getInstance().format(
-        PhoneNumberUtil.getInstance().getExampleNumber("US"), PhoneNumberUtil.PhoneNumberFormat.E164);
-
+  @ParameterizedTest
+  @ValueSource(booleans = {true, false})
+  void getAuthenticatedAccountIdentity(final boolean hasPhoneNumber) {
     final byte[] usernameHash = TestRandomUtil.nextBytes(32);
+    final UUID usernameLinkHandle = UUID.randomUUID();
 
     final Account account = mock(Account.class);
-    when(account.getUuid()).thenReturn(AUTHENTICATED_ACI);
-    when(account.getPhoneNumberIdentifier()).thenReturn(phoneNumberIdentifier);
-    when(account.getNumber()).thenReturn(e164);
+    when(account.getAccountIdentifier()).thenReturn(AUTHENTICATED_ACI);
     when(account.getUsernameHash()).thenReturn(Optional.of(usernameHash));
+    when(account.getUsernameLinkHandle()).thenReturn(usernameLinkHandle);
 
-    when(accountsManager.getByAccountIdentifierAsync(AUTHENTICATED_ACI))
-        .thenReturn(CompletableFuture.completedFuture(Optional.of(account)));
+    final AccountIdentifiers.Builder expectedIdentifiersBuilder = AccountIdentifiers.newBuilder()
+        .addServiceIdentifiers(GrpcServiceIdentifierUtil.toGrpcServiceIdentifier(new AciServiceIdentifier(AUTHENTICATED_ACI)))
+        .setUsernameHash(ByteString.copyFrom(usernameHash))
+        .setUsernameLinkHandle(UUIDUtil.toByteString(usernameLinkHandle));
+
+    if (hasPhoneNumber) {
+      final UUID phoneNumberIdentifier = UUID.randomUUID();
+      final String e164 = PhoneNumberUtil.getInstance().format(
+          PhoneNumberUtil.getInstance().getExampleNumber("US"), PhoneNumberUtil.PhoneNumberFormat.E164);
+
+      expectedIdentifiersBuilder
+          .addServiceIdentifiers(GrpcServiceIdentifierUtil.toGrpcServiceIdentifier(new PniServiceIdentifier(phoneNumberIdentifier)))
+          .setE164(e164);
+
+      when(account.getPhoneNumberIdentifier()).thenReturn(Optional.of(phoneNumberIdentifier));
+      when(account.getNumber()).thenReturn(Optional.of(e164));
+    } else {
+      when(account.getPhoneNumberIdentifier()).thenReturn(Optional.empty());
+      when(account.getNumber()).thenReturn(Optional.empty());
+    }
+
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
+        .thenReturn(Optional.of(account));
 
     final GetAccountIdentityResponse expectedResponse = GetAccountIdentityResponse.newBuilder()
-        .setAccountIdentifiers(AccountIdentifiers.newBuilder()
-            .addServiceIdentifiers(ServiceIdentifierUtil.toGrpcServiceIdentifier(new AciServiceIdentifier(AUTHENTICATED_ACI)))
-            .addServiceIdentifiers(ServiceIdentifierUtil.toGrpcServiceIdentifier(new PniServiceIdentifier(phoneNumberIdentifier)))
-            .setE164(e164)
-            .setUsernameHash(ByteString.copyFrom(usernameHash))
-            .build())
+        .setAccountIdentifiers(expectedIdentifiersBuilder.build())
         .build();
 
     assertEquals(expectedResponse, authenticatedServiceStub().getAccountIdentity(GetAccountIdentityRequest.newBuilder().build()));
   }
 
+
   @Test
   void deleteAccount() {
-    final Account account = mock(Account.class);
-
-    when(accountsManager.getByAccountIdentifierAsync(AUTHENTICATED_ACI))
-        .thenReturn(CompletableFuture.completedFuture(Optional.of(account)));
-
-    when(accountsManager.delete(any(), any()))
-        .thenReturn(CompletableFuture.completedFuture(null));
-
     final DeleteAccountResponse ignored =
         authenticatedServiceStub().deleteAccount(DeleteAccountRequest.newBuilder().build());
 
-    verify(accountsManager).delete(account, AccountsManager.DeletionReason.USER_REQUEST);
+    verify(accountsManager).delete(AUTHENTICATED_ACI, AccountsManager.DeletionReason.USER_REQUEST);
   }
 
   @Test
   void deleteAccountLinkedDevice() {
     getMockAuthenticationInterceptor().setAuthenticatedDevice(AUTHENTICATED_ACI, (byte) (Device.PRIMARY_ID + 1));
 
-    //noinspection ResultOfMethodCallIgnored
-    GrpcTestUtils.assertStatusException(Status.PERMISSION_DENIED,
-        () -> authenticatedServiceStub().deleteAccount(DeleteAccountRequest.newBuilder().build()));
+    final DeleteAccountResponse ignored =
+        authenticatedServiceStub().deleteAccount(DeleteAccountRequest.newBuilder().build());
 
-    verify(accountsManager, never()).delete(any(), any());
+    verify(accountsManager).delete(AUTHENTICATED_ACI, AccountsManager.DeletionReason.USER_REQUEST);
   }
 
-  @Test
-  void setRegistrationLock() {
+  @ParameterizedTest
+  @ValueSource(bytes = { Device.PRIMARY_ID, Device.PRIMARY_ID + 1 })
+  void setRegistrationLock(final byte deviceId) {
+    getMockAuthenticationInterceptor().setAuthenticatedDevice(AUTHENTICATED_ACI, deviceId);
+
     final Account account = mock(Account.class);
 
-    when(accountsManager.getByAccountIdentifierAsync(AUTHENTICATED_ACI))
-        .thenReturn(CompletableFuture.completedFuture(Optional.of(account)));
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
+        .thenReturn(Optional.of(account));
 
     final byte[] registrationLockSecret = TestRandomUtil.nextBytes(32);
 
@@ -204,32 +297,41 @@ class AccountsGrpcServiceTest extends SimpleBaseGrpcTest<AccountsGrpcService, Ac
 
   @Test
   void setRegistrationLockEmptySecret() {
-    //noinspection ResultOfMethodCallIgnored
     GrpcTestUtils.assertStatusException(Status.INVALID_ARGUMENT,
         () -> authenticatedServiceStub().setRegistrationLock(SetRegistrationLockRequest.newBuilder()
             .build()));
 
-    verify(accountsManager, never()).updateAsync(any(), any());
+    verify(accountsManager, never()).update(any(UUID.class), any());
   }
 
   @Test
-  void setRegistrationLockLinkedDevice() {
-    getMockAuthenticationInterceptor().setAuthenticatedDevice(AUTHENTICATED_ACI, (byte) (Device.PRIMARY_ID + 1));
+  void setRegistrationLockAccountHasNoNumber() {
+    getMockAuthenticationInterceptor().setAuthenticatedDevice(AUTHENTICATED_ACI, Device.PRIMARY_ID);
 
-    //noinspection ResultOfMethodCallIgnored
-    GrpcTestUtils.assertStatusException(Status.PERMISSION_DENIED,
-        () -> authenticatedServiceStub().setRegistrationLock(SetRegistrationLockRequest.newBuilder()
-            .build()));
-
-    verify(accountsManager, never()).updateAsync(any(), any());
-  }
-
-  @Test
-  void clearRegistrationLock() {
     final Account account = mock(Account.class);
 
-    when(accountsManager.getByAccountIdentifierAsync(AUTHENTICATED_ACI))
-        .thenReturn(CompletableFuture.completedFuture(Optional.of(account)));
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
+        .thenReturn(Optional.of(account));
+
+    final String message = "no phone number";
+    doThrow(new IllegalArgumentException(message)).when(account).setRegistrationLock(any(), any());
+
+    final byte[] registrationLockSecret = TestRandomUtil.nextBytes(32);
+    GrpcTestUtils.assertStatusException(Status.INVALID_ARGUMENT,
+        () -> authenticatedServiceStub().setRegistrationLock(SetRegistrationLockRequest.newBuilder()
+        .setRegistrationLock(ByteString.copyFrom(registrationLockSecret))
+        .build()));
+  }
+
+  @ParameterizedTest
+  @ValueSource(bytes = { Device.PRIMARY_ID, Device.PRIMARY_ID + 1 })
+  void clearRegistrationLock(final byte deviceId) {
+    getMockAuthenticationInterceptor().setAuthenticatedDevice(AUTHENTICATED_ACI, deviceId);
+
+    final Account account = mock(Account.class);
+
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
+        .thenReturn(Optional.of(account));
 
     final ClearRegistrationLockResponse ignored =
         authenticatedServiceStub().clearRegistrationLock(ClearRegistrationLockRequest.newBuilder().build());
@@ -238,22 +340,12 @@ class AccountsGrpcServiceTest extends SimpleBaseGrpcTest<AccountsGrpcService, Ac
   }
 
   @Test
-  void clearRegistrationLockLinkedDevice() {
-    getMockAuthenticationInterceptor().setAuthenticatedDevice(AUTHENTICATED_ACI, (byte) (Device.PRIMARY_ID + 1));
-
-    //noinspection ResultOfMethodCallIgnored
-    GrpcTestUtils.assertStatusException(Status.PERMISSION_DENIED,
-        () -> authenticatedServiceStub().clearRegistrationLock(ClearRegistrationLockRequest.newBuilder().build()));
-
-    verify(accountsManager, never()).updateAsync(any(), any());
-  }
-
-  @Test
-  void reserveUsernameHash() {
+  void reserveUsernameHash() throws UsernameHashNotAvailableException {
     final Account account = mock(Account.class);
+    when(account.getAccountIdentifier()).thenReturn(AUTHENTICATED_ACI);
 
-    when(accountsManager.getByAccountIdentifierAsync(AUTHENTICATED_ACI))
-        .thenReturn(CompletableFuture.completedFuture(Optional.of(account)));
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
+        .thenReturn(Optional.of(account));
 
     final byte[] usernameHash = TestRandomUtil.nextBytes(AccountController.USERNAME_HASH_LENGTH);
 
@@ -261,8 +353,7 @@ class AccountsGrpcServiceTest extends SimpleBaseGrpcTest<AccountsGrpcService, Ac
         .thenAnswer(invocation -> {
           final List<byte[]> usernameHashes = invocation.getArgument(1);
 
-          return CompletableFuture.completedFuture(
-              new AccountsManager.UsernameReservation(invocation.getArgument(0), usernameHashes.getFirst()));
+          return new AccountsManager.UsernameReservation(accountsManager.getByAccountIdentifier(invocation.getArgument(0)).orElseThrow(), usernameHashes.getFirst());
         });
 
     final ReserveUsernameHashResponse expectedResponse = ReserveUsernameHashResponse.newBuilder()
@@ -276,21 +367,19 @@ class AccountsGrpcServiceTest extends SimpleBaseGrpcTest<AccountsGrpcService, Ac
   }
 
   @Test
-  void reserveUsernameHashNotAvailable() {
+  void reserveUsernameHashNotAvailable() throws UsernameHashNotAvailableException {
     final Account account = mock(Account.class);
 
-    when(accountsManager.getByAccountIdentifierAsync(AUTHENTICATED_ACI))
-        .thenReturn(CompletableFuture.completedFuture(Optional.of(account)));
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
+        .thenReturn(Optional.of(account));
 
     final byte[] usernameHash = TestRandomUtil.nextBytes(AccountController.USERNAME_HASH_LENGTH);
 
     when(accountsManager.reserveUsernameHash(any(), any()))
-        .thenReturn(CompletableFuture.failedFuture(new UsernameHashNotAvailableException()));
+        .thenThrow(new UsernameHashNotAvailableException());
 
     final ReserveUsernameHashResponse expectedResponse = ReserveUsernameHashResponse.newBuilder()
-        .setError(ReserveUsernameHashError.newBuilder()
-            .setErrorType(ReserveUsernameHashErrorType.RESERVE_USERNAME_HASH_ERROR_TYPE_NO_HASHES_AVAILABLE)
-            .build())
+        .setUsernameNotAvailable(UsernameNotAvailable.getDefaultInstance())
         .build();
 
     assertEquals(expectedResponse,
@@ -301,7 +390,6 @@ class AccountsGrpcServiceTest extends SimpleBaseGrpcTest<AccountsGrpcService, Ac
 
   @Test
   void reserveUsernameHashNoHashes() {
-    //noinspection ResultOfMethodCallIgnored
     GrpcTestUtils.assertStatusException(Status.INVALID_ARGUMENT,
         () -> authenticatedServiceStub().reserveUsernameHash(ReserveUsernameHashRequest.newBuilder().build()));
   }
@@ -315,7 +403,6 @@ class AccountsGrpcServiceTest extends SimpleBaseGrpcTest<AccountsGrpcService, Ac
       requestBuilder.addUsernameHashes(ByteString.copyFrom(usernameHash));
     }
 
-    //noinspection ResultOfMethodCallIgnored
     GrpcTestUtils.assertStatusException(Status.INVALID_ARGUMENT,
         () -> authenticatedServiceStub().reserveUsernameHash(requestBuilder.build()));
   }
@@ -324,12 +411,11 @@ class AccountsGrpcServiceTest extends SimpleBaseGrpcTest<AccountsGrpcService, Ac
   void reserveUsernameHashBadHashLength() {
     final Account account = mock(Account.class);
 
-    when(accountsManager.getByAccountIdentifierAsync(AUTHENTICATED_ACI))
-        .thenReturn(CompletableFuture.completedFuture(Optional.of(account)));
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
+        .thenReturn(Optional.of(account));
 
     final byte[] usernameHash = TestRandomUtil.nextBytes(AccountController.USERNAME_HASH_LENGTH + 1);
 
-    //noinspection ResultOfMethodCallIgnored
     GrpcTestUtils.assertStatusException(Status.INVALID_ARGUMENT,
         () -> authenticatedServiceStub().reserveUsernameHash(ReserveUsernameHashRequest.newBuilder()
             .addUsernameHashes(ByteString.copyFrom(usernameHash))
@@ -337,13 +423,13 @@ class AccountsGrpcServiceTest extends SimpleBaseGrpcTest<AccountsGrpcService, Ac
   }
 
   @Test
-  void reserveUsernameHashRateLimited() {
+  void reserveUsernameHashRateLimited() throws RateLimitExceededException {
     final byte[] usernameHash = TestRandomUtil.nextBytes(AccountController.USERNAME_HASH_LENGTH);
 
     final Duration retryAfter = Duration.ofMinutes(3);
 
-    when(rateLimiter.validateReactive(any(UUID.class)))
-        .thenReturn(Mono.error(new RateLimitExceededException(retryAfter)));
+    doThrow(new RateLimitExceededException(retryAfter))
+        .when(rateLimiter).validate(any(UUID.class));
 
     //noinspection ResultOfMethodCallIgnored
     GrpcTestUtils.assertRateLimitExceeded(retryAfter,
@@ -354,7 +440,7 @@ class AccountsGrpcServiceTest extends SimpleBaseGrpcTest<AccountsGrpcService, Ac
   }
 
   @Test
-  void confirmUsernameHash() {
+  void confirmUsernameHash() throws UsernameHashNotAvailableException, UsernameReservationNotFoundException {
     final byte[] usernameHash = TestRandomUtil.nextBytes(AccountController.USERNAME_HASH_LENGTH);
 
     final byte[] usernameCiphertext = TestRandomUtil.nextBytes(32);
@@ -365,22 +451,23 @@ class AccountsGrpcServiceTest extends SimpleBaseGrpcTest<AccountsGrpcService, Ac
 
     final Account account = mock(Account.class);
 
-    when(accountsManager.getByAccountIdentifierAsync(AUTHENTICATED_ACI))
-        .thenReturn(CompletableFuture.completedFuture(Optional.of(account)));
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
+        .thenReturn(Optional.of(account));
 
-    when(accountsManager.confirmReservedUsernameHash(account, usernameHash, usernameCiphertext))
-        .thenAnswer(invocation -> {
+    when(accountsManager.confirmReservedUsernameHash(AUTHENTICATED_ACI, usernameHash, usernameCiphertext))
+        .thenAnswer(_ -> {
           final Account updatedAccount = mock(Account.class);
 
           when(updatedAccount.getUsernameHash()).thenReturn(Optional.of(usernameHash));
           when(updatedAccount.getUsernameLinkHandle()).thenReturn(linkHandle);
 
-          return CompletableFuture.completedFuture(updatedAccount);
+          return updatedAccount;
         });
 
     final ConfirmUsernameHashResponse expectedResponse = ConfirmUsernameHashResponse.newBuilder()
-        .setUsernameHash(ByteString.copyFrom(usernameHash))
-        .setUsernameLinkHandle(UUIDUtil.toByteString(linkHandle))
+        .setConfirmedUsernameHash(ConfirmUsernameHashResponse.ConfirmedUsernameHash.newBuilder()
+            .setUsernameLinkHandle(UUIDUtil.toByteString(linkHandle))
+            .build())
         .build();
 
     assertEquals(expectedResponse,
@@ -393,7 +480,8 @@ class AccountsGrpcServiceTest extends SimpleBaseGrpcTest<AccountsGrpcService, Ac
 
   @ParameterizedTest
   @MethodSource
-  void confirmUsernameHashConfirmationException(final Exception confirmationException, final Status expectedStatus) {
+  void confirmUsernameHashConfirmationException(final Exception confirmationException, final ConfirmUsernameHashResponse expectedResponse)
+      throws UsernameHashNotAvailableException, UsernameReservationNotFoundException {
     final byte[] usernameHash = TestRandomUtil.nextBytes(AccountController.USERNAME_HASH_LENGTH);
 
     final byte[] usernameCiphertext = TestRandomUtil.nextBytes(32);
@@ -402,25 +490,32 @@ class AccountsGrpcServiceTest extends SimpleBaseGrpcTest<AccountsGrpcService, Ac
 
     final Account account = mock(Account.class);
 
-    when(accountsManager.getByAccountIdentifierAsync(AUTHENTICATED_ACI))
-        .thenReturn(CompletableFuture.completedFuture(Optional.of(account)));
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
+        .thenReturn(Optional.of(account));
 
     when(accountsManager.confirmReservedUsernameHash(any(), any(), any()))
-        .thenReturn(CompletableFuture.failedFuture(confirmationException));
+        .thenThrow(confirmationException);
 
-    //noinspection ResultOfMethodCallIgnored
-    GrpcTestUtils.assertStatusException(expectedStatus,
-        () -> authenticatedServiceStub().confirmUsernameHash(ConfirmUsernameHashRequest.newBuilder()
+    final ConfirmUsernameHashResponse actualResponse = authenticatedServiceStub()
+        .confirmUsernameHash(ConfirmUsernameHashRequest.newBuilder()
             .setUsernameHash(ByteString.copyFrom(usernameHash))
             .setUsernameCiphertext(ByteString.copyFrom(usernameCiphertext))
             .setZkProof(ByteString.copyFrom(zkProof))
-            .build()));
+            .build());
+
+    assertEquals(expectedResponse, actualResponse);
   }
 
   private static Stream<Arguments> confirmUsernameHashConfirmationException() {
     return Stream.of(
-        Arguments.of(new UsernameHashNotAvailableException(), Status.NOT_FOUND),
-        Arguments.of(new UsernameReservationNotFoundException(), Status.FAILED_PRECONDITION)
+        Arguments.of( new UsernameHashNotAvailableException(),
+            ConfirmUsernameHashResponse.newBuilder()
+                .setUsernameNotAvailable(UsernameNotAvailable.getDefaultInstance())
+                .build()),
+        Arguments.of(new UsernameReservationNotFoundException(),
+            ConfirmUsernameHashResponse.newBuilder()
+                .setReservationNotFound(FailedPrecondition.getDefaultInstance())
+                .build())
     );
   }
 
@@ -434,12 +529,11 @@ class AccountsGrpcServiceTest extends SimpleBaseGrpcTest<AccountsGrpcService, Ac
 
     final Account account = mock(Account.class);
 
-    when(accountsManager.getByAccountIdentifierAsync(AUTHENTICATED_ACI))
-        .thenReturn(CompletableFuture.completedFuture(Optional.of(account)));
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
+        .thenReturn(Optional.of(account));
 
     doThrow(BaseUsernameException.class).when(usernameHashZkProofVerifier).verifyProof(any(), any());
 
-    //noinspection ResultOfMethodCallIgnored
     GrpcTestUtils.assertStatusException(Status.INVALID_ARGUMENT,
         () -> authenticatedServiceStub().confirmUsernameHash(ConfirmUsernameHashRequest.newBuilder()
             .setUsernameHash(ByteString.copyFrom(usernameHash))
@@ -451,7 +545,6 @@ class AccountsGrpcServiceTest extends SimpleBaseGrpcTest<AccountsGrpcService, Ac
   @ParameterizedTest
   @MethodSource
   void confirmUsernameHashInvalidArgument(final ConfirmUsernameHashRequest request) {
-    //noinspection ResultOfMethodCallIgnored
     GrpcTestUtils.assertStatusException(Status.INVALID_ARGUMENT,
         () -> authenticatedServiceStub().confirmUsernameHash(request));
   }
@@ -494,15 +587,15 @@ class AccountsGrpcServiceTest extends SimpleBaseGrpcTest<AccountsGrpcService, Ac
   void deleteUsernameHash() {
     final Account account = mock(Account.class);
 
-    when(accountsManager.getByAccountIdentifierAsync(AUTHENTICATED_ACI))
-        .thenReturn(CompletableFuture.completedFuture(Optional.of(account)));
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
+        .thenReturn(Optional.of(account));
 
-    when(accountsManager.clearUsernameHash(account)).thenReturn(CompletableFuture.completedFuture(account));
+    when(accountsManager.clearUsernameHash(AUTHENTICATED_ACI)).thenReturn(account);
 
     assertDoesNotThrow(() ->
         authenticatedServiceStub().deleteUsernameHash(DeleteUsernameHashRequest.newBuilder().build()));
 
-    verify(accountsManager).clearUsernameHash(account);
+    verify(accountsManager).clearUsernameHash(AUTHENTICATED_ACI);
   }
 
   @ParameterizedTest
@@ -510,11 +603,12 @@ class AccountsGrpcServiceTest extends SimpleBaseGrpcTest<AccountsGrpcService, Ac
   void setUsernameLink(final boolean keepLink) {
     final Account account = mock(Account.class);
     final UUID oldHandle = UUID.randomUUID();
+    when(account.getAccountIdentifier()).thenReturn(AUTHENTICATED_ACI);
     when(account.getUsernameHash()).thenReturn(Optional.of(new byte[AccountController.USERNAME_HASH_LENGTH]));
     when(account.getUsernameLinkHandle()).thenReturn(oldHandle);
 
-    when(accountsManager.getByAccountIdentifierAsync(AUTHENTICATED_ACI))
-        .thenReturn(CompletableFuture.completedFuture(Optional.of(account)));
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
+        .thenReturn(Optional.of(account));
 
     final byte[] usernameCiphertext = TestRandomUtil.nextBytes(EncryptedUsername.MAX_SIZE);
 
@@ -541,14 +635,16 @@ class AccountsGrpcServiceTest extends SimpleBaseGrpcTest<AccountsGrpcService, Ac
     final Account account = mock(Account.class);
     when(account.getUsernameHash()).thenReturn(Optional.empty());
 
-    when(accountsManager.getByAccountIdentifierAsync(AUTHENTICATED_ACI))
-        .thenReturn(CompletableFuture.completedFuture(Optional.of(account)));
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
+        .thenReturn(Optional.of(account));
 
     final byte[] usernameCiphertext = TestRandomUtil.nextBytes(EncryptedUsername.MAX_SIZE);
 
-    //noinspection ResultOfMethodCallIgnored
-    GrpcTestUtils.assertStatusException(Status.FAILED_PRECONDITION,
-        () -> authenticatedServiceStub().setUsernameLink(SetUsernameLinkRequest.newBuilder()
+    assertEquals(
+        SetUsernameLinkResponse.newBuilder()
+            .setNoUsernameSet(FailedPrecondition.getDefaultInstance())
+            .build(),
+        authenticatedServiceStub().setUsernameLink(SetUsernameLinkRequest.newBuilder()
             .setUsernameCiphertext(ByteString.copyFrom(usernameCiphertext))
             .build()));
   }
@@ -556,7 +652,6 @@ class AccountsGrpcServiceTest extends SimpleBaseGrpcTest<AccountsGrpcService, Ac
   @ParameterizedTest
   @MethodSource
   void setUsernameLinkIllegalCiphertext(final SetUsernameLinkRequest request) {
-    //noinspection ResultOfMethodCallIgnored
     GrpcTestUtils.assertStatusException(Status.INVALID_ARGUMENT,
         () -> authenticatedServiceStub().setUsernameLink(request));
   }
@@ -574,11 +669,11 @@ class AccountsGrpcServiceTest extends SimpleBaseGrpcTest<AccountsGrpcService, Ac
   }
 
   @Test
-  void setUsernameLinkRateLimited() {
+  void setUsernameLinkRateLimited() throws RateLimitExceededException {
     final Duration retryAfter = Duration.ofSeconds(97);
 
-    when(rateLimiter.validateReactive(any(UUID.class)))
-        .thenReturn(Mono.error(new RateLimitExceededException(retryAfter)));
+    doThrow(new RateLimitExceededException(retryAfter))
+        .when(rateLimiter).validate(any(UUID.class));
 
     final byte[] usernameCiphertext = TestRandomUtil.nextBytes(EncryptedUsername.MAX_SIZE);
 
@@ -594,8 +689,8 @@ class AccountsGrpcServiceTest extends SimpleBaseGrpcTest<AccountsGrpcService, Ac
   void deleteUsernameLink() {
     final Account account = mock(Account.class);
 
-    when(accountsManager.getByAccountIdentifierAsync(AUTHENTICATED_ACI))
-        .thenReturn(CompletableFuture.completedFuture(Optional.of(account)));
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
+        .thenReturn(Optional.of(account));
 
     assertDoesNotThrow(
         () -> authenticatedServiceStub().deleteUsernameLink(DeleteUsernameLinkRequest.newBuilder().build()));
@@ -604,11 +699,11 @@ class AccountsGrpcServiceTest extends SimpleBaseGrpcTest<AccountsGrpcService, Ac
   }
 
   @Test
-  void deleteUsernameLinkRateLimited() {
+  void deleteUsernameLinkRateLimited() throws RateLimitExceededException {
     final Duration retryAfter = Duration.ofSeconds(11);
 
-    when(rateLimiter.validateReactive(any(UUID.class)))
-        .thenReturn(Mono.error(new RateLimitExceededException(retryAfter)));
+    doThrow(new RateLimitExceededException(retryAfter))
+        .when(rateLimiter).validate(any(UUID.class));
 
     //noinspection ResultOfMethodCallIgnored
     GrpcTestUtils.assertRateLimitExceeded(retryAfter,
@@ -617,39 +712,30 @@ class AccountsGrpcServiceTest extends SimpleBaseGrpcTest<AccountsGrpcService, Ac
   }
 
   @ParameterizedTest
-  @MethodSource
-  void configureUnidentifiedAccess(final boolean unrestrictedUnidentifiedAccess,
-      final byte[] unidentifiedAccessKey,
-      final byte[] expectedUnidentifiedAccessKey) {
+  @ValueSource(booleans = {true, false})
+  void configureUnidentifiedAccess(final boolean unrestrictedUnidentifiedAccess) {
 
     final Account account = mock(Account.class);
 
-    when(accountsManager.getByAccountIdentifierAsync(AUTHENTICATED_ACI))
-        .thenReturn(CompletableFuture.completedFuture(Optional.of(account)));
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
+        .thenReturn(Optional.of(account));
+    final byte[] uak = TestRandomUtil.nextBytes(UnidentifiedAccessUtil.UNIDENTIFIED_ACCESS_KEY_LENGTH);
+    final ConfigureUnidentifiedAccessRequest.Builder builder = ConfigureUnidentifiedAccessRequest.newBuilder();
+    if (unrestrictedUnidentifiedAccess) {
+      builder.setAllowUnrestrictedUnidentifiedAccess(Empty.getDefaultInstance());
+    } else {
+      builder.setUnidentifiedAccessKey(ByteString.copyFrom(uak));
+    }
 
-    assertDoesNotThrow(() -> authenticatedServiceStub().configureUnidentifiedAccess(ConfigureUnidentifiedAccessRequest.newBuilder()
-        .setAllowUnrestrictedUnidentifiedAccess(unrestrictedUnidentifiedAccess)
-        .setUnidentifiedAccessKey(ByteString.copyFrom(unidentifiedAccessKey))
-        .build()));
+    assertDoesNotThrow(() -> authenticatedServiceStub().configureUnidentifiedAccess(builder.build()));
 
     verify(account).setUnrestrictedUnidentifiedAccess(unrestrictedUnidentifiedAccess);
-    verify(account).setUnidentifiedAccessKey(expectedUnidentifiedAccessKey);
-  }
-
-  private static Stream<Arguments> configureUnidentifiedAccess() {
-    final byte[] unidentifiedAccessKey = TestRandomUtil.nextBytes(UnidentifiedAccessUtil.UNIDENTIFIED_ACCESS_KEY_LENGTH);
-
-    return Stream.of(
-        Arguments.of(true, new byte[0], null),
-        Arguments.of(true, unidentifiedAccessKey, null),
-        Arguments.of(false, unidentifiedAccessKey, unidentifiedAccessKey)
-    );
+    verify(account).setUnidentifiedAccessKey(unrestrictedUnidentifiedAccess ? null : uak);
   }
 
   @ParameterizedTest
   @MethodSource
   void configureUnidentifiedAccessIllegalArguments(final ConfigureUnidentifiedAccessRequest request) {
-    //noinspection ResultOfMethodCallIgnored
     GrpcTestUtils.assertStatusException(Status.INVALID_ARGUMENT,
         () -> authenticatedServiceStub().configureUnidentifiedAccess(request));
   }
@@ -661,7 +747,6 @@ class AccountsGrpcServiceTest extends SimpleBaseGrpcTest<AccountsGrpcService, Ac
 
         // Key with incorrect length
         ConfigureUnidentifiedAccessRequest.newBuilder()
-            .setAllowUnrestrictedUnidentifiedAccess(false)
             .setUnidentifiedAccessKey(ByteString.copyFrom(new byte[15]))
             .build()
     );
@@ -672,8 +757,12 @@ class AccountsGrpcServiceTest extends SimpleBaseGrpcTest<AccountsGrpcService, Ac
   void setDiscoverableByPhoneNumber(final boolean discoverableByPhoneNumber) {
     final Account account = mock(Account.class);
 
-    when(accountsManager.getByAccountIdentifierAsync(AUTHENTICATED_ACI))
-        .thenReturn(CompletableFuture.completedFuture(Optional.of(account)));
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
+        .thenReturn(Optional.of(account));
+
+    when(account.getNumber())
+        .thenReturn(Optional.of(PhoneNumberUtil.getInstance().format(
+            PhoneNumberUtil.getInstance().getExampleNumber("US"), PhoneNumberUtil.PhoneNumberFormat.E164)));
 
     assertDoesNotThrow(() ->
         authenticatedServiceStub().setDiscoverableByPhoneNumber(SetDiscoverableByPhoneNumberRequest.newBuilder()
@@ -683,31 +772,942 @@ class AccountsGrpcServiceTest extends SimpleBaseGrpcTest<AccountsGrpcService, Ac
     verify(account).setDiscoverableByPhoneNumber(discoverableByPhoneNumber);
   }
 
+  @ParameterizedTest
+  @ValueSource(booleans = {true, false})
+  void setDiscoverableByPhoneNumberNoPhoneNumber(final boolean discoverableByPhoneNumber) {
+    final Account account = mock(Account.class);
+
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
+        .thenReturn(Optional.of(account));
+
+    when(account.getNumber())
+        .thenReturn(Optional.empty());
+
+    GrpcTestUtils.assertStatusException(Status.INVALID_ARGUMENT, () ->
+        authenticatedServiceStub().setDiscoverableByPhoneNumber(SetDiscoverableByPhoneNumberRequest.newBuilder()
+            .setDiscoverableByPhoneNumber(discoverableByPhoneNumber)
+            .build()));
+
+    verify(account, never()).setDiscoverableByPhoneNumber(anyBoolean());
+  }
+
   @Test
   void setRegistrationRecoveryPassword() {
     final UUID phoneNumberIdentifier = UUID.randomUUID();
 
     final Account account = mock(Account.class);
-    when(account.getIdentifier(IdentityType.PNI)).thenReturn(phoneNumberIdentifier);
+    when(account.getAccountIdentifier()).thenReturn(AUTHENTICATED_ACI);
+    when(account.getPhoneNumberIdentifier()).thenReturn(Optional.of(phoneNumberIdentifier));
 
-    when(accountsManager.getByAccountIdentifierAsync(AUTHENTICATED_ACI))
-        .thenReturn(CompletableFuture.completedFuture(Optional.of(account)));
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
+        .thenReturn(Optional.of(account));
 
     final byte[] registrationRecoveryPassword = TestRandomUtil.nextBytes(32);
+
+    when(phoneNumberRecoveryPasswordsManager.buildTransactWriteItemForStorePassword(phoneNumberIdentifier, registrationRecoveryPassword))
+        .thenReturn(TransactWriteItem.builder().build());
 
     assertDoesNotThrow(() ->
         authenticatedServiceStub().setRegistrationRecoveryPassword(SetRegistrationRecoveryPasswordRequest.newBuilder()
             .setRegistrationRecoveryPassword(ByteString.copyFrom(registrationRecoveryPassword))
             .build()));
 
-    verify(registrationRecoveryPasswordsManager).store(account.getIdentifier(IdentityType.PNI), registrationRecoveryPassword);
+    verify(account).setAccountRecoveryPassword(registrationRecoveryPassword);
+    verify(accountsManager).update(eq(AUTHENTICATED_ACI), any(), argThat(additionalWriteItems -> additionalWriteItems.size() == 1));
   }
 
   @Test
   void setRegistrationRecoveryPasswordMissingPassword() {
-    //noinspection ResultOfMethodCallIgnored
     GrpcTestUtils.assertStatusException(Status.INVALID_ARGUMENT,
         () -> authenticatedServiceStub().setRegistrationRecoveryPassword(
             SetRegistrationRecoveryPasswordRequest.newBuilder().build()));
   }
+
+  @ParameterizedTest
+  @ValueSource(booleans = {true, false})
+  void setZkCredentialKey(final boolean matchesCurrentZkCredentialKey) {
+
+    final ZkCredentialPublicKey publicKey = ZkCredentialKeyPair.generate().getPublicKey();
+    final long rotationId = ThreadLocalRandom.current().nextLong(1, Long.MAX_VALUE);
+
+    final Account account = mock(Account.class);
+
+    if (matchesCurrentZkCredentialKey) {
+      when(account.getZkCredentialKey()).thenReturn(Optional.of(publicKey));
+      when(account.getZkCredentialKeyRotationId()).thenReturn(rotationId);
+    }
+
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
+        .thenReturn(Optional.of(account));
+
+    final SetZkCredentialKeyResponse response = assertDoesNotThrow(() ->
+        authenticatedServiceStub().setZkCredentialKey(SetZkCredentialKeyRequest.newBuilder()
+                .setPublicKey(ByteString.copyFrom(publicKey.serialize()))
+            .build()));
+
+    if (matchesCurrentZkCredentialKey) {
+      assertEquals(rotationId, response.getRotationId());
+    } else {
+      assertTrue(response.getRotationId() != 0);
+    }
+
+    final int updateMethodCalls = matchesCurrentZkCredentialKey ? 0 : 1;
+
+    verify(accountsManager, times(updateMethodCalls)).update(eq(AUTHENTICATED_ACI), any());
+    verify(account, times(updateMethodCalls)).setZkCredentialKey(publicKey);
+  }
+
+  @Test
+  void setZkCredentialKeyRateLimited() throws Exception {
+
+    final byte[] publicKey = ZkCredentialKeyPair.generate().getPublicKey().serialize();
+    final Duration retryDuration = Duration.ofDays(1);
+
+    final Account account = mock(Account.class);
+    when(account.getAccountIdentifier()).thenReturn(AUTHENTICATED_ACI);
+
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
+        .thenReturn(Optional.of(account));
+    doThrow(new RateLimitExceededException(retryDuration))
+        .when(rateLimiter).validate(AUTHENTICATED_ACI);
+
+    GrpcTestUtils.assertRateLimitExceeded(retryDuration, () ->
+        authenticatedServiceStub().setZkCredentialKey(SetZkCredentialKeyRequest.newBuilder()
+            .setPublicKey(ByteString.copyFrom(publicKey))
+            .build()));
+
+    verify(accountsManager, never()).update(any(UUID.class), any());
+    verify(account, never()).setZkCredentialKey(any());
+  }
+
+  @ParameterizedTest
+  @ValueSource(booleans = {true, false})
+  void getEntitlements(final boolean expired) {
+    final Account account = mock(Account.class);
+    final Instant expiration = expired
+        ? testClock.instant().minus(Duration.ofDays(1))
+        : testClock.instant().plus(Duration.ofMillis(1));
+    final AccountBadge badge1 = new AccountBadge("badge1", expiration, true);
+    final AccountBadge badge2 = new AccountBadge("badge2", expiration, true);
+
+    when(account.getBackupVoucher()).thenReturn(new Account.BackupVoucher(100, expiration));
+    when(account.getBadges()).thenReturn(List.of(badge1, badge2));
+    when(account.getAccountIdentifier()).thenReturn(AUTHENTICATED_ACI);
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI)).thenReturn(Optional.of(account));
+
+    final GetEntitlementsResponse entitlements = authenticatedServiceStub()
+        .getEntitlements(GetEntitlementsRequest.newBuilder().build());
+
+    if (expired) {
+      assertThat(entitlements.getBadgesCount()).isEqualTo(0);
+      assertThat(entitlements.hasBackup()).isFalse();
+    } else {
+      assertThat(entitlements.getBadges(0)).isEqualTo(toBadgeEntitlement(badge1));
+      assertThat(entitlements.getBadges(1)).isEqualTo(toBadgeEntitlement(badge2));
+      assertThat(entitlements.getBackup().getLevel()).isEqualTo(100);
+      assertThat(entitlements.getBackup().getExpirationEpochSeconds()).isEqualTo(expiration.getEpochSecond());
+    }
+  }
+
+  private static GetEntitlementsResponse.BadgeEntitlement toBadgeEntitlement(AccountBadge badge) {
+    return GetEntitlementsResponse.BadgeEntitlement.newBuilder()
+        .setExpirationEpochSeconds(badge.expiration().getEpochSecond())
+        .setBadgeId(badge.id())
+        .setVisible(badge.visible())
+        .build();
+  }
+
+  @Test
+  void changeNumber() throws Exception {
+    final String newNumber = PhoneNumberUtil.getInstance().format(
+        PhoneNumberUtil.getInstance().getExampleNumber("US"), PhoneNumberUtil.PhoneNumberFormat.E164);
+
+    final ECKeyPair pniIdentityKeyPair = ECKeyPair.generate();
+    final IdentityKey pniIdentityKey = new IdentityKey(pniIdentityKeyPair.getPublicKey());
+
+    final ECSignedPreKey ecSignedPreKey = KeysHelper.signedECPreKey(1, pniIdentityKeyPair);
+    final KEMSignedPreKey kemSignedPreKey = KeysHelper.signedKEMPreKey(2, pniIdentityKeyPair);
+
+    final byte[] sessionId = TestRandomUtil.nextBytes(16);
+    final UUID updatedPni = UUID.randomUUID();
+
+    final Account updatedAccount = mock(Account.class);
+    when(updatedAccount.getAccountIdentifier()).thenReturn(AUTHENTICATED_ACI);
+    when(updatedAccount.getNumber()).thenReturn(Optional.of(newNumber));
+    when(updatedAccount.getPhoneNumberIdentifier()).thenReturn(Optional.of(updatedPni));
+    when(updatedAccount.getUsernameHash()).thenReturn(Optional.empty());
+
+    when(changeNumberManager.changeNumber(eq(AUTHENTICATED_ACI), any(), any(), any(), eq(newNumber),
+        any(), any(), any(), any(), any(), any(), any(), any()))
+        .thenReturn(updatedAccount);
+
+    final ChangeNumberResponse response = authenticatedServiceStub().changeNumber(ChangeNumberRequest.newBuilder()
+        .setSessionId(ByteString.copyFrom(sessionId))
+        .setNumber(newNumber)
+        .setRegistrationLock(ByteString.copyFrom(TestRandomUtil.nextBytes(32)))
+        .setPniIdentityKey(ByteString.copyFrom(pniIdentityKey.serialize()))
+        .putDevicePniSignedPreKeys(Device.PRIMARY_ID, EcSignedPreKey.newBuilder()
+            .setKeyId(KeyIdUtil.toUnsignedInt(ecSignedPreKey.keyId()))
+            .setPublicKey(ByteString.copyFrom(ecSignedPreKey.serializedPublicKey()))
+            .setSignature(ByteString.copyFrom(ecSignedPreKey.signature()))
+            .build())
+        .putDevicePniPqLastResortPreKeys(Device.PRIMARY_ID, KemSignedPreKey.newBuilder()
+            .setKeyId(KeyIdUtil.toUnsignedInt(kemSignedPreKey.keyId()))
+            .setPublicKey(ByteString.copyFrom(kemSignedPreKey.serializedPublicKey()))
+            .setSignature(ByteString.copyFrom(kemSignedPreKey.signature()))
+            .build())
+        .putPniRegistrationIds(Device.PRIMARY_ID, 17)
+        .build());
+
+    final ChangeNumberResponse expectedResponse = ChangeNumberResponse.newBuilder()
+        .setAccountIdentifiers(AccountIdentifiers.newBuilder()
+            .addServiceIdentifiers(GrpcServiceIdentifierUtil.toGrpcServiceIdentifier(new AciServiceIdentifier(AUTHENTICATED_ACI)))
+            .addServiceIdentifiers(GrpcServiceIdentifierUtil.toGrpcServiceIdentifier(new PniServiceIdentifier(updatedPni)))
+            .setE164(newNumber))
+        .build();
+
+    assertEquals(expectedResponse, response);
+  }
+
+  @ParameterizedTest
+  @MethodSource
+  void changeNumberErrorResponse(final Exception exceptionToThrow, final ChangeNumberResponse expectedResponse)
+      throws Exception {
+
+    when(changeNumberManager.changeNumber(any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any()))
+        .thenThrow(exceptionToThrow);
+
+    assertEquals(expectedResponse, authenticatedServiceStub().changeNumber(createChangeNumberRequest()));
+  }
+
+  private static List<Arguments> changeNumberErrorResponse() {
+    return List.of(
+        Arguments.argumentSet("Invalid registration session",
+            new InvalidRegistrationSessionException("invalid registration session"),
+            ChangeNumberResponse.newBuilder()
+                .setInvalidRegistrationSession(FailedPrecondition.newBuilder().setDescription("invalid registration session"))
+                .build()),
+        Arguments.argumentSet("Unverified registration session",
+            new UnverifiedRegistrationSessionException(),
+            ChangeNumberResponse.newBuilder()
+                .setUnverifiedRegistrationSession(FailedPrecondition.getDefaultInstance())
+                .build()),
+        Arguments.argumentSet("Recovery password verification failed",
+            new RecoveryPasswordVerificationFailedException(),
+            ChangeNumberResponse.newBuilder()
+                .setRecoveryPasswordVerificationFailed(FailedPrecondition.getDefaultInstance())
+                .build()),
+        Arguments.argumentSet("Message too large",
+            new MessageTooLargeException(),
+            ChangeNumberResponse.newBuilder()
+                .setMessageTooLarge(FailedPrecondition.newBuilder().setDescription("one or more device messages was too large"))
+                .build()));
+  }
+
+  @Test
+  void changeNumberIllegalArgumentException() throws Exception {
+    final String message = "Horrors";
+
+    when(changeNumberManager.changeNumber(any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any()))
+        .thenThrow(new IllegalArgumentException(message));
+
+    GrpcTestUtils.assertStatusException(Status.INVALID_ARGUMENT.withDescription(message),
+        () -> authenticatedServiceStub().changeNumber(createChangeNumberRequest()));
+  }
+
+  @ParameterizedTest
+  @MethodSource
+  void changeNumberUnavailable(final Exception exceptionToThrow) throws Exception {
+    when(changeNumberManager.changeNumber(any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any()))
+        .thenThrow(exceptionToThrow);
+
+    GrpcTestUtils.assertStatusException(Status.UNAVAILABLE,
+        () -> authenticatedServiceStub().changeNumber(createChangeNumberRequest()));
+  }
+
+  private static List<Arguments> changeNumberUnavailable() {
+    return List.of(
+        Arguments.argumentSet("Message delivery not allowed", new MessageDeliveryNotAllowedException()),
+        Arguments.argumentSet("Registration service unavailable", new IOException("unavailable")));
+  }
+
+  @Test
+  void changeNumberRegistrationLockFailure() throws Exception {
+    final long timeRemaining = Duration.ofDays(7).toMillis();
+
+    when(changeNumberManager.changeNumber(any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any()))
+        .thenThrow(new RegistrationLockFailureException(new org.whispersystems.textsecuregcm.entities.RegistrationLockFailure(
+            timeRemaining,
+            new org.whispersystems.textsecuregcm.auth.ExternalServiceCredentials("test-username", "test-password"))));
+
+    final ChangeNumberResponse expectedResponse = ChangeNumberResponse.newBuilder()
+        .setRegistrationLockFailure(RegistrationLockFailure.newBuilder()
+            .setTimeRemainingMillis(timeRemaining)
+            .setSvr2Credentials(ExternalServiceCredentials.newBuilder()
+                .setUsername("test-username")
+                .setPassword("test-password")))
+        .build();
+
+    assertEquals(expectedResponse, authenticatedServiceStub().changeNumber(createChangeNumberRequest()));
+  }
+
+  @Test
+  void changeNumberStaleDevices() throws Exception {
+    final byte staleDeviceId = (byte) (Device.PRIMARY_ID + 1);
+
+    when(changeNumberManager.changeNumber(any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any()))
+        .thenThrow(new MismatchedDevicesException(new MismatchedDevices(Set.of(), Set.of(), Set.of(staleDeviceId))));
+
+    final ChangeNumberResponse expectedResponse = ChangeNumberResponse.newBuilder()
+        .setStaleDevices(StaleDevices.newBuilder().addStaleDevices(staleDeviceId))
+        .build();
+
+    assertEquals(expectedResponse, authenticatedServiceStub().changeNumber(createChangeNumberRequest()));
+  }
+
+  @Test
+  void changeNumberMismatchedDevices() throws Exception {
+    final byte missingDeviceId = (byte) (Device.PRIMARY_ID + 1);
+    final byte extraDeviceId = (byte) (Device.PRIMARY_ID + 2);
+
+    when(changeNumberManager.changeNumber(any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any()))
+        .thenThrow(new MismatchedDevicesException(new MismatchedDevices(Set.of(missingDeviceId), Set.of(extraDeviceId), Set.of())));
+
+    final ChangeNumberResponse expectedResponse = ChangeNumberResponse.newBuilder()
+        .setMismatchedDevices(org.signal.chat.messages.MismatchedDevices.newBuilder()
+            .setServiceIdentifier(GrpcServiceIdentifierUtil.toGrpcServiceIdentifier(new AciServiceIdentifier(AUTHENTICATED_ACI)))
+            .addMissingDevices(missingDeviceId)
+            .addExtraDevices(extraDeviceId))
+        .build();
+
+    assertEquals(expectedResponse, authenticatedServiceStub().changeNumber(createChangeNumberRequest()));
+  }
+
+  private static ChangeNumberRequest createChangeNumberRequest() {
+    final ECKeyPair pniIdentityKeyPair = ECKeyPair.generate();
+    final IdentityKey pniIdentityKey = new IdentityKey(pniIdentityKeyPair.getPublicKey());
+
+    final ECSignedPreKey ecSignedPreKey = KeysHelper.signedECPreKey(1, pniIdentityKeyPair);
+    final KEMSignedPreKey kemSignedPreKey = KeysHelper.signedKEMPreKey(2, pniIdentityKeyPair);
+
+    return ChangeNumberRequest.newBuilder()
+        .setSessionId(ByteString.copyFrom(TestRandomUtil.nextBytes(16)))
+        .setNumber(PhoneNumberUtil.getInstance().format(
+            PhoneNumberUtil.getInstance().getExampleNumber("US"), PhoneNumberUtil.PhoneNumberFormat.E164))
+        .setPniIdentityKey(ByteString.copyFrom(pniIdentityKey.serialize()))
+        .putDevicePniSignedPreKeys(Device.PRIMARY_ID, EcSignedPreKey.newBuilder()
+            .setKeyId(KeyIdUtil.toUnsignedInt(ecSignedPreKey.keyId()))
+            .setPublicKey(ByteString.copyFrom(ecSignedPreKey.serializedPublicKey()))
+            .setSignature(ByteString.copyFrom(ecSignedPreKey.signature()))
+            .build())
+        .putDevicePniPqLastResortPreKeys(Device.PRIMARY_ID, KemSignedPreKey.newBuilder()
+            .setKeyId(KeyIdUtil.toUnsignedInt(kemSignedPreKey.keyId()))
+            .setPublicKey(ByteString.copyFrom(kemSignedPreKey.serializedPublicKey()))
+            .setSignature(ByteString.copyFrom(kemSignedPreKey.signature()))
+            .build())
+        .putPniRegistrationIds(Device.PRIMARY_ID, 17)
+        .build();
+  }
+
+  @ParameterizedTest
+  @ArgumentsSource(AccountsTestHelper.AccountsDataReportArgumentProvider.class)
+  void getAccountDataReport(final Account account, final String expectedTextAfterHeader) {
+    getMockAuthenticationInterceptor().setAuthenticatedDevice(account.getAccountIdentifier(), Device.PRIMARY_ID);
+    when(accountsManager.getByAccountIdentifier(account.getAccountIdentifier())).thenReturn(Optional.of(account));
+
+    final GetAccountDataReportResponse response =
+        authenticatedServiceStub().getAccountDataReport(GetAccountDataReportRequest.newBuilder().build());
+
+    final String actualText = response.getText();
+    AccountsTestHelper.verifyAccountDataReportText(actualText, expectedTextAfterHeader);
+  }
+
+  @Test
+  void getCapabilities() {
+    final Account account = mock(Account.class);
+    when(account.getAccountIdentifier()).thenReturn(AUTHENTICATED_ACI);
+
+    // public-visible and self-visible capabilities should be returned on the authenticated RPC
+    when(account.hasCapability(DeviceCapability.SPARSE_POST_QUANTUM_RATCHET)).thenReturn(true);
+    when(account.hasCapability(DeviceCapability.USERNAME_CHANGE_SYNC_MESSAGE)).thenReturn(true);
+    when(account.getAccountIdentifier()).thenReturn(AUTHENTICATED_ACI);
+
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI)).thenReturn(Optional.of(account));
+
+    final GetCapabilitiesResponse response = authenticatedServiceStub()
+        .getCapabilities(GetCapabilitiesRequest.getDefaultInstance());
+
+    assertEquals(Capabilities.newBuilder()
+        .addCapabilities(org.signal.chat.common.DeviceCapability.DEVICE_CAPABILITY_SPARSE_POST_QUANTUM_RATCHET)
+        .addCapabilities(org.signal.chat.common.DeviceCapability.DEVICE_CAPABILITY_USERNAME_CHANGE_SYNC_MESSAGE)
+        .build(), response.getCapabilities());
+  }
+
+  @Test
+  void generateTotpKey() throws TooManyTotpKeysException, TooManyMfaKeysException {
+    final byte[] encodedKey = TestRandomUtil.nextBytes(16);
+
+    final Account account = mock(Account.class);
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
+        .thenReturn(Optional.of(account));
+    when(account.getNumber()).thenReturn(Optional.empty());
+
+    when(accountsManager.generatePendingTotpKey(AUTHENTICATED_ACI))
+        .thenReturn(new TotpKey(TOTP_PARAMETERS, encodedKey));
+
+    final GenerateTotpKeyResponse response =
+        authenticatedServiceStub().generateTotpKey(GenerateTotpKeyRequest.getDefaultInstance());
+
+    assertEquals(GenerateTotpKeyResponse.ResponseCase.KEY_GENERATED, response.getResponseCase());
+
+    assertArrayEquals(encodedKey, response.getKeyGenerated().getKey().toByteArray());
+    assertEquals(TotpManager.TOTP.getAlgorithm(), response.getKeyGenerated().getTotpParameters().getAlgorithm());
+    assertEquals(TotpManager.TOTP.getPasswordLength(), response.getKeyGenerated().getTotpParameters().getPasswordLength());
+    assertEquals(TotpManager.TOTP.getTimeStep().toSeconds(), response.getKeyGenerated().getTotpParameters().getTimeStepSeconds());
+  }
+
+  @Test
+  void generateTotpKeyTooManyKeys() throws TooManyTotpKeysException, TooManyMfaKeysException {
+    final Account account = mock(Account.class);
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI)).thenReturn(Optional.of(account));
+    when(account.getNumber()).thenReturn(Optional.empty());
+
+    when(accountsManager.generatePendingTotpKey(AUTHENTICATED_ACI))
+        .thenThrow(TooManyTotpKeysException.class);
+
+    final GenerateTotpKeyResponse response =
+        authenticatedServiceStub().generateTotpKey(GenerateTotpKeyRequest.getDefaultInstance());
+
+    assertEquals(GenerateTotpKeyResponse.ResponseCase.TOO_MANY_TOTP_KEYS, response.getResponseCase());
+  }
+
+  @Test
+  void generateTotpKeyTooManyNonTotpKeys() throws TooManyTotpKeysException, TooManyMfaKeysException {
+    final Account account = mock(Account.class);
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI)).thenReturn(Optional.of(account));
+    when(account.getNumber()).thenReturn(Optional.empty());
+
+    when(accountsManager.generatePendingTotpKey(AUTHENTICATED_ACI))
+        .thenThrow(TooManyMfaKeysException.class);
+
+    final GenerateTotpKeyResponse response =
+        authenticatedServiceStub().generateTotpKey(GenerateTotpKeyRequest.getDefaultInstance());
+
+    assertEquals(GenerateTotpKeyResponse.ResponseCase.TOO_MANY_MFA_KEYS, response.getResponseCase());
+  }
+
+
+  @Test
+  void confirmTotpKey() throws TooManyMfaKeysException {
+    final byte keyId = 17;
+    final int oneTimePassword = 123456;
+    final byte[] metadataCiphertext = TestRandomUtil.nextBytes(MFA_KEY_METADATA_SIZE);
+
+    final Account account = mock(Account.class);
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
+        .thenReturn(Optional.of(account));
+    when(account.getNumber()).thenReturn(Optional.empty());
+
+    when(accountsManager.confirmPendingTotpKey(AUTHENTICATED_ACI, oneTimePassword, testClock.instant(), metadataCiphertext))
+        .thenReturn(Optional.of(keyId));
+
+    final ConfirmTotpKeyResponse response = authenticatedServiceStub().confirmTotpKey(ConfirmTotpKeyRequest.newBuilder()
+            .setOneTimePassword(oneTimePassword)
+            .setMetadataCiphertext(ByteString.copyFrom(metadataCiphertext))
+        .build());
+
+    assertEquals(ConfirmTotpKeyResponse.ResponseCase.KEY_CONFIRMED, response.getResponseCase());
+    assertEquals(keyId, response.getKeyConfirmed().getKeyId());
+  }
+
+  @Test
+  void confirmTotpKeyIncorrectMetadataSize() {
+    GrpcTestUtils.assertStatusInvalidArgument(
+        () -> authenticatedServiceStub().confirmTotpKey(ConfirmTotpKeyRequest.newBuilder()
+            .setOneTimePassword(123456)
+            .setMetadataCiphertext(ByteString.copyFrom(TestRandomUtil.nextBytes(MFA_KEY_METADATA_SIZE + 1)))
+            .build()));
+  }
+
+  @Test
+  void confirmTotpKeyPasswordNotVerified() throws TooManyMfaKeysException {
+    final Account account = mock(Account.class);
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI)).thenReturn(Optional.of(account));
+    when(account.getNumber()).thenReturn(Optional.empty());
+
+    when(accountsManager.confirmPendingTotpKey(any(), anyInt(), any(), any()))
+        .thenReturn(Optional.empty());
+
+    final ConfirmTotpKeyResponse response = authenticatedServiceStub().confirmTotpKey(ConfirmTotpKeyRequest.newBuilder()
+        .setOneTimePassword(123456)
+        .setMetadataCiphertext(ByteString.copyFrom(TestRandomUtil.nextBytes(MFA_KEY_METADATA_SIZE)))
+        .build());
+
+    assertEquals(ConfirmTotpKeyResponse.ResponseCase.ONE_TIME_PASSWORD_NOT_VERIFIED, response.getResponseCase());
+  }
+
+  @Test
+  void confirmTotpKeyTooManyNonTotpKeys() throws TooManyMfaKeysException {
+    final Account account = mock(Account.class);
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
+        .thenReturn(Optional.of(account));
+    when(account.getNumber()).thenReturn(Optional.empty());
+
+    when(accountsManager.confirmPendingTotpKey(any(), anyInt(), any(), any()))
+        .thenThrow(TooManyMfaKeysException.class);
+
+    final ConfirmTotpKeyResponse response =
+      authenticatedServiceStub().confirmTotpKey(ConfirmTotpKeyRequest.newBuilder()
+          .setOneTimePassword(123456)
+          .setMetadataCiphertext(ByteString.copyFrom(TestRandomUtil.nextBytes(MFA_KEY_METADATA_SIZE)))
+          .build());
+
+    assertEquals(ConfirmTotpKeyResponse.ResponseCase.TOO_MANY_MFA_KEYS, response.getResponseCase());
+  }
+
+  @Test
+  void forbidSetMfaOnAccountsWithNumbers() {
+    final Account account = mock(Account.class);
+    when(account.getNumber()).thenReturn(Optional.of(
+        PhoneNumberUtil.getInstance().format(PhoneNumberUtil.getInstance()
+            .getExampleNumber("US"), PhoneNumberUtil.PhoneNumberFormat.E164)));
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI)).thenReturn(Optional.of(account));
+
+    GrpcTestUtils.assertStatusException(Status.INVALID_ARGUMENT, "CONSTRAINT_VIOLATED", () ->
+        authenticatedServiceStub().generateTotpKey(GenerateTotpKeyRequest.getDefaultInstance()));
+
+    GrpcTestUtils.assertStatusException(Status.INVALID_ARGUMENT, "CONSTRAINT_VIOLATED", () ->
+        authenticatedServiceStub().confirmTotpKey(ConfirmTotpKeyRequest.newBuilder()
+            .setOneTimePassword(123456)
+            .setMetadataCiphertext(ByteString.copyFrom(TestRandomUtil.nextBytes(MFA_KEY_METADATA_SIZE)))
+            .build()));
+  }
+
+  @Test
+  void listMfaKeys() {
+    final Map<Byte, AnnotatedMfaKey> mfaKeys = Map.of(
+        (byte) 1, generateRandomAnnotatedTotpKey(),
+        (byte) 2, generateRandomAnnotatedTotpKey(),
+        (byte) 3, generateRandomAnnotatedWebAuthnCredential());
+
+    final Account account = mock(Account.class);
+    when(account.getMfaKeys()).thenReturn(mfaKeys);
+
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
+        .thenReturn(Optional.of(account));
+
+    final ListMfaKeysResponse response =
+        authenticatedServiceStub().listMfaKeys(ListMfaKeysRequest.getDefaultInstance());
+
+    final Map<Integer, ListMfaKeysResponse.MfaKeyMetadata> expectedMfaKeys = mfaKeys.entrySet().stream()
+        .collect(Collectors.toMap(entry -> entry.getKey().intValue(), entry -> {
+          final ListMfaKeysResponse.MfaKeyMetadata.Builder builder = ListMfaKeysResponse.MfaKeyMetadata.newBuilder()
+              .setMetadataCiphertext(ByteString.copyFrom(entry.getValue().metadataCiphertext()));
+
+          if (entry.getValue() instanceof AnnotatedTotpKey) {
+            builder.setType(MfaKeyType.MFA_KEY_TYPE_TOTP);
+          } else if (entry.getValue() instanceof AnnotatedWebAuthnCredential c) {
+            builder.setType(MfaKeyType.MFA_KEY_TYPE_WEBAUTHN);
+          }
+
+          return builder.build();
+        }));
+
+
+    assertEquals(expectedMfaKeys, response.getKeysMap());
+  }
+
+  @Test
+  void setTotpKeyMetadata() {
+    final byte keyId = (byte) ThreadLocalRandom.current().nextInt(Account.MAX_MFA_KEY_ID);
+    final byte[] updatedMetadata = TestRandomUtil.nextBytes(MFA_KEY_METADATA_SIZE);
+    final AnnotatedMfaKey existingTotpKey = generateRandomAnnotatedTotpKey();
+
+    final Account account = mock(Account.class);
+    when(account.getMfaKeys()).thenReturn(Map.of(keyId, existingTotpKey));
+
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
+        .thenReturn(Optional.of(account));
+
+    final SetMfaKeyMetadataResponse response =
+        authenticatedServiceStub().setMfaKeyMetadata(SetMfaKeyMetadataRequest.newBuilder()
+            .setKeyId(keyId)
+            .setMetadataCiphertext(ByteString.copyFrom(updatedMetadata))
+            .build());
+
+    assertEquals(SetMfaKeyMetadataResponse.ResponseCase.SUCCESS, response.getResponseCase());
+    verify(account).setMfaKeys(Map.of(keyId, existingTotpKey.withMetadataCiphertext(updatedMetadata)));
+  }
+
+  @Test
+  void setTotpKeyMetadataKeyNotFound() {
+    final Account account = mock(Account.class);
+    when(account.getMfaKeys()).thenReturn(Collections.emptyMap());
+
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
+        .thenReturn(Optional.of(account));
+
+    final SetMfaKeyMetadataResponse response =
+        authenticatedServiceStub().setMfaKeyMetadata(SetMfaKeyMetadataRequest.newBuilder()
+            .setKeyId(ThreadLocalRandom.current().nextInt(Account.MAX_MFA_KEY_ID))
+            .setMetadataCiphertext(ByteString.copyFrom(TestRandomUtil.nextBytes(MFA_KEY_METADATA_SIZE)))
+            .build());
+
+    assertEquals(SetMfaKeyMetadataResponse.ResponseCase.KEY_NOT_FOUND, response.getResponseCase());
+  }
+
+  @Test
+  void setTotpKeyMetadataIncorrectMetadataSize() {
+    GrpcTestUtils.assertStatusInvalidArgument(
+        () -> authenticatedServiceStub().setMfaKeyMetadata(SetMfaKeyMetadataRequest.newBuilder()
+            .setKeyId(1)
+            .setMetadataCiphertext(ByteString.copyFrom(TestRandomUtil.nextBytes(MFA_KEY_METADATA_SIZE + 1)))
+            .build()));
+  }
+
+  @Test
+  void setTotpKeyMetadataKeyIdOutOfRange() {
+    GrpcTestUtils.assertStatusInvalidArgument(
+        () -> authenticatedServiceStub().setMfaKeyMetadata(SetMfaKeyMetadataRequest.newBuilder()
+            .setKeyId(Account.MAX_MFA_KEY_ID + 1)
+            .setMetadataCiphertext(ByteString.copyFrom(TestRandomUtil.nextBytes(MFA_KEY_METADATA_SIZE)))
+            .build()));
+  }
+
+  @Test
+  void removeTotpKey() {
+    final byte retainedKeyId = 1;
+    final byte removedKeyId = 2;
+
+    final Map<Byte, AnnotatedMfaKey> initialKeys = Map.of(
+        retainedKeyId, generateRandomAnnotatedTotpKey(),
+        removedKeyId, generateRandomAnnotatedTotpKey());
+
+    final Account account = mock(Account.class);
+    when(account.getMfaKeys()).thenReturn(initialKeys);
+
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
+        .thenReturn(Optional.of(account));
+
+    //noinspection ResultOfMethodCallIgnored
+    authenticatedServiceStub().removeMfaKey(RemoveMfaKeyRequest.newBuilder()
+        .setKeyId(removedKeyId)
+        .build());
+
+    verify(account).setMfaKeys(Map.of(retainedKeyId, initialKeys.get(retainedKeyId)));
+  }
+
+  @Test
+  void removeTotpKeyIdOutOfRange() {
+    GrpcTestUtils.assertStatusInvalidArgument(
+        () -> authenticatedServiceStub().removeMfaKey(RemoveMfaKeyRequest.newBuilder()
+            .setKeyId(Account.MAX_MFA_KEY_ID + 1)
+            .build()));
+  }
+
+  private static AnnotatedTotpKey generateRandomAnnotatedTotpKey() {
+    return new AnnotatedTotpKey(new TotpKey(TOTP_PARAMETERS, TestRandomUtil.nextBytes(32)),
+        TestRandomUtil.nextBytes(MFA_KEY_METADATA_SIZE));
+  }
+
+  @Test
+  void startWebAuthnRegistration() throws TooManyMfaKeysException {
+    final Account account = mock(Account.class);
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
+        .thenReturn(Optional.of(account));
+    when(account.getNumber()).thenReturn(Optional.empty());
+
+    final byte[] userHandle = TestRandomUtil.nextBytes(32);
+    final byte[] excludedCredentialId = TestRandomUtil.nextBytes(32);
+
+    when(accountsManager.startWebAuthnRegistration(AUTHENTICATED_ACI))
+        .thenReturn(new RegistrationCeremonyParameters(
+            userHandle, List.of(COSEAlgorithmIdentifier.ES256.getValue(), COSEAlgorithmIdentifier.Ed25519.getValue()), List.of(excludedCredentialId)));
+
+    final StartWebAuthnRegistrationResponse response =
+        authenticatedServiceStub().startWebAuthnRegistration(StartWebAuthnRegistrationRequest.getDefaultInstance());
+
+    assertEquals(StartWebAuthnRegistrationResponse.ResponseCase.PARAMS, response.getResponseCase());
+    assertArrayEquals(userHandle, response.getParams().getUserHandle().toByteArray());
+    assertEquals(List.of(COSEAlgorithmIdentifier.ES256.getValue(), COSEAlgorithmIdentifier.Ed25519.getValue()), response.getParams().getAllowedAlgorithmsList());
+    assertEquals(List.of(ByteString.copyFrom(excludedCredentialId)),
+        response.getParams().getExcludeCredentialIdsList());
+  }
+
+  @Test
+  void startWebAuthnRegistrationTooManyMfaKeys() throws TooManyMfaKeysException {
+    final Account account = mock(Account.class);
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
+        .thenReturn(Optional.of(account));
+    when(account.getNumber()).thenReturn(Optional.empty());
+
+    when(accountsManager.startWebAuthnRegistration(AUTHENTICATED_ACI)).thenThrow(TooManyMfaKeysException.class);
+
+    final StartWebAuthnRegistrationResponse response =
+        authenticatedServiceStub().startWebAuthnRegistration(StartWebAuthnRegistrationRequest.getDefaultInstance());
+
+    assertEquals(StartWebAuthnRegistrationResponse.ResponseCase.TOO_MANY_MFA_KEYS, response.getResponseCase());
+  }
+
+  @Test
+  void startWebAuthnRegistrationAccountNotFound() throws TooManyMfaKeysException {
+    when(accountsManager.startWebAuthnRegistration(AUTHENTICATED_ACI)).thenThrow(AccountNotFoundException.class);
+
+    GrpcTestUtils.assertStatusException(Status.UNAUTHENTICATED,
+        () -> authenticatedServiceStub().startWebAuthnRegistration(StartWebAuthnRegistrationRequest.getDefaultInstance()));
+  }
+
+  @Test
+  void finishWebAuthnRegistration() throws TooManyMfaKeysException {
+    final Account account = mock(Account.class);
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
+        .thenReturn(Optional.of(account));
+    when(account.getNumber()).thenReturn(Optional.empty());
+
+    final byte keyId = 42;
+    final byte[] attestationObject = TestRandomUtil.nextBytes(128);
+    final byte[] metadataCiphertext = TestRandomUtil.nextBytes(MFA_KEY_METADATA_SIZE);
+    final String collectedClientDataJson = "{\"type\":\"webauthn.create\"}";
+
+    when(accountsManager.finishWebAuthnRegistration(
+        eq(AUTHENTICATED_ACI), any(), eq(collectedClientDataJson), any()))
+        .thenReturn(Optional.of(keyId));
+
+    final FinishWebAuthnRegistrationResponse response =
+        authenticatedServiceStub().finishWebAuthnRegistration(FinishWebAuthnRegistrationRequest.newBuilder()
+            .setAttestationObject(ByteString.copyFrom(attestationObject))
+            .setCollectedClientDataJson(collectedClientDataJson)
+            .setMetadataCiphertext(ByteString.copyFrom(metadataCiphertext))
+            .build());
+
+    assertEquals(FinishWebAuthnRegistrationResponse.ResponseCase.KEY_CONFIRMED, response.getResponseCase());
+    assertEquals(keyId, response.getKeyConfirmed().getKeyId());
+
+    verify(accountsManager).finishWebAuthnRegistration(
+        AUTHENTICATED_ACI, attestationObject, collectedClientDataJson, metadataCiphertext);
+  }
+
+  @Test
+  void finishWebAuthnRegistrationKeyNotConfirmed() throws TooManyMfaKeysException {
+    final Account account = mock(Account.class);
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
+        .thenReturn(Optional.of(account));
+    when(account.getNumber()).thenReturn(Optional.empty());
+
+    when(accountsManager.finishWebAuthnRegistration(any(), any(), any(), any())).thenReturn(Optional.empty());
+
+    final FinishWebAuthnRegistrationResponse response =
+        authenticatedServiceStub().finishWebAuthnRegistration(FinishWebAuthnRegistrationRequest.newBuilder()
+            .setAttestationObject(ByteString.copyFrom(TestRandomUtil.nextBytes(128)))
+            .setCollectedClientDataJson("{}")
+            .setMetadataCiphertext(ByteString.copyFrom(TestRandomUtil.nextBytes(MFA_KEY_METADATA_SIZE)))
+            .build());
+
+    assertEquals(FinishWebAuthnRegistrationResponse.ResponseCase.KEY_NOT_CONFIRMED, response.getResponseCase());
+  }
+
+  @Test
+  void finishWebAuthnRegistrationTooManyMfaKeys() throws TooManyMfaKeysException {
+    final Account account = mock(Account.class);
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
+        .thenReturn(Optional.of(account));
+    when(account.getNumber()).thenReturn(Optional.empty());
+
+    when(accountsManager.finishWebAuthnRegistration(any(), any(), any(), any()))
+        .thenThrow(TooManyMfaKeysException.class);
+
+    final FinishWebAuthnRegistrationResponse response =
+        authenticatedServiceStub().finishWebAuthnRegistration(FinishWebAuthnRegistrationRequest.newBuilder()
+            .setAttestationObject(ByteString.copyFrom(TestRandomUtil.nextBytes(128)))
+            .setCollectedClientDataJson("{}")
+            .setMetadataCiphertext(ByteString.copyFrom(TestRandomUtil.nextBytes(MFA_KEY_METADATA_SIZE)))
+            .build());
+
+    assertEquals(FinishWebAuthnRegistrationResponse.ResponseCase.TOO_MANY_MFA_KEYS, response.getResponseCase());
+  }
+
+  @Test
+  void finishWebAuthnRegistrationIncorrectMetadataSize() {
+    GrpcTestUtils.assertStatusInvalidArgument(
+        () -> authenticatedServiceStub().finishWebAuthnRegistration(FinishWebAuthnRegistrationRequest.newBuilder()
+            .setAttestationObject(ByteString.copyFrom(TestRandomUtil.nextBytes(128)))
+            .setCollectedClientDataJson("{}")
+            .setMetadataCiphertext(ByteString.copyFrom(TestRandomUtil.nextBytes(MFA_KEY_METADATA_SIZE + 1)))
+            .build()));
+  }
+
+  @Test
+  void startMfaVerification_totp() {
+    final Account account = mock(Account.class);
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
+        .thenReturn(Optional.of(account));
+
+    when(account.getMfaKeys()).thenReturn(Map.of((byte) 1, mock(AnnotatedTotpKey.class)));
+    when(accountsManager.startWebAuthnAuthentication(account)).thenReturn(Optional.empty());
+
+    final StartMfaVerificationResponse response = authenticatedServiceStub().startMfaVerification(StartMfaVerificationRequest.getDefaultInstance());
+
+    assertTrue(response.getHasTotp());
+    assertFalse(response.hasWebauthnAuthenticationParameters());
+  }
+
+  @Test
+  void startMfaVerification_webAuthn() {
+    final Account account = mock(Account.class);
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
+        .thenReturn(Optional.of(account));
+
+    when(account.getMfaKeys()).thenReturn(
+        Map.of((byte) 1, mock(AnnotatedWebAuthnCredential.class),
+            (byte) 2, mock(AnnotatedWebAuthnCredential.class)));
+
+    when(accountsManager.startWebAuthnAuthentication(account)).thenReturn(
+        Optional.of(
+            new AuthenticationCeremonyParameters("challenge".getBytes(), Duration.ofSeconds(30), List.of("id1".getBytes(), "id2".getBytes()))));
+
+    final StartMfaVerificationResponse response = authenticatedServiceStub().startMfaVerification(StartMfaVerificationRequest.getDefaultInstance());
+
+    assertFalse(response.getHasTotp());
+    assertTrue(response.hasWebauthnAuthenticationParameters());
+    assertArrayEquals("challenge".getBytes(), response.getWebauthnAuthenticationParameters().getChallenge().toByteArray());
+    assertEquals(30, response.getWebauthnAuthenticationParameters().getTimeoutSeconds());
+    assertEquals(2, response.getWebauthnAuthenticationParameters().getAllowedCredentialIdsCount());
+    assertArrayEquals("id1".getBytes(), response.getWebauthnAuthenticationParameters().getAllowedCredentialIds(0).toByteArray());
+    assertArrayEquals("id2".getBytes(), response.getWebauthnAuthenticationParameters().getAllowedCredentialIds(1).toByteArray());
+  }
+
+  @Test
+  void startMfaVerification_totpAndWebAuthn() {
+    final Account account = mock(Account.class);
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
+        .thenReturn(Optional.of(account));
+
+    when(account.getMfaKeys()).thenReturn(
+        Map.of((byte) 1, mock(AnnotatedTotpKey.class),
+            (byte) 2, mock(AnnotatedWebAuthnCredential.class),
+            (byte) 3, mock(AnnotatedWebAuthnCredential.class)));
+
+    when(accountsManager.startWebAuthnAuthentication(account)).thenReturn(
+        Optional.of(
+            new AuthenticationCeremonyParameters("challenge".getBytes(), Duration.ofSeconds(30), List.of("id1".getBytes(), "id2".getBytes()))));
+
+    final StartMfaVerificationResponse response = authenticatedServiceStub().startMfaVerification(StartMfaVerificationRequest.getDefaultInstance());
+
+    assertTrue(response.getHasTotp());
+    assertTrue(response.hasWebauthnAuthenticationParameters());
+    assertArrayEquals("challenge".getBytes(), response.getWebauthnAuthenticationParameters().getChallenge().toByteArray());
+    assertEquals(30, response.getWebauthnAuthenticationParameters().getTimeoutSeconds());
+    assertEquals(2, response.getWebauthnAuthenticationParameters().getAllowedCredentialIdsCount());
+    assertArrayEquals("id1".getBytes(), response.getWebauthnAuthenticationParameters().getAllowedCredentialIds(0).toByteArray());
+    assertArrayEquals("id2".getBytes(), response.getWebauthnAuthenticationParameters().getAllowedCredentialIds(1).toByteArray());
+  }
+
+  @Test
+  void startMfaVerification_noMfa() {
+    final Account account = mock(Account.class);
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
+        .thenReturn(Optional.of(account));
+
+    when(account.getMfaKeys()).thenReturn(Map.of());
+    when(accountsManager.startWebAuthnAuthentication(account)).thenReturn(Optional.empty());
+
+    final StartMfaVerificationResponse response = authenticatedServiceStub().startMfaVerification(StartMfaVerificationRequest.getDefaultInstance());
+
+    assertFalse(response.getHasTotp());
+    assertFalse(response.hasWebauthnAuthenticationParameters());
+  }
+
+  @Test
+  void finishMfaVerification_totp() {
+    final int oneTimePassword = 123456;
+
+    final Account account = mock(Account.class);
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
+        .thenReturn(Optional.of(account));
+
+    when(accountsManager.verifyTotp(any(), eq(testClock.instant()), eq(oneTimePassword))).thenReturn(true);
+
+    final FinishMfaVerificationResponse response = authenticatedServiceStub().finishMfaVerification(
+        FinishMfaVerificationRequest.newBuilder()
+            .setTotpPassword(oneTimePassword)
+            .build());
+
+    assertTrue(response.getSuccess());
+  }
+
+  @Test
+  void finishMfaVerification_totpFailed() {
+    final int oneTimePassword = 123456;
+
+    final Account account = mock(Account.class);
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
+        .thenReturn(Optional.of(account));
+
+    when(accountsManager.verifyTotp(any(), eq(testClock.instant()), eq(oneTimePassword))).thenReturn(false);
+
+    final FinishMfaVerificationResponse response = authenticatedServiceStub().finishMfaVerification(
+        FinishMfaVerificationRequest.newBuilder()
+            .setTotpPassword(oneTimePassword)
+            .build());
+
+    assertFalse(response.getSuccess());
+  }
+
+  @Test
+  void finishMfaVerification_totpRateLimited() throws RateLimitExceededException {
+    final int oneTimePassword = 123456;
+
+    final Account account = mock(Account.class);
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
+        .thenReturn(Optional.of(account));
+
+    doThrow(new RateLimitExceededException(Duration.ofSeconds(1))).when(rateLimiter).validate(AUTHENTICATED_ACI);
+
+    GrpcTestUtils.assertRateLimitExceeded(Duration.ofSeconds(1),
+        () -> authenticatedServiceStub().finishMfaVerification(
+        FinishMfaVerificationRequest.newBuilder()
+            .setTotpPassword(oneTimePassword)
+            .build()),
+        accountsManager);
+  }
+
+  @Test
+  void finishMfaVerification_webAuthn() {
+    final Account account = mock(Account.class);
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
+        .thenReturn(Optional.of(account));
+
+    when(accountsManager.verifyWebAuthnAuthentication(any(), eq("good auth json"))).thenReturn(Optional.of(account));
+
+    final FinishMfaVerificationResponse response = authenticatedServiceStub().finishMfaVerification(
+        FinishMfaVerificationRequest.newBuilder()
+            .setWebauthnAuthenticationResponseJson("good auth json")
+            .build());
+
+    assertTrue(response.getSuccess());
+  }
+
+  @Test
+  void finishMfaVerification_webAuthnFailed() {
+    final Account account = mock(Account.class);
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
+        .thenReturn(Optional.of(account));
+
+    when(accountsManager.verifyWebAuthnAuthentication(any(), eq("bad auth json"))).thenReturn(Optional.empty());
+
+    final FinishMfaVerificationResponse response = authenticatedServiceStub().finishMfaVerification(
+        FinishMfaVerificationRequest.newBuilder()
+            .setWebauthnAuthenticationResponseJson("bad auth json")
+            .build());
+
+    assertFalse(response.getSuccess());
+  }
+
+  private static AnnotatedWebAuthnCredential generateRandomAnnotatedWebAuthnCredential() {
+    return new AnnotatedWebAuthnCredential(
+        new AttestedCredentialData(AAGUID.ZERO, TestRandomUtil.nextBytes(32), TestDataUtil.createEC2COSEPublicKey()),
+        0,
+        TestRandomUtil.nextBytes(MFA_KEY_METADATA_SIZE));
+  }
+
 }

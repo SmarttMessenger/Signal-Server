@@ -5,152 +5,241 @@
 package org.whispersystems.textsecuregcm.grpc;
 
 import com.google.protobuf.ByteString;
-import io.grpc.Status;
+import com.google.protobuf.Empty;
 import java.util.Optional;
-import java.util.concurrent.CompletableFuture;
-import io.micrometer.core.instrument.Metrics;
+import java.util.concurrent.Flow;
 import io.micrometer.core.instrument.Tag;
-import io.micrometer.core.instrument.Tags;
+import org.signal.chat.backup.BackupStreamClosed;
 import org.signal.chat.backup.CopyMediaRequest;
 import org.signal.chat.backup.CopyMediaResponse;
 import org.signal.chat.backup.DeleteAllRequest;
 import org.signal.chat.backup.DeleteAllResponse;
+import org.signal.chat.backup.DeleteMediaItem;
 import org.signal.chat.backup.DeleteMediaRequest;
 import org.signal.chat.backup.DeleteMediaResponse;
 import org.signal.chat.backup.GetBackupInfoRequest;
-import org.signal.chat.backup.GetBackupInfoResponse;
 import org.signal.chat.backup.GetCdnCredentialsRequest;
 import org.signal.chat.backup.GetCdnCredentialsResponse;
+import org.signal.chat.backup.GetMediaBackupInfoResponse;
+import org.signal.chat.backup.GetMessageBackupInfoResponse;
 import org.signal.chat.backup.GetSvrBCredentialsRequest;
 import org.signal.chat.backup.GetSvrBCredentialsResponse;
 import org.signal.chat.backup.GetUploadFormRequest;
 import org.signal.chat.backup.GetUploadFormResponse;
 import org.signal.chat.backup.ListMediaRequest;
 import org.signal.chat.backup.ListMediaResponse;
-import org.signal.chat.backup.ReactorBackupsAnonymousGrpc;
 import org.signal.chat.backup.RefreshRequest;
 import org.signal.chat.backup.RefreshResponse;
 import org.signal.chat.backup.SetPublicKeyRequest;
 import org.signal.chat.backup.SetPublicKeyResponse;
 import org.signal.chat.backup.SignedPresentation;
+import org.signal.chat.backup.SimpleBackupsAnonymousGrpc;
+import org.signal.chat.common.UploadForm;
+import org.signal.chat.errors.FailedPrecondition;
+import org.signal.chat.errors.FailedZkAuthentication;
 import org.signal.libsignal.protocol.InvalidKeyException;
 import org.signal.libsignal.protocol.ecc.ECPublicKey;
 import org.signal.libsignal.zkgroup.InvalidInputException;
 import org.signal.libsignal.zkgroup.backups.BackupAuthCredentialPresentation;
+import org.signal.libsignal.zkgroup.backups.BackupCredentialType;
 import org.whispersystems.textsecuregcm.auth.AuthenticatedBackupUser;
+import org.whispersystems.textsecuregcm.auth.ExternalServiceCredentials;
+import org.whispersystems.textsecuregcm.backup.BackupFailedZkAuthenticationException;
+import org.whispersystems.textsecuregcm.backup.BackupInvalidArgumentException;
 import org.whispersystems.textsecuregcm.backup.BackupManager;
+import org.whispersystems.textsecuregcm.backup.BackupPermissionException;
+import org.whispersystems.textsecuregcm.backup.BackupUploadDescriptor;
+import org.whispersystems.textsecuregcm.backup.BackupWrongCredentialTypeException;
 import org.whispersystems.textsecuregcm.backup.CopyParameters;
 import org.whispersystems.textsecuregcm.backup.MediaEncryptionParameters;
-import org.whispersystems.textsecuregcm.controllers.ArchiveController;
+import org.whispersystems.textsecuregcm.controllers.RateLimitExceededException;
 import org.whispersystems.textsecuregcm.metrics.BackupMetrics;
 import org.whispersystems.textsecuregcm.metrics.UserAgentTagUtil;
+import reactor.adapter.JdkFlowAdapter;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
-import static org.whispersystems.textsecuregcm.metrics.MetricsUtil.name;
-
-public class BackupsAnonymousGrpcService extends ReactorBackupsAnonymousGrpc.BackupsAnonymousImplBase {
+public class BackupsAnonymousGrpcService extends SimpleBackupsAnonymousGrpc.BackupsAnonymousImplBase {
 
   private final BackupManager backupManager;
   private final BackupMetrics backupMetrics;
+  private final long maxAttachmentSize;
+  private final long maxMessageBackupSize;
 
-  public BackupsAnonymousGrpcService(final BackupManager backupManager, final BackupMetrics backupMetrics) {
+  public BackupsAnonymousGrpcService(final BackupManager backupManager, final BackupMetrics backupMetrics, final long maxAttachmentSize, final long maxMessageBackupSize) {
     this.backupManager = backupManager;
     this.backupMetrics = backupMetrics;
+    this.maxAttachmentSize = maxAttachmentSize;
+    this.maxMessageBackupSize = maxMessageBackupSize;
   }
 
   @Override
-  public Mono<GetCdnCredentialsResponse> getCdnCredentials(final GetCdnCredentialsRequest request) {
-    return authenticateBackupUserMono(request.getSignedPresentation())
-        .map(user -> backupManager.generateReadAuth(user, request.getCdn()))
-        .map(credentials -> GetCdnCredentialsResponse.newBuilder().putAllHeaders(credentials).build());
+  public GetCdnCredentialsResponse getCdnCredentials(final GetCdnCredentialsRequest request)
+      throws BackupInvalidArgumentException, BackupPermissionException {
+    try {
+      final AuthenticatedBackupUser backupUser = authenticateBackupUser(request.getSignedPresentation());
+      return GetCdnCredentialsResponse.newBuilder()
+          .setCdnCredentials(GetCdnCredentialsResponse.CdnCredentials.newBuilder()
+              .putAllHeaders(backupManager.generateReadAuth(backupUser, request.getCdn())))
+          .build();
+    } catch (BackupFailedZkAuthenticationException e) {
+      return GetCdnCredentialsResponse.newBuilder()
+          .setFailedAuthentication(FailedZkAuthentication.newBuilder().setDescription(e.getMessage()).build())
+          .build();
+    }
   }
 
   @Override
-  public Mono<GetSvrBCredentialsResponse> getSvrBCredentials(final GetSvrBCredentialsRequest request) {
-    return authenticateBackupUserMono(request.getSignedPresentation())
-        .map(backupManager::generateSvrbAuth)
-        .map(credentials -> GetSvrBCredentialsResponse.newBuilder()
-            .setUsername(credentials.username())
-            .setPassword(credentials.password())
-            .build());
+  public GetSvrBCredentialsResponse getSvrBCredentials(final GetSvrBCredentialsRequest request)
+      throws BackupWrongCredentialTypeException, BackupPermissionException {
+    try {
+      final AuthenticatedBackupUser backupUser = authenticateBackupUser(request.getSignedPresentation());
+      final ExternalServiceCredentials credentials = backupManager.generateSvrbAuth(backupUser);
+      return GetSvrBCredentialsResponse.newBuilder()
+          .setSvrbCredentials(GetSvrBCredentialsResponse.SvrBCredentials.newBuilder()
+              .setUsername(credentials.username())
+              .setPassword(credentials.password()))
+          .build();
+    } catch (BackupFailedZkAuthenticationException e) {
+      return GetSvrBCredentialsResponse.newBuilder()
+          .setFailedAuthentication(FailedZkAuthentication.newBuilder().setDescription(e.getMessage()).build())
+          .build();
+    }
   }
 
   @Override
-  public Mono<GetBackupInfoResponse> getBackupInfo(final GetBackupInfoRequest request) {
-    return Mono.fromFuture(() ->
-            authenticateBackupUser(request.getSignedPresentation()).thenCompose(backupManager::backupInfo))
-        .map(info -> GetBackupInfoResponse.newBuilder()
-            .setBackupName(info.messageBackupKey())
-            .setCdn(info.cdn())
-            .setBackupDir(info.backupSubdir())
-            .setMediaDir(info.mediaSubdir())
-            .setUsedSpace(info.mediaUsedSpace().orElse(0L))
-            .build());
+  public GetMessageBackupInfoResponse getMessageBackupInfo(final GetBackupInfoRequest request) throws BackupPermissionException {
+    try {
+      final AuthenticatedBackupUser backupUser = authenticateBackupUser(request.getSignedPresentation());
+      if (backupUser.credentialType() != BackupCredentialType.MESSAGES) {
+        throw GrpcExceptions.badAuthentication("credential type for message backup info must be 'messages'");
+      }
+      final BackupManager.BackupInfo info = backupManager.backupInfo(backupUser);
+      return GetMessageBackupInfoResponse.newBuilder().setBackupInfo(GetMessageBackupInfoResponse.MessageBackupInfo.newBuilder()
+              .setBackupName(info.messageBackupKey())
+              .setCdn(info.cdn())
+              .setBackupDir(info.backupSubdir())
+          .build()).build();
+    } catch (BackupFailedZkAuthenticationException e) {
+      return GetMessageBackupInfoResponse.newBuilder()
+          .setFailedAuthentication(FailedZkAuthentication.newBuilder().setDescription(e.getMessage()).build())
+          .build();
+    }
   }
 
   @Override
-  public Mono<RefreshResponse> refresh(final RefreshRequest request) {
-    return Mono.fromFuture(() -> authenticateBackupUser(request.getSignedPresentation())
-            .thenCompose(backupManager::ttlRefresh))
-        .thenReturn(RefreshResponse.getDefaultInstance());
+  public GetMediaBackupInfoResponse getMediaBackupInfo(final GetBackupInfoRequest request) throws BackupPermissionException {
+    try {
+      final AuthenticatedBackupUser backupUser = authenticateBackupUser(request.getSignedPresentation());
+      if (backupUser.credentialType() != BackupCredentialType.MEDIA) {
+        throw GrpcExceptions.badAuthentication("credential type for media backup info must be 'media'");
+      }
+      final BackupManager.BackupInfo info = backupManager.backupInfo(backupUser);
+      return GetMediaBackupInfoResponse.newBuilder().setBackupInfo(GetMediaBackupInfoResponse.MediaBackupInfo.newBuilder()
+              .setBackupDir(info.backupSubdir())
+              .setMediaDir(info.mediaSubdir())
+              .setUsedSpace(info.mediaUsedSpace().orElse(0L))
+          .build()).build();
+    } catch (BackupFailedZkAuthenticationException e) {
+      return GetMediaBackupInfoResponse.newBuilder()
+          .setFailedAuthentication(FailedZkAuthentication.newBuilder().setDescription(e.getMessage()).build())
+          .build();
+    }
   }
 
   @Override
-  public Mono<SetPublicKeyResponse> setPublicKey(final SetPublicKeyRequest request) {
+  public RefreshResponse refresh(final RefreshRequest request) throws BackupPermissionException {
+    try {
+      final AuthenticatedBackupUser backupUser = authenticateBackupUser(request.getSignedPresentation());
+      backupManager.ttlRefresh(backupUser);
+      return RefreshResponse.newBuilder().setSuccess(Empty.getDefaultInstance()).build();
+    } catch (BackupFailedZkAuthenticationException e) {
+      return RefreshResponse.newBuilder()
+          .setFailedAuthentication(FailedZkAuthentication.newBuilder().setDescription(e.getMessage()).build())
+          .build();
+    }
+  }
+
+  @Override
+  public SetPublicKeyResponse setPublicKey(final SetPublicKeyRequest request) {
     final ECPublicKey publicKey = deserialize(ECPublicKey::new, request.getPublicKey().toByteArray());
     final BackupAuthCredentialPresentation presentation = deserialize(
         BackupAuthCredentialPresentation::new,
         request.getSignedPresentation().getPresentation().toByteArray());
     final byte[] signature = request.getSignedPresentation().getPresentationSignature().toByteArray();
 
-    return Mono.fromFuture(() -> backupManager.setPublicKey(presentation, signature, publicKey))
-        .thenReturn(SetPublicKeyResponse.getDefaultInstance());
+    try {
+      backupManager.setPublicKey(presentation, signature, publicKey);
+      return SetPublicKeyResponse.newBuilder().setSuccess(Empty.getDefaultInstance()).build();
+    } catch (BackupFailedZkAuthenticationException e) {
+      return SetPublicKeyResponse.newBuilder().setFailedAuthentication(FailedZkAuthentication.getDefaultInstance()).build();
+    }
   }
 
 
   @Override
-  public Mono<GetUploadFormResponse> getUploadForm(final GetUploadFormRequest request) {
-    return authenticateBackupUserMono(request.getSignedPresentation())
-        .flatMap(backupUser -> switch (request.getUploadTypeCase()) {
-          case MESSAGES -> {
-            final long uploadLength = request.getMessages().getUploadLength();
-            final boolean oversize = uploadLength > BackupManager.MAX_MESSAGE_BACKUP_OBJECT_SIZE;
-            backupMetrics.updateMessageBackupSizeDistribution(backupUser, oversize, Optional.of(uploadLength));
-            if (oversize) {
-              yield Mono.error(Status.FAILED_PRECONDITION
-                  .withDescription("Exceeds max upload length")
-                  .asRuntimeException());
-            }
+  public GetUploadFormResponse getUploadForm(final GetUploadFormRequest request)
+      throws RateLimitExceededException, BackupWrongCredentialTypeException, BackupPermissionException {
+    final AuthenticatedBackupUser backupUser;
+    try {
+      backupUser = authenticateBackupUser(request.getSignedPresentation());
+    } catch (BackupFailedZkAuthenticationException e) {
+      return GetUploadFormResponse.newBuilder()
+          .setFailedAuthentication(FailedZkAuthentication.newBuilder().setDescription(e.getMessage()).build())
+          .build();
+    }
+    final long uploadLength = request.getUploadLength();
+    final boolean oversize = switch (request.getUploadTypeCase()) {
+      case MEDIA -> uploadLength > maxAttachmentSize;
+      case MESSAGES -> {
+        backupMetrics.updateMessageBackupSizeDistribution(backupUser, uploadLength > maxMessageBackupSize, Optional.of(uploadLength));
+        yield uploadLength > maxMessageBackupSize;
+      }
+      case UPLOADTYPE_NOT_SET -> throw GrpcExceptions.fieldViolation("upload_type", "Must set upload_type");
+    };
 
-            yield Mono.fromFuture(backupManager.createMessageBackupUploadDescriptor(backupUser));
-          }
-          case MEDIA -> Mono.fromCompletionStage(backupManager.createTemporaryAttachmentUploadDescriptor(backupUser));
-          case UPLOADTYPE_NOT_SET -> Mono.error(Status.INVALID_ARGUMENT
-              .withDescription("Must set upload_type")
-              .asRuntimeException());
-        })
-        .map(uploadDescriptor -> GetUploadFormResponse.newBuilder()
+    if (oversize) {
+      return GetUploadFormResponse.newBuilder().setExceedsMaxUploadLength(FailedPrecondition.getDefaultInstance()).build();
+    }
+
+    final BackupUploadDescriptor uploadDescriptor = switch (request.getUploadTypeCase()) {
+      case MESSAGES -> backupManager.createMessageBackupUploadDescriptor(backupUser, uploadLength);
+      case MEDIA -> backupManager.createTemporaryAttachmentUploadDescriptor(backupUser, uploadLength);
+      case UPLOADTYPE_NOT_SET -> throw GrpcExceptions.fieldViolation("upload_type", "Must set upload_type");
+    };
+    return GetUploadFormResponse.newBuilder()
+        .setUploadForm(UploadForm.newBuilder()
             .setCdn(uploadDescriptor.cdn())
             .setKey(uploadDescriptor.key())
             .setSignedUploadLocation(uploadDescriptor.signedUploadLocation())
-            .putAllHeaders(uploadDescriptor.headers())
-            .build());
+            .putAllHeaders(uploadDescriptor.headers()))
+        .build();
   }
 
   @Override
-  public Flux<CopyMediaResponse> copyMedia(final CopyMediaRequest request) {
-    return authenticateBackupUserMono(request.getSignedPresentation())
-        .flatMapMany(backupUser -> backupManager.copyToBackup(backupUser,
-            request.getItemsList().stream().map(item -> new CopyParameters(
-                item.getSourceAttachmentCdn(), item.getSourceKey(),
-                // uint32 in proto, make sure it fits in a signed int
-                fromUnsignedExact(item.getObjectLength()),
-                new MediaEncryptionParameters(item.getEncryptionKey().toByteArray(), item.getHmacKey().toByteArray()),
-                item.getMediaId().toByteArray())).toList()))
-        .doOnNext(result -> backupMetrics.updateCopyCounter(
-            result,
-            UserAgentTagUtil.getPlatformTag(RequestAttributesUtil.getUserAgent().orElse(null))))
+  public Flow.Publisher<CopyMediaResponse> copyMedia(final CopyMediaRequest request)
+      throws BackupWrongCredentialTypeException, BackupPermissionException, BackupInvalidArgumentException {
+    final BackupManager.CopyQuota copyQuota;
+    try {
+      final AuthenticatedBackupUser backupUser = authenticateBackupUser(request.getSignedPresentation());
+      copyQuota = backupManager.getCopyQuota(backupUser,
+          request.getItemsList().stream().map(item -> new CopyParameters(
+              item.getSourceAttachmentCdn(), item.getSourceKey(),
+              item.getObjectLength(),
+              new MediaEncryptionParameters(item.getEncryptionKey().toByteArray(), item.getHmacKey().toByteArray()),
+              item.getMediaId().toByteArray())).toList(), maxAttachmentSize);
+    } catch (BackupFailedZkAuthenticationException e) {
+      return JdkFlowAdapter.publisherToFlowPublisher(
+          Mono.error(GrpcExceptions.streamClosed(BackupStreamClosed.newBuilder()
+              .setFailedAuthentication(FailedZkAuthentication.newBuilder()
+                  .setDescription(e.getMessage())
+                  .build())
+              .build())));
+    }
+
+    final Tag platformTag = UserAgentTagUtil.getPlatformTag(RequestAttributesUtil.getUserAgent().orElse(null));
+    return JdkFlowAdapter.publisherToFlowPublisher(backupManager.copyToBackup(copyQuota)
+        .doOnNext(result -> backupMetrics.updateCopyCounter(result, platformTag))
         .map(copyResult -> {
           CopyMediaResponse.Builder builder = CopyMediaResponse
               .newBuilder()
@@ -166,65 +255,91 @@ public class BackupsAnonymousGrpcService extends ReactorBackupsAnonymousGrpc.Bac
                 .setSourceNotFound(CopyMediaResponse.SourceNotFound.getDefaultInstance());
           };
           return builder.build();
-        });
-
+        }));
   }
 
   @Override
-  public Mono<ListMediaResponse> listMedia(final ListMediaRequest request) {
-    return authenticateBackupUserMono(request.getSignedPresentation()).zipWhen(
-        backupUser -> Mono.fromFuture(backupManager.list(
-            backupUser,
-            request.hasCursor() ? Optional.of(request.getCursor()) : Optional.empty(),
-            request.getLimit()).toCompletableFuture()),
-
-        (backupUser, listResult) -> {
-          final ListMediaResponse.Builder builder = ListMediaResponse.newBuilder();
-          for (BackupManager.StorageDescriptorWithLength sd : listResult.media()) {
-            builder.addPage(ListMediaResponse.ListEntry.newBuilder()
-                .setMediaId(ByteString.copyFrom(sd.key()))
-                .setCdn(sd.cdn())
-                .setLength(sd.length())
-                .build());
-          }
-          builder
-              .setBackupDir(backupUser.backupDir())
-              .setMediaDir(backupUser.mediaDir());
-          listResult.cursor().ifPresent(builder::setCursor);
-          return builder.build();
-        });
-
+  public ListMediaResponse listMedia(final ListMediaRequest request) throws BackupPermissionException {
+    try {
+      final AuthenticatedBackupUser backupUser = authenticateBackupUser(request.getSignedPresentation());
+      final BackupManager.ListMediaResult listResult = backupManager.list(
+          backupUser,
+          request.hasCursor() ? Optional.of(request.getCursor()) : Optional.empty(),
+          request.hasLimit() ? Optional.of(request.getLimit()) : Optional.empty());
+      final ListMediaResponse.ListResult.Builder builder = ListMediaResponse.ListResult.newBuilder();
+      for (BackupManager.StorageDescriptorWithLength sd : listResult.media()) {
+        builder.addPage(ListMediaResponse.ListEntry.newBuilder()
+            .setMediaId(ByteString.copyFrom(sd.key()))
+            .setCdn(sd.cdn())
+            .setLength(sd.length())
+            .build());
+      }
+      builder
+          .setBackupDir(backupUser.backupDir())
+          .setMediaDir(backupUser.mediaDir());
+      listResult.cursor().ifPresent(builder::setCursor);
+      return ListMediaResponse.newBuilder().setListResult(builder).build();
+    } catch (BackupFailedZkAuthenticationException e) {
+      return ListMediaResponse.newBuilder()
+          .setFailedAuthentication(FailedZkAuthentication.newBuilder().setDescription(e.getMessage()))
+          .build();
+    }
   }
 
   @Override
-  public Mono<DeleteAllResponse> deleteAll(final DeleteAllRequest request) {
-    return Mono.fromFuture(() -> authenticateBackupUser(request.getSignedPresentation())
-            .thenCompose(backupManager::deleteEntireBackup))
-        .thenReturn(DeleteAllResponse.getDefaultInstance());
+  public DeleteAllResponse deleteAll(final DeleteAllRequest request) throws BackupPermissionException {
+    try {
+      final AuthenticatedBackupUser backupUser = authenticateBackupUser(request.getSignedPresentation());
+      backupManager.deleteEntireBackup(backupUser);
+      return DeleteAllResponse.newBuilder().setSuccess(Empty.getDefaultInstance()).build();
+    } catch (BackupFailedZkAuthenticationException e) {
+      return DeleteAllResponse.newBuilder()
+          .setFailedAuthentication(FailedZkAuthentication.newBuilder().setDescription(e.getMessage()))
+          .build();
+    }
   }
 
   @Override
-  public Flux<DeleteMediaResponse> deleteMedia(final DeleteMediaRequest request) {
-    return Mono
-        .fromFuture(() -> authenticateBackupUser(request.getSignedPresentation()))
-        .flatMapMany(backupUser -> backupManager.deleteMedia(backupUser, request
-            .getItemsList()
-            .stream()
-            .map(item -> new BackupManager.StorageDescriptor(item.getCdn(), item.getMediaId().toByteArray()))
-            .toList()))
+  public Flow.Publisher<DeleteMediaResponse> deleteMedia(final DeleteMediaRequest request)
+      throws BackupWrongCredentialTypeException, BackupPermissionException {
+    final Flux<BackupManager.StorageDescriptor> deleteItems;
+    try {
+      final AuthenticatedBackupUser backupUser = authenticateBackupUser(request.getSignedPresentation());
+      deleteItems = backupManager.deleteMedia(backupUser, request
+          .getItemsList()
+          .stream()
+          .map(item -> new BackupManager.StorageDescriptor(item.getCdn(), item.getMediaId().toByteArray()))
+          .toList());
+    } catch (BackupFailedZkAuthenticationException e) {
+      return JdkFlowAdapter.publisherToFlowPublisher(
+          Mono.error(GrpcExceptions.streamClosed(BackupStreamClosed.newBuilder()
+              .setFailedAuthentication(FailedZkAuthentication.newBuilder()
+                  .setDescription(e.getMessage())
+                  .build())
+              .build())));
+    }
+    return JdkFlowAdapter.publisherToFlowPublisher(deleteItems
         .map(storageDescriptor -> DeleteMediaResponse.newBuilder()
-            .setMediaId(ByteString.copyFrom(storageDescriptor.key()))
-            .setCdn(storageDescriptor.cdn()).build());
+            .setDeletedItem(DeleteMediaItem.newBuilder()
+                .setMediaId(ByteString.copyFrom(storageDescriptor.key()))
+                .setCdn(storageDescriptor.cdn()))
+            .build()));
   }
 
-  private Mono<AuthenticatedBackupUser> authenticateBackupUserMono(final SignedPresentation signedPresentation) {
-    return Mono.fromFuture(() -> authenticateBackupUser(signedPresentation));
+  @Override
+  public Throwable mapException(final Throwable throwable) {
+    return switch (throwable) {
+      case BackupInvalidArgumentException e -> GrpcExceptions.invalidArguments(e.getMessage());
+      case BackupPermissionException e -> GrpcExceptions.badAuthentication(e.getMessage());
+      case BackupWrongCredentialTypeException e -> GrpcExceptions.badAuthentication(e.getMessage());
+      default -> throwable;
+    };
   }
 
-  private CompletableFuture<AuthenticatedBackupUser> authenticateBackupUser(
-      final SignedPresentation signedPresentation) {
+  private AuthenticatedBackupUser authenticateBackupUser(final SignedPresentation signedPresentation)
+      throws BackupFailedZkAuthenticationException {
     if (signedPresentation == null) {
-      throw Status.UNAUTHENTICATED.asRuntimeException();
+      throw GrpcExceptions.badAuthentication("Missing required signedPresentation");
     }
     try {
       return backupManager.authenticateBackupUser(
@@ -232,19 +347,8 @@ public class BackupsAnonymousGrpcService extends ReactorBackupsAnonymousGrpc.Bac
           signedPresentation.getPresentationSignature().toByteArray(),
           RequestAttributesUtil.getUserAgent().orElse(null));
     } catch (InvalidInputException e) {
-      throw Status.UNAUTHENTICATED.withDescription("Could not deserialize presentation").asRuntimeException();
+      throw GrpcExceptions.badAuthentication("Could not deserialize presentation");
     }
-  }
-
-  /**
-   * Convert an int from a proto uint32 to a signed positive integer, throwing if the value exceeds
-   * {@link Integer#MAX_VALUE}. To convert to a long, see {@link Integer#toUnsignedLong(int)}
-   */
-  private static int fromUnsignedExact(final int i) {
-    if (i < 0) {
-      throw Status.INVALID_ARGUMENT.withDescription("Invalid size").asRuntimeException();
-    }
-    return i;
   }
 
   private interface Deserializer<T> {
@@ -256,7 +360,7 @@ public class BackupsAnonymousGrpcService extends ReactorBackupsAnonymousGrpc.Bac
     try {
       return deserializer.deserialize(bytes);
     } catch (InvalidInputException | InvalidKeyException e) {
-      throw Status.INVALID_ARGUMENT.withDescription("Invalid serialization").asRuntimeException();
+      throw GrpcExceptions.invalidArguments("invalid serialization");
     }
   }
 

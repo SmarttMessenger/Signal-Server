@@ -9,7 +9,6 @@ import java.time.Clock;
 import java.time.Instant;
 import java.time.LocalTime;
 import java.time.ZoneId;
-import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
 import java.time.zone.ZoneRules;
 import java.util.Comparator;
@@ -19,39 +18,41 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.function.Function;
 import java.util.stream.Collectors;
+import io.micrometer.core.instrument.Metrics;
+import org.whispersystems.textsecuregcm.metrics.MetricsUtil;
 import org.whispersystems.textsecuregcm.storage.Account;
 
 public class SchedulingUtil {
+  private static final String PARSED_TIMEZONE_COUNTER_NAME = MetricsUtil.name(SchedulingUtil.class, "parsedTimezone");
+  private static final String HAS_TIMEZONE_TAG_NAME = "hasTimezone";
 
-  /**
-   * Gets a present or future time at which to send a notification to a device associated with the given account. This
-   * is mainly intended to facilitate scheduling notifications such that they arrive during a recipient's waking hours.
-   * <p/>
-   * This method will attempt to use a timezone derived from the account's phone number to choose an appropriate time
-   * to send a notification. If a timezone cannot be derived from the account's phone number, then this method will use
-   * the account's creation time as a hint. As an example, if the account was created at 07:17 in the server's local
-   * time, we can assume that the account holder was awake at that time of day, and it's likely a safe time to send a
-   * notification in the absence of other hints.
-   *
-   * @param account the account that will receive the notification
-   * @param preferredTime the preferred local time (e.g. "noon") at which to deliver the notification
-   * @param clock a source of the current time
-   *
-   * @return the next time in the present or future at which to send a notification for the target account
-   */
+  /// Gets a present or future time at which to send a notification to a device associated with the given account. This
+  /// is mainly intended to facilitate scheduling notifications such that they arrive during a recipient's waking hours.
+  ///
+  /// This method will attempt to use a timezone derived from the account's phone number to choose an appropriate time
+  /// to send a notification. If a timezone cannot be derived from the account's phone number, or there is no phone number
+  /// associated with the account, then this method will default to the preferred time in the server's timezone.
+  ///
+  /// @param account the account that will receive the notification
+  /// @param preferredTime the preferred local time (e.g. "noon") at which to deliver the notification
+  /// @param clock a source of the current time
+  ///
+  /// @return the next time in the present or future at which to send a notification for the target account
   public static Instant getNextRecommendedNotificationTime(final Account account,
       final LocalTime preferredTime,
       final Clock clock) {
 
-    final ZonedDateTime candidateNotificationTime = getZoneId(account, clock)
-        .map(zoneId -> ZonedDateTime.now(clock.withZone(zoneId)).with(preferredTime))
+    final ZonedDateTime candidateNotificationTime = account.getNumber()
+        .flatMap(number -> getZoneId(number, clock))
+        .map(zoneId -> {
+          Metrics.counter(PARSED_TIMEZONE_COUNTER_NAME, HAS_TIMEZONE_TAG_NAME, String.valueOf(true)).increment();
+          return ZonedDateTime.now(clock.withZone(zoneId)).with(preferredTime);
+        })
         .orElseGet(() -> {
-          // We couldn't find a reasonable timezone for the account for some reason, so make an educated guess at a
-          // reasonable time to send a notification based on the account's creation time.
-          final Instant accountCreation = Instant.ofEpochMilli(account.getPrimaryDevice().getCreated());
-          final LocalTime accountCreationLocalTime = LocalTime.ofInstant(accountCreation, ZoneId.systemDefault());
-
-          return ZonedDateTime.now(ZoneId.systemDefault()).with(accountCreationLocalTime);
+          if (account.getNumber().isPresent()) {
+            Metrics.counter(PARSED_TIMEZONE_COUNTER_NAME, HAS_TIMEZONE_TAG_NAME, String.valueOf(false)).increment();
+          }
+          return ZonedDateTime.now(ZoneId.systemDefault()).with(preferredTime);
         });
 
     if (candidateNotificationTime.toInstant().isBefore(clock.instant())) {
@@ -64,15 +65,23 @@ public class SchedulingUtil {
   }
 
   @VisibleForTesting
-  static Optional<ZoneId> getZoneId(final Account account, final Clock clock) {
+  public static Optional<ZoneId> getZoneId(final String e164, final Clock clock) {
     try {
-      final Phonenumber.PhoneNumber phoneNumber = PhoneNumberUtil.getInstance().parse(account.getNumber(), null);
+      final Phonenumber.PhoneNumber phoneNumber = PhoneNumberUtil.getInstance().parse(e164, null);
 
-      final List<String> timeZonesForNumber =
+      List<String> timeZonesForNumber =
           PhoneNumberToTimeZonesMapper.getInstance().getTimeZonesForNumber(phoneNumber);
 
-      if (timeZonesForNumber.equals(List.of(PhoneNumberToTimeZonesMapper.getUnknownTimeZone()))) {
-        return Optional.empty();
+      if (isUnknownTimeZone(timeZonesForNumber)) {
+        // The more general getTimeZonesForNumber has a guard on PhoneNumberType.UNKONWN, returning the “unknown”
+        // time zone for these numbers. In these cases, we'll first fall back to the geographical lookup, which looks up
+        // a result based on the country code and national significant number.
+        timeZonesForNumber  =
+            PhoneNumberToTimeZonesMapper.getInstance().getTimeZonesForGeographicalNumber(phoneNumber);
+
+        if (isUnknownTimeZone(timeZonesForNumber)) {
+          return Optional.empty();
+        }
       }
 
       final Instant now = clock.instant();
@@ -91,7 +100,7 @@ public class SchedulingUtil {
           .collect(Collectors.toMap(
               ZoneId::getRules,
               Function.identity(),
-              (v1, v2) -> v2));
+              (_, v2) -> v2));
 
       // Sort the ZoneRules by the offsets they produce
       final List<ZoneRules> zoneRulesSortedByOffset = byOffset.keySet()
@@ -104,5 +113,9 @@ public class SchedulingUtil {
     } catch (final NumberParseException e) {
       return Optional.empty();
     }
+  }
+
+  static boolean isUnknownTimeZone(final List<String> timeZonesForNumber) {
+    return timeZonesForNumber.equals(List.of(PhoneNumberToTimeZonesMapper.getUnknownTimeZone()));
   }
 }

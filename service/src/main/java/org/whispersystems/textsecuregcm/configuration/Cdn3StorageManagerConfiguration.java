@@ -2,9 +2,11 @@ package org.whispersystems.textsecuregcm.configuration;
 
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotNull;
+import java.time.Duration;
 import java.util.Collections;
 import java.util.Map;
 import org.whispersystems.textsecuregcm.configuration.secrets.SecretString;
+import javax.annotation.Nullable;
 
 /**
  * Configuration for the cdn3 storage manager
@@ -16,8 +18,12 @@ import org.whispersystems.textsecuregcm.configuration.secrets.SecretString;
  *                       storage-manager when copying to determine how to read a source object. Current schemes are
  *                       'gcs' and 'r2'
  * @param numHttpClients The number http clients to use with the storage-manager to support request striping
- * @param circuitBreaker A circuit breaker configuration for the storage-manager http client
- * @param retry          A retry configuration for the storage-manager http client
+ * @param circuitBreakerConfigurationName The name of a circuit breaker configuration for the storage-manager http
+ *                                        client; if `null`, uses the global default configuration
+ * @param retryConfigurationName          The name of a retry configuration for the storage-manager http client; if
+ *                                        `null`, uses the global default configuration
+ * @param usageRequestTimeout             The per-attempt request timeout for usage requests to the storage-manager; if
+ *                                        `null`, defaults to 5 minutes
  */
 public record Cdn3StorageManagerConfiguration(
     @NotNull String baseUri,
@@ -25,8 +31,9 @@ public record Cdn3StorageManagerConfiguration(
     @NotNull SecretString clientSecret,
     @NotNull Map<Integer, String> sourceSchemes,
     @NotNull Integer numHttpClients,
-    @NotNull @Valid CircuitBreakerConfiguration circuitBreaker,
-    @NotNull @Valid RetryConfiguration retry) {
+    @Nullable String circuitBreakerConfigurationName,
+    @Nullable String retryConfigurationName,
+    @NotNull Duration usageRequestTimeout) {
 
   public Cdn3StorageManagerConfiguration {
     if (numHttpClients == null) {
@@ -35,11 +42,8 @@ public record Cdn3StorageManagerConfiguration(
     if (sourceSchemes == null) {
       sourceSchemes = Collections.emptyMap();
     }
-    if (circuitBreaker == null) {
-      circuitBreaker = new CircuitBreakerConfiguration();
-    }
-    if (retry == null) {
-      retry = new RetryConfiguration();
+    if (usageRequestTimeout == null) {
+      usageRequestTimeout = Duration.ofMinutes(5);
     }
   }
 }

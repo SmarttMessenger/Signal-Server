@@ -14,6 +14,7 @@ import io.swagger.v3.oas.annotations.responses.ApiResponse;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotNull;
 import jakarta.ws.rs.Consumes;
+import jakarta.ws.rs.ForbiddenException;
 import jakarta.ws.rs.GET;
 import jakarta.ws.rs.POST;
 import jakarta.ws.rs.PUT;
@@ -29,11 +30,13 @@ import java.time.Duration;
 import java.util.Base64;
 import java.util.Locale;
 import org.glassfish.jersey.server.ManagedAsync;
+import org.signal.libsignal.zkgroup.backups.BackupLevel;
 import org.whispersystems.textsecuregcm.auth.AuthenticatedDevice;
 import org.whispersystems.textsecuregcm.backup.BackupAuthManager;
 import org.whispersystems.textsecuregcm.limits.RateLimiters;
 import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.storage.AccountsManager;
+import org.whispersystems.textsecuregcm.storage.Device;
 import org.whispersystems.textsecuregcm.storage.devicecheck.AppleDeviceCheckManager;
 import org.whispersystems.textsecuregcm.storage.devicecheck.ChallengeNotFoundException;
 import org.whispersystems.textsecuregcm.storage.devicecheck.DeviceCheckKeyIdNotFoundException;
@@ -59,7 +62,6 @@ public class DeviceCheckController {
   private final BackupAuthManager backupAuthManager;
   private final AppleDeviceCheckManager deviceCheckManager;
   private final RateLimiters rateLimiters;
-  private final long backupRedemptionLevel;
   private final Duration backupRedemptionDuration;
 
   public DeviceCheckController(
@@ -68,13 +70,11 @@ public class DeviceCheckController {
       final BackupAuthManager backupAuthManager,
       final AppleDeviceCheckManager deviceCheckManager,
       final RateLimiters rateLimiters,
-      final long backupRedemptionLevel,
       final Duration backupRedemptionDuration) {
     this.clock = clock;
     this.accountsManager = accountsManager;
     this.backupAuthManager = backupAuthManager;
     this.deviceCheckManager = deviceCheckManager;
-    this.backupRedemptionLevel = backupRedemptionLevel;
     this.backupRedemptionDuration = backupRedemptionDuration;
     this.rateLimiters = rateLimiters;
   }
@@ -140,6 +140,10 @@ public class DeviceCheckController {
 
       @RequestBody(description = "The attestation data, created by [attestKey](https://developer.apple.com/documentation/devicecheck/dcappattestservice/attestkey(_:clientdatahash:completionhandler:))")
       @NotNull final byte[] attestation) {
+
+    if (authenticatedDevice.deviceId() != Device.PRIMARY_ID) {
+      throw new ForbiddenException("Only primary devices may register attestations");
+    }
 
     final Account account = accountsManager.getByAccountIdentifier(authenticatedDevice.accountIdentifier())
         .orElseThrow(() -> new WebApplicationException(Response.Status.UNAUTHORIZED));
@@ -252,8 +256,7 @@ public class DeviceCheckController {
     switch (request.assertionRequest().action()) {
       case BACKUP -> backupAuthManager.extendBackupVoucher(
               account,
-              new Account.BackupVoucher(backupRedemptionLevel, clock.instant().plus(backupRedemptionDuration)))
-          .join();
+              new Account.BackupVoucher(BackupLevel.PAID.getValue(), clock.instant().plus(backupRedemptionDuration)));
     }
   }
 

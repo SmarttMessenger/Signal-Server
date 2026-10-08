@@ -4,8 +4,8 @@
  */
 package org.whispersystems.textsecuregcm.push;
 
-import static com.codahale.metrics.MetricRegistry.name;
 import static org.whispersystems.textsecuregcm.entities.MessageProtos.Envelope;
+import static org.whispersystems.textsecuregcm.metrics.MetricsUtil.name;
 
 import com.google.common.annotations.VisibleForTesting;
 import io.dropwizard.util.DataSize;
@@ -13,27 +13,30 @@ import io.micrometer.core.instrument.DistributionSummary;
 import io.micrometer.core.instrument.Metrics;
 import io.micrometer.core.instrument.Tag;
 import io.micrometer.core.instrument.Tags;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.stream.Collectors;
 import javax.annotation.Nullable;
-import org.apache.commons.lang3.StringUtils;
+import kotlin.Pair;
 import org.signal.libsignal.protocol.SealedSenderMultiRecipientMessage;
-import org.signal.libsignal.protocol.util.Pair;
-import org.whispersystems.textsecuregcm.controllers.MessageController;
+import org.whispersystems.textsecuregcm.configuration.dynamic.DynamicConfiguration;
+import org.whispersystems.textsecuregcm.controllers.MessageDeliveryNotAllowedException;
 import org.whispersystems.textsecuregcm.controllers.MismatchedDevices;
 import org.whispersystems.textsecuregcm.controllers.MismatchedDevicesException;
 import org.whispersystems.textsecuregcm.controllers.MultiRecipientMismatchedDevicesException;
-import org.whispersystems.textsecuregcm.identity.IdentityType;
 import org.whispersystems.textsecuregcm.identity.ServiceIdentifier;
 import org.whispersystems.textsecuregcm.metrics.MetricsUtil;
 import org.whispersystems.textsecuregcm.metrics.UserAgentTagUtil;
+import org.whispersystems.textsecuregcm.spam.MessageDeliveryListener;
 import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.storage.Device;
+import org.whispersystems.textsecuregcm.storage.DynamicConfigurationManager;
 import org.whispersystems.textsecuregcm.storage.MessagesManager;
 import org.whispersystems.textsecuregcm.util.Util;
 
@@ -52,10 +55,13 @@ public class MessageSender {
 
   private final MessagesManager messagesManager;
   private final PushNotificationManager pushNotificationManager;
+  private final DynamicConfigurationManager<DynamicConfiguration> dynamicConfigurationManager;
+
+  private final List<MessageDeliveryListener> messageDeliveryListeners = new ArrayList<>();
 
   // Note that these names deliberately reference `MessageController` for metric continuity
-  private static final String REJECT_OVERSIZE_MESSAGE_COUNTER_NAME = name(MessageController.class, "rejectOversizeMessage");
-  private static final String CONTENT_SIZE_DISTRIBUTION_NAME = MetricsUtil.name(MessageController.class, "messageContentSize");
+  private static final String REJECT_OVERSIZE_MESSAGE_COUNTER_NAME = name(MessageSender.class, "rejectOversizeMessage");
+  private static final String CONTENT_SIZE_DISTRIBUTION_NAME = MetricsUtil.name(MessageSender.class, "messageContentSize");
   private static final String EMPTY_MESSAGE_LIST_COUNTER_NAME = MetricsUtil.name(MessageSender.class, "emptyMessageList");
 
   private static final String SEND_COUNTER_NAME = name(MessageSender.class, "sendMessage");
@@ -68,14 +74,21 @@ public class MessageSender {
   private static final String SYNC_MESSAGE_TAG_NAME = "sync";
 
   @VisibleForTesting
-  public static final int MAX_MESSAGE_SIZE = (int) DataSize.kibibytes(256).toBytes();
+  public static final int MAX_MESSAGE_SIZE = (int) DataSize.kibibytes(96).toBytes();
 
   @VisibleForTesting
   static final byte NO_EXCLUDED_DEVICE_ID = -1;
 
-  public MessageSender(final MessagesManager messagesManager, final PushNotificationManager pushNotificationManager) {
+  public MessageSender(final MessagesManager messagesManager,
+      final PushNotificationManager pushNotificationManager,
+      final DynamicConfigurationManager<DynamicConfiguration> dynamicConfigurationManager) {
     this.messagesManager = messagesManager;
     this.pushNotificationManager = pushNotificationManager;
+    this.dynamicConfigurationManager = dynamicConfigurationManager;
+  }
+
+  public void addMessageDeliveryListener(final MessageDeliveryListener messageDeliveryListener) {
+    messageDeliveryListeners.add(messageDeliveryListener);
   }
 
   /**
@@ -101,7 +114,12 @@ public class MessageSender {
       final Map<Byte, Envelope> messagesByDeviceId,
       final Map<Byte, Integer> registrationIdsByDeviceId,
       @SuppressWarnings("OptionalUsedAsFieldOrParameterType") final Optional<Byte> syncMessageSenderDeviceId,
-      @Nullable final String userAgent) throws MismatchedDevicesException, MessageTooLargeException {
+      @Nullable final String userAgent)
+      throws MismatchedDevicesException, MessageTooLargeException, MessageDeliveryNotAllowedException {
+
+    if (dynamicConfigurationManager.getConfiguration().getMessageDeliveryConfiguration().isReadOnly()) {
+      throw new MessageDeliveryNotAllowedException();
+    }
 
     final Tag platformTag = UserAgentTagUtil.getPlatformTag(userAgent);
 
@@ -112,7 +130,7 @@ public class MessageSender {
         syncMessageSenderDeviceId,
         platformTag);
 
-    messagesManager.insert(destination.getIdentifier(IdentityType.ACI), messagesByDeviceId)
+    messagesManager.insert(destination.getAccountIdentifier(), messagesByDeviceId)
         .forEach((deviceId, destinationPresent) -> {
           final Envelope message = messagesByDeviceId.get(deviceId);
 
@@ -134,6 +152,16 @@ public class MessageSender {
               .and(platformTag);
 
           Metrics.counter(SEND_COUNTER_NAME, tags).increment();
+
+          messageDeliveryListeners.forEach(messageDeliveryListener ->
+              messageDeliveryListener.handleMessageDelivered(destination,
+                  deviceId,
+                  message.getEphemeral(),
+                  message.getUrgent(),
+                  message.getStory(),
+                  !message.hasSourceServiceId(),
+                  false,
+                  syncMessageSenderDeviceId.isPresent()));
         });
   }
 
@@ -168,7 +196,12 @@ public class MessageSender {
       final boolean isStory,
       final boolean isEphemeral,
       final boolean isUrgent,
-      @Nullable final String userAgent) throws MultiRecipientMismatchedDevicesException, MessageTooLargeException {
+      @Nullable final String userAgent)
+      throws MultiRecipientMismatchedDevicesException, MessageTooLargeException, MessageDeliveryNotAllowedException {
+
+    if (dynamicConfigurationManager.getConfiguration().getMessageDeliveryConfiguration().isReadOnly()) {
+      throw new MessageDeliveryNotAllowedException();
+    }
 
     final Tag platformTag = UserAgentTagUtil.getPlatformTag(userAgent);
 
@@ -187,7 +220,7 @@ public class MessageSender {
       final ServiceIdentifier serviceIdentifier = ServiceIdentifier.fromLibsignal(serviceId);
 
       final Map<Byte, Integer> registrationIdsByDeviceId = recipient.getDevicesAndRegistrationIds()
-          .collect(Collectors.toMap(Pair::first, pair -> (int) pair.second()));
+          .collect(Collectors.toMap(Pair::getFirst, pair -> (int) pair.getSecond()));
 
       getMismatchedDevices(account, serviceIdentifier, registrationIdsByDeviceId, NO_EXCLUDED_DEVICE_ID)
           .ifPresent(mismatchedDevices ->
@@ -221,6 +254,16 @@ public class MessageSender {
                       .and(platformTag);
 
                   Metrics.counter(SEND_COUNTER_NAME, tags).increment();
+
+                  messageDeliveryListeners.forEach(messageDeliveryListener ->
+                      messageDeliveryListener.handleMessageDelivered(account,
+                          deviceId,
+                          isEphemeral,
+                          isUrgent,
+                          isStory,
+                          true,
+                          true,
+                          false));
                 })))
         .thenRun(Util.NOOP);
   }
@@ -273,21 +316,24 @@ public class MessageSender {
     }
 
     if (messagesByDeviceId.isEmpty()) {
+      if (syncMessageSenderDeviceId.isEmpty()) {
+        throw new IllegalArgumentException("Messages must not be empty for non-sync messages");
+      }
       Metrics.counter(EMPTY_MESSAGE_LIST_COUNTER_NAME,
-          Tags.of(SYNC_MESSAGE_TAG_NAME, String.valueOf(syncMessageSenderDeviceId.isPresent())).and(platformTag)).increment();
+          Tags.of(SYNC_MESSAGE_TAG_NAME, String.valueOf(true)).and(platformTag)).increment();
     }
 
     final byte excludedDeviceId;
     if (syncMessageSenderDeviceId.isPresent()) {
-      if (messagesByDeviceId.values().stream().anyMatch(message -> StringUtils.isBlank(message.getSourceServiceId()) ||
-          !destination.isIdentifiedBy(ServiceIdentifier.valueOf(message.getSourceServiceId())))) {
+      if (messagesByDeviceId.values().stream().anyMatch(message -> !message.hasSourceServiceId() ||
+          !destination.isIdentifiedBy(ServiceIdentifier.fromByteString(message.getSourceServiceId())))) {
 
         throw new IllegalArgumentException("Sync message sender device ID specified, but one or more messages are not addressed to sender");
       }
       excludedDeviceId = syncMessageSenderDeviceId.get();
     } else {
-      if (messagesByDeviceId.values().stream().anyMatch(message -> StringUtils.isNotBlank(message.getSourceServiceId()) &&
-          destination.isIdentifiedBy(ServiceIdentifier.valueOf(message.getSourceServiceId())))) {
+      if (messagesByDeviceId.values().stream().anyMatch(message -> message.hasSourceServiceId() &&
+          destination.isIdentifiedBy(ServiceIdentifier.fromByteString(message.getSourceServiceId())))) {
 
         throw new IllegalArgumentException("Sync message sender device ID not specified, but one or more messages are addressed to sender");
       }
@@ -321,7 +367,6 @@ public class MessageSender {
             Tag.of("multiRecipientMessage", String.valueOf(isMultiRecipientMessage)),
             Tag.of("syncMessage", String.valueOf(isSyncMessage)),
             Tag.of("story", String.valueOf(isStory))))
-        .publishPercentileHistogram(true)
         .register(Metrics.globalRegistry)
         .record(contentLength);
 
@@ -363,9 +408,14 @@ public class MessageSender {
           // We know the device must be present because we've already filtered out device IDs that aren't associated
           // with the given account
           final Device device = account.getDevice(deviceId).orElseThrow();
-          final int expectedRegistrationId = device.getRegistrationId(serviceIdentifier.identityType());
+          final Optional<Integer> maybeExpectedRegistrationId = switch (serviceIdentifier.identityType()) {
+            case ACI -> Optional.of(device.getAccountRegistrationId());
+            case PNI -> device.getPhoneNumberIdentityRegistrationId();
+          };
 
-          return registrationId != expectedRegistrationId;
+          return maybeExpectedRegistrationId
+              .map(expectedRegistrationId -> registrationId != expectedRegistrationId)
+              .orElse(true);
         })
         .map(Map.Entry::getKey)
         .collect(Collectors.toSet());

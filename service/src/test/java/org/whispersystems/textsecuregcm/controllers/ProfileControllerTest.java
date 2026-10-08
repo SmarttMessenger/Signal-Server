@@ -8,6 +8,7 @@ package org.whispersystems.textsecuregcm.controllers;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatNoException;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.refEq;
 import static org.mockito.Mockito.any;
@@ -38,20 +39,23 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Base64;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executors;
 import java.util.stream.Stream;
+import javax.annotation.Nullable;
 import org.assertj.core.api.Condition;
 import org.glassfish.jersey.server.ServerProperties;
 import org.glassfish.jersey.test.grizzly.GrizzlyWebTestContainerFactory;
-import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -75,7 +79,10 @@ import org.signal.libsignal.zkgroup.profiles.ProfileKeyCommitment;
 import org.signal.libsignal.zkgroup.profiles.ProfileKeyCredentialRequest;
 import org.signal.libsignal.zkgroup.profiles.ProfileKeyCredentialRequestContext;
 import org.signal.libsignal.zkgroup.profiles.ServerZkProfileOperations;
+import org.whispersystems.textsecuregcm.asn.AsnInfoProvider;
 import org.whispersystems.textsecuregcm.auth.AuthenticatedDevice;
+import org.whispersystems.textsecuregcm.auth.UnidentifiedAccessUtil;
+import org.whispersystems.textsecuregcm.badges.ProfileBadgeConverter;
 import org.whispersystems.textsecuregcm.configuration.BadgeConfiguration;
 import org.whispersystems.textsecuregcm.configuration.BadgesConfiguration;
 import org.whispersystems.textsecuregcm.configuration.dynamic.DynamicConfiguration;
@@ -90,13 +97,11 @@ import org.whispersystems.textsecuregcm.entities.ExpiringProfileKeyCredentialPro
 import org.whispersystems.textsecuregcm.entities.ProfileAvatarUploadAttributes;
 import org.whispersystems.textsecuregcm.entities.VersionedProfileResponse;
 import org.whispersystems.textsecuregcm.identity.AciServiceIdentifier;
-import org.whispersystems.textsecuregcm.identity.IdentityType;
 import org.whispersystems.textsecuregcm.identity.PniServiceIdentifier;
 import org.whispersystems.textsecuregcm.identity.ServiceIdentifier;
 import org.whispersystems.textsecuregcm.limits.RateLimiter;
 import org.whispersystems.textsecuregcm.limits.RateLimiters;
 import org.whispersystems.textsecuregcm.mappers.RateLimitExceededExceptionMapper;
-import org.whispersystems.textsecuregcm.s3.PolicySigner;
 import org.whispersystems.textsecuregcm.s3.PostPolicyGenerator;
 import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.storage.AccountBadge;
@@ -104,7 +109,8 @@ import org.whispersystems.textsecuregcm.storage.AccountsManager;
 import org.whispersystems.textsecuregcm.storage.DeviceCapability;
 import org.whispersystems.textsecuregcm.storage.DynamicConfigurationManager;
 import org.whispersystems.textsecuregcm.storage.ProfilesManager;
-import org.whispersystems.textsecuregcm.storage.VersionedProfile;
+import org.whispersystems.textsecuregcm.storage.VersionedProfileV1;
+import org.whispersystems.textsecuregcm.purchases.ReceiptLevel;
 import org.whispersystems.textsecuregcm.tests.util.AccountsHelper;
 import org.whispersystems.textsecuregcm.tests.util.AuthHelper;
 import org.whispersystems.textsecuregcm.tests.util.ProfileTestHelper;
@@ -125,8 +131,7 @@ class ProfileControllerTest {
   private static final RateLimiter usernameRateLimiter = mock(RateLimiter.class);
 
   private static final PostPolicyGenerator postPolicyGenerator = new PostPolicyGenerator("us-west-1", "profile-bucket",
-      "accessKey");
-  private static final PolicySigner policySigner = new PolicySigner("accessSecret", "us-west-1");
+      "accessKey", "accessSecret");
   private static final ServerZkProfileOperations zkProfileOperations = mock(ServerZkProfileOperations.class);
   private static final ServerSecretParams serverSecretParams = ServerSecretParams.generate();
 
@@ -157,18 +162,35 @@ class ProfileControllerTest {
           rateLimiters,
           accountsManager,
           profilesManager,
+          () -> AsnInfoProvider.EMPTY,
           dynamicConfigurationManager,
-          (acceptableLanguages, accountBadges, isSelf) -> List.of(new Badge("TEST", "other", "Test Badge",
-              "This badge is in unit tests.", List.of("l", "m", "h", "x", "xx", "xxx"), "SVG", List.of(new BadgeSvg("sl", "sd"), new BadgeSvg("ml", "md"), new BadgeSvg("ll", "ld")))
-          ),
+          new ProfileBadgeConverter() {
+            @Override
+            public List<String> visibleBadgeIds(final List<AccountBadge> badges) {
+              return List.of("TEST");
+            }
+
+            @Override
+            public List<Badge> convert(final List<Locale> acceptableLanguages, final List<AccountBadge> accountBadges,
+                final boolean isSelf) {
+              return List.of(new Badge("TEST", "other", "Test Badge",
+                  "This badge is in unit tests.",
+                  List.of("l", "m", "h", "x", "xx", "xxx"),
+                  "SVG", List.of(new BadgeSvg("sl", "sd"),
+                  new BadgeSvg("ml", "md"),
+                  new BadgeSvg("ll", "ld"))));
+            }
+          },
           new BadgesConfiguration(List.of(
               new BadgeConfiguration("TEST", "other", List.of("l", "m", "h", "x", "xx", "xxx"), "SVG", List.of(new BadgeSvg("sl", "sd"), new BadgeSvg("ml", "md"), new BadgeSvg("ll", "ld"))),
               new BadgeConfiguration("TEST1", "testing", List.of("l", "m", "h", "x", "xx", "xxx"), "SVG", List.of(new BadgeSvg("sl", "sd"), new BadgeSvg("ml", "md"), new BadgeSvg("ll", "ld"))),
               new BadgeConfiguration("TEST2", "testing", List.of("l", "m", "h", "x", "xx", "xxx"), "SVG", List.of(new BadgeSvg("sl", "sd"), new BadgeSvg("ml", "md"), new BadgeSvg("ll", "ld"))),
               new BadgeConfiguration("TEST3", "testing", List.of("l", "m", "h", "x", "xx", "xxx"), "SVG", List.of(new BadgeSvg("sl", "sd"), new BadgeSvg("ml", "md"), new BadgeSvg("ll", "ld")))
-          ), List.of("TEST1"), Map.of(1L, "TEST1", 2L, "TEST2", 3L, "TEST3")),
+          ), Map.of(
+              ReceiptLevel.ONE_TIME_DONATION, "TEST1",
+              ReceiptLevel.SUBSCRIPTION_MEDIUM, "TEST2",
+              ReceiptLevel.SUBSCRIPTION_HIGH, "TEST3")),
           postPolicyGenerator,
-          policySigner,
           serverSecretParams,
           zkProfileOperations,
           Executors.newSingleThreadExecutor()))
@@ -176,7 +198,7 @@ class ProfileControllerTest {
 
   @BeforeEach
   void setup() {
-    reset(profilesManager);
+    reset(profilesManager, zkProfileOperations, accountsManager, rateLimiter);
     clock.pin(Instant.ofEpochSecond(42));
     AccountsHelper.setupMockUpdate(accountsManager);
 
@@ -185,17 +207,17 @@ class ProfileControllerTest {
 
     when(dynamicConfigurationManager.getConfiguration()).thenReturn(dynamicConfiguration);
     when(dynamicConfiguration.getPaymentsConfiguration()).thenReturn(dynamicPaymentsConfiguration);
-    when(dynamicPaymentsConfiguration.getDisallowedPrefixes()).thenReturn(Collections.emptyList());
+    when(dynamicPaymentsConfiguration.disallowedPrefixes()).thenReturn(Collections.emptyList());
 
     when(rateLimiters.getProfileLimiter()).thenReturn(rateLimiter);
     when(rateLimiters.getUsernameLookupLimiter()).thenReturn(usernameRateLimiter);
 
     profileAccount = mock(Account.class);
 
-    when(profileAccount.getIdentityKey(IdentityType.ACI)).thenReturn(ACCOUNT_TWO_IDENTITY_KEY);
-    when(profileAccount.getIdentityKey(IdentityType.PNI)).thenReturn(ACCOUNT_TWO_PHONE_NUMBER_IDENTITY_KEY);
-    when(profileAccount.getUuid()).thenReturn(AuthHelper.VALID_UUID_TWO);
-    when(profileAccount.getPhoneNumberIdentifier()).thenReturn(AuthHelper.VALID_PNI_TWO);
+    when(profileAccount.getAccountIdentityKey()).thenReturn(ACCOUNT_TWO_IDENTITY_KEY);
+    when(profileAccount.getPhoneNumberIdentityKey()).thenReturn(Optional.of(ACCOUNT_TWO_PHONE_NUMBER_IDENTITY_KEY));
+    when(profileAccount.getAccountIdentifier()).thenReturn(AuthHelper.VALID_UUID_TWO);
+    when(profileAccount.getPhoneNumberIdentifier()).thenReturn(Optional.of(AuthHelper.VALID_PNI_TWO));
     when(profileAccount.getCurrentProfileVersion()).thenReturn(Optional.empty());
     when(profileAccount.getUsernameHash()).thenReturn(Optional.of(USERNAME_HASH));
     when(profileAccount.getUnidentifiedAccessKey()).thenReturn(Optional.of(UNIDENTIFIED_ACCESS_KEY));
@@ -204,9 +226,9 @@ class ProfileControllerTest {
 
     capabilitiesAccount = mock(Account.class);
 
-    when(capabilitiesAccount.getUuid()).thenReturn(AuthHelper.VALID_UUID);
-    when(capabilitiesAccount.getIdentityKey(IdentityType.ACI)).thenReturn(ACCOUNT_IDENTITY_KEY);
-    when(capabilitiesAccount.getIdentityKey(IdentityType.PNI)).thenReturn(ACCOUNT_PHONE_NUMBER_IDENTITY_KEY);
+    when(capabilitiesAccount.getAccountIdentifier()).thenReturn(AuthHelper.VALID_UUID);
+    when(capabilitiesAccount.getAccountIdentityKey()).thenReturn(ACCOUNT_IDENTITY_KEY);
+    when(capabilitiesAccount.getPhoneNumberIdentityKey()).thenReturn(Optional.of(ACCOUNT_PHONE_NUMBER_IDENTITY_KEY));
 
     when(accountsManager.getByServiceIdentifier(any())).thenReturn(Optional.empty());
 
@@ -228,8 +250,8 @@ class ProfileControllerTest {
     final byte[] about = TestRandomUtil.nextBytes(156);
     final byte[] phoneNumberSharing = TestRandomUtil.nextBytes(29);
 
-    when(profilesManager.get(eq(AuthHelper.VALID_UUID), eq(versionHex("someversion")))).thenReturn(Optional.empty());
-    when(profilesManager.get(eq(AuthHelper.VALID_UUID_TWO), eq(versionHex("validversion")))).thenReturn(Optional.of(new VersionedProfile(
+    when(profilesManager.getV1(eq(AuthHelper.VALID_UUID), eq(versionHex("someversion")))).thenReturn(Optional.empty());
+    when(profilesManager.getV1(eq(AuthHelper.VALID_UUID_TWO), eq(versionHex("validversion")))).thenReturn(Optional.of(new VersionedProfileV1(
         versionHex("validversion"), name, "profiles/validavatar", emoji, about, null, phoneNumberSharing, "validcommitment".getBytes())));
 
     when(profilesManager.deleteAvatar(anyString())).thenReturn(CompletableFuture.completedFuture(null));
@@ -239,12 +261,6 @@ class ProfileControllerTest {
     clearInvocations(usernameRateLimiter);
     clearInvocations(profilesManager);
     clearInvocations(zkProfileOperations);
-  }
-
-  @AfterEach
-  void teardown() {
-    reset(accountsManager);
-    reset(rateLimiter);
   }
 
   @Test
@@ -297,7 +313,9 @@ class ProfileControllerTest {
     final Response response = resources.getJerseyTest()
         .target("/v1/profile/" + AuthHelper.VALID_UUID_TWO)
         .request()
-        .header(HeaderUtils.UNIDENTIFIED_ACCESS_KEY, AuthHelper.getUnidentifiedAccessHeader("incorrect".getBytes()))
+        .header(HeaderUtils.UNIDENTIFIED_ACCESS_KEY,
+            AuthHelper.getUnidentifiedAccessHeader(
+                Arrays.copyOf("incorrect".getBytes(), UnidentifiedAccessUtil.UNIDENTIFIED_ACCESS_KEY_LENGTH)))
         .get();
 
     assertThat(response.getStatus()).isEqualTo(401);
@@ -424,7 +442,8 @@ class ProfileControllerTest {
     final Response response = resources.getJerseyTest()
         .target("/v1/profile/" + AuthHelper.VALID_PNI_TWO)
         .request()
-        .header(HeaderUtils.UNIDENTIFIED_ACCESS_KEY, AuthHelper.getUnidentifiedAccessHeader("incorrect".getBytes()))
+        .header(HeaderUtils.UNIDENTIFIED_ACCESS_KEY, AuthHelper.getUnidentifiedAccessHeader(
+            Arrays.copyOf("incorrect".getBytes(), UnidentifiedAccessUtil.UNIDENTIFIED_ACCESS_KEY_LENGTH)))
         .get();
 
     assertThat(response.getStatus()).isEqualTo(401);
@@ -442,9 +461,7 @@ class ProfileControllerTest {
 
   @CartesianTest
   void testProfileCapabilities(
-      @CartesianTest.Values(booleans = {true, false}) final boolean isDeleteSyncSupported,
       @CartesianTest.Values(booleans = {true, false}) final boolean isAttachmentBackfillSupported) {
-    when(capabilitiesAccount.hasCapability(DeviceCapability.DELETE_SYNC)).thenReturn(isDeleteSyncSupported);
     when(capabilitiesAccount.hasCapability(DeviceCapability.ATTACHMENT_BACKFILL)).thenReturn(isAttachmentBackfillSupported);
     final BaseProfileResponse profile = resources.getJerseyTest()
         .target("/v1/profile/" + AuthHelper.VALID_UUID)
@@ -452,7 +469,6 @@ class ProfileControllerTest {
         .header("Authorization", AuthHelper.getAuthHeader(AuthHelper.VALID_UUID, AuthHelper.VALID_PASSWORD))
         .get(BaseProfileResponse.class);
 
-    assertEquals(isDeleteSyncSupported, profile.getCapabilities().get("deleteSync"));
     assertEquals(isAttachmentBackfillSupported, profile.getCapabilities().get("attachmentBackfill"));
   }
 
@@ -469,10 +485,10 @@ class ProfileControllerTest {
             name, null, null,
             null, true, false, Optional.of(List.of()), null), MediaType.APPLICATION_JSON_TYPE), ProfileAvatarUploadAttributes.class);
 
-    final ArgumentCaptor<VersionedProfile> profileArgumentCaptor = ArgumentCaptor.forClass(VersionedProfile.class);
+    final ArgumentCaptor<VersionedProfileV1> profileArgumentCaptor = ArgumentCaptor.forClass(VersionedProfileV1.class);
 
-    verify(profilesManager, times(1)).get(eq(AuthHelper.VALID_UUID), eq(versionHex("someversion")));
-    verify(profilesManager, times(1)).set(eq(AuthHelper.VALID_UUID), profileArgumentCaptor.capture());
+    verify(profilesManager, times(1)).getV1(eq(AuthHelper.VALID_UUID), eq(versionHex("someversion")));
+    verify(profilesManager, times(1)).setV1(eq(AuthHelper.VALID_UUID), profileArgumentCaptor.capture());
 
     verifyNoMoreInteractions(profilesManager);
 
@@ -518,10 +534,10 @@ class ProfileControllerTest {
       assertThat(response.getStatus()).isEqualTo(200);
       assertThat(response.hasEntity()).isFalse();
 
-      final ArgumentCaptor<VersionedProfile> profileArgumentCaptor = ArgumentCaptor.forClass(VersionedProfile.class);
+      final ArgumentCaptor<VersionedProfileV1> profileArgumentCaptor = ArgumentCaptor.forClass(VersionedProfileV1.class);
 
-      verify(profilesManager, times(1)).get(eq(AuthHelper.VALID_UUID_TWO), eq(versionHex("anotherversion")));
-      verify(profilesManager, times(1)).set(eq(AuthHelper.VALID_UUID_TWO), profileArgumentCaptor.capture());
+      verify(profilesManager, times(1)).getV1(eq(AuthHelper.VALID_UUID_TWO), eq(versionHex("anotherversion")));
+      verify(profilesManager, times(1)).setV1(eq(AuthHelper.VALID_UUID_TWO), profileArgumentCaptor.capture());
 
       verifyNoMoreInteractions(profilesManager);
 
@@ -548,10 +564,10 @@ class ProfileControllerTest {
             name, null, null,
             null, true, false, Optional.of(List.of()), null), MediaType.APPLICATION_JSON_TYPE), ProfileAvatarUploadAttributes.class);
 
-    final ArgumentCaptor<VersionedProfile> profileArgumentCaptor = ArgumentCaptor.forClass(VersionedProfile.class);
+    final ArgumentCaptor<VersionedProfileV1> profileArgumentCaptor = ArgumentCaptor.forClass(VersionedProfileV1.class);
 
-    verify(profilesManager, times(1)).get(eq(AuthHelper.VALID_UUID_TWO), eq(versionHex("validversion")));
-    verify(profilesManager, times(1)).set(eq(AuthHelper.VALID_UUID_TWO), profileArgumentCaptor.capture());
+    verify(profilesManager, times(1)).getV1(eq(AuthHelper.VALID_UUID_TWO), eq(versionHex("validversion")));
+    verify(profilesManager, times(1)).setV1(eq(AuthHelper.VALID_UUID_TWO), profileArgumentCaptor.capture());
     verify(profilesManager, times(1)).deleteAvatar("profiles/validavatar");
 
     assertThat(profileArgumentCaptor.getValue().commitment()).isEqualTo(commitment.serialize());
@@ -577,10 +593,10 @@ class ProfileControllerTest {
       assertThat(response.getStatus()).isEqualTo(200);
       assertThat(response.hasEntity()).isFalse();
 
-      final ArgumentCaptor<VersionedProfile> profileArgumentCaptor = ArgumentCaptor.forClass(VersionedProfile.class);
+      final ArgumentCaptor<VersionedProfileV1> profileArgumentCaptor = ArgumentCaptor.forClass(VersionedProfileV1.class);
 
-      verify(profilesManager, times(1)).get(eq(AuthHelper.VALID_UUID_TWO), eq(versionHex("validversion")));
-      verify(profilesManager, times(1)).set(eq(AuthHelper.VALID_UUID_TWO), profileArgumentCaptor.capture());
+      verify(profilesManager, times(1)).getV1(eq(AuthHelper.VALID_UUID_TWO), eq(versionHex("validversion")));
+      verify(profilesManager, times(1)).setV1(eq(AuthHelper.VALID_UUID_TWO), profileArgumentCaptor.capture());
       verify(profilesManager, times(1)).deleteAvatar(eq("profiles/validavatar"));
 
       assertThat(profileArgumentCaptor.getValue().commitment()).isEqualTo(commitment.serialize());
@@ -607,10 +623,10 @@ class ProfileControllerTest {
       assertThat(response.getStatus()).isEqualTo(200);
       assertThat(response.hasEntity()).isFalse();
 
-      final ArgumentCaptor<VersionedProfile> profileArgumentCaptor = ArgumentCaptor.forClass(VersionedProfile.class);
+      final ArgumentCaptor<VersionedProfileV1> profileArgumentCaptor = ArgumentCaptor.forClass(VersionedProfileV1.class);
 
-      verify(profilesManager, times(1)).get(eq(AuthHelper.VALID_UUID_TWO), eq(versionHex("validversion")));
-      verify(profilesManager, times(1)).set(eq(AuthHelper.VALID_UUID_TWO), profileArgumentCaptor.capture());
+      verify(profilesManager, times(1)).getV1(eq(AuthHelper.VALID_UUID_TWO), eq(versionHex("validversion")));
+      verify(profilesManager, times(1)).setV1(eq(AuthHelper.VALID_UUID_TWO), profileArgumentCaptor.capture());
       verify(profilesManager, never()).deleteAvatar(anyString());
 
       assertThat(profileArgumentCaptor.getValue().commitment()).isEqualTo(commitment.serialize());
@@ -635,10 +651,10 @@ class ProfileControllerTest {
             null, null,
             null, false, true, Optional.of(List.of()), null), MediaType.APPLICATION_JSON_TYPE))) {
 
-      final ArgumentCaptor<VersionedProfile> profileArgumentCaptor = ArgumentCaptor.forClass(VersionedProfile.class);
+      final ArgumentCaptor<VersionedProfileV1> profileArgumentCaptor = ArgumentCaptor.forClass(VersionedProfileV1.class);
 
-      verify(profilesManager, times(1)).get(eq(AuthHelper.VALID_UUID_TWO), eq(versionHex("validversion")));
-      verify(profilesManager, times(1)).set(eq(AuthHelper.VALID_UUID_TWO), profileArgumentCaptor.capture());
+      verify(profilesManager, times(1)).getV1(eq(AuthHelper.VALID_UUID_TWO), eq(versionHex("validversion")));
+      verify(profilesManager, times(1)).setV1(eq(AuthHelper.VALID_UUID_TWO), profileArgumentCaptor.capture());
       verify(profilesManager, times(1)).deleteAvatar(eq("profiles/validavatar"));
 
       assertThat(profileArgumentCaptor.getValue().commitment()).isEqualTo(commitment.serialize());
@@ -665,10 +681,10 @@ class ProfileControllerTest {
       assertThat(response.getStatus()).isEqualTo(200);
       assertThat(response.hasEntity()).isFalse();
 
-      final ArgumentCaptor<VersionedProfile> profileArgumentCaptor = ArgumentCaptor.forClass(VersionedProfile.class);
+      final ArgumentCaptor<VersionedProfileV1> profileArgumentCaptor = ArgumentCaptor.forClass(VersionedProfileV1.class);
 
-      verify(profilesManager, times(1)).get(eq(AuthHelper.VALID_UUID), eq(version));
-      verify(profilesManager, times(1)).set(eq(AuthHelper.VALID_UUID), profileArgumentCaptor.capture());
+      verify(profilesManager, times(1)).getV1(eq(AuthHelper.VALID_UUID), eq(version));
+      verify(profilesManager, times(1)).setV1(eq(AuthHelper.VALID_UUID), profileArgumentCaptor.capture());
       verify(profilesManager, never()).deleteAvatar(anyString());
 
       assertThat(profileArgumentCaptor.getValue().commitment()).isEqualTo(commitment.serialize());
@@ -696,10 +712,10 @@ class ProfileControllerTest {
                 null, null, null, true, false, Optional.of(List.of()), null),
             MediaType.APPLICATION_JSON_TYPE), ProfileAvatarUploadAttributes.class);
 
-    final ArgumentCaptor<VersionedProfile> profileArgumentCaptor = ArgumentCaptor.forClass(VersionedProfile.class);
+    final ArgumentCaptor<VersionedProfileV1> profileArgumentCaptor = ArgumentCaptor.forClass(VersionedProfileV1.class);
 
-    verify(profilesManager, times(1)).get(eq(AuthHelper.VALID_UUID_TWO), eq(version));
-    verify(profilesManager, times(1)).set(eq(AuthHelper.VALID_UUID_TWO), profileArgumentCaptor.capture());
+    verify(profilesManager, times(1)).getV1(eq(AuthHelper.VALID_UUID_TWO), eq(version));
+    verify(profilesManager, times(1)).setV1(eq(AuthHelper.VALID_UUID_TWO), profileArgumentCaptor.capture());
     verify(profilesManager, times(1)).deleteAvatar("profiles/validavatar");
 
     assertThat(profileArgumentCaptor.getValue().commitment()).isEqualTo(commitment.serialize());
@@ -733,14 +749,14 @@ class ProfileControllerTest {
       assertThat(response.getStatus()).isEqualTo(200);
       assertThat(response.hasEntity()).isFalse();
 
-      final ArgumentCaptor<VersionedProfile> profileArgumentCaptor = ArgumentCaptor.forClass(VersionedProfile.class);
+      final ArgumentCaptor<VersionedProfileV1> profileArgumentCaptor = ArgumentCaptor.forClass(VersionedProfileV1.class);
 
-      verify(profilesManager, times(1)).get(eq(AuthHelper.VALID_UUID_TWO), eq(version));
-      verify(profilesManager, times(1)).set(eq(AuthHelper.VALID_UUID_TWO), profileArgumentCaptor.capture());
+      verify(profilesManager, times(1)).getV1(eq(AuthHelper.VALID_UUID_TWO), eq(version));
+      verify(profilesManager, times(1)).setV1(eq(AuthHelper.VALID_UUID_TWO), profileArgumentCaptor.capture());
 
       verifyNoMoreInteractions(profilesManager);
 
-      final VersionedProfile profile = profileArgumentCaptor.getValue();
+      final VersionedProfileV1 profile = profileArgumentCaptor.getValue();
       assertThat(profile.commitment()).isEqualTo(commitment.serialize());
       assertThat(profile.avatar()).isNull();
       assertThat(profile.version()).isEqualTo(version);
@@ -773,14 +789,14 @@ class ProfileControllerTest {
       assertThat(response.getStatus()).isEqualTo(200);
       assertThat(response.hasEntity()).isFalse();
 
-      final ArgumentCaptor<VersionedProfile> profileArgumentCaptor = ArgumentCaptor.forClass(VersionedProfile.class);
+      final ArgumentCaptor<VersionedProfileV1> profileArgumentCaptor = ArgumentCaptor.forClass(VersionedProfileV1.class);
 
-      verify(profilesManager).get(eq(AuthHelper.VALID_UUID_TWO), eq(version));
-      verify(profilesManager).set(eq(AuthHelper.VALID_UUID_TWO), profileArgumentCaptor.capture());
+      verify(profilesManager).getV1(eq(AuthHelper.VALID_UUID_TWO), eq(version));
+      verify(profilesManager).setV1(eq(AuthHelper.VALID_UUID_TWO), profileArgumentCaptor.capture());
 
       verifyNoMoreInteractions(profilesManager);
 
-      final VersionedProfile profile = profileArgumentCaptor.getValue();
+      final VersionedProfileV1 profile = profileArgumentCaptor.getValue();
       assertThat(profile.commitment()).isEqualTo(commitment.serialize());
       assertThat(profile.avatar()).isNull();
       assertThat(profile.version()).isEqualTo(version);
@@ -793,7 +809,7 @@ class ProfileControllerTest {
 
   @Test
   void testSetProfilePaymentAddressCountryNotAllowed() throws InvalidInputException {
-    when(dynamicPaymentsConfiguration.getDisallowedPrefixes())
+    when(dynamicPaymentsConfiguration.disallowedPrefixes())
         .thenReturn(List.of(AuthHelper.VALID_NUMBER_TWO.substring(0, 3)));
 
     final ProfileKeyCommitment commitment = new ProfileKey(new byte[32]).getCommitment(new ServiceId.Aci(AuthHelper.VALID_UUID));
@@ -815,28 +831,27 @@ class ProfileControllerTest {
       assertThat(response.getStatus()).isEqualTo(403);
       assertThat(response.hasEntity()).isFalse();
 
-      verify(profilesManager, never()).set(any(), any());
+      verify(profilesManager, never()).setV1(any(), any());
     }
   }
 
   @ParameterizedTest
-  @ValueSource(booleans = {true, false})
+  @MethodSource
   void testSetProfilePaymentAddressCountryNotAllowedExistingPaymentAddress(
-      final boolean existingPaymentAddressOnProfile) throws InvalidInputException {
-    when(dynamicPaymentsConfiguration.getDisallowedPrefixes())
+      @Nullable final byte[] existingPaymentAddressOnProfile, final byte[] requestPaymentAddress, final boolean expectAllowed) throws InvalidInputException {
+    when(dynamicPaymentsConfiguration.disallowedPrefixes())
         .thenReturn(List.of(AuthHelper.VALID_NUMBER_TWO.substring(0, 3)));
 
     final ProfileKeyCommitment commitment = new ProfileKey(new byte[32]).getCommitment(new ServiceId.Aci(AuthHelper.VALID_UUID));
     final byte[] name = TestRandomUtil.nextBytes(81);
-    final byte[] paymentAddress = TestRandomUtil.nextBytes(582);
     final byte[] phoneNumberSharing = TestRandomUtil.nextBytes(29);
 
     clearInvocations(AuthHelper.VALID_ACCOUNT_TWO);
 
-    when(profilesManager.get(eq(AuthHelper.VALID_UUID_TWO), any()))
+    when(profilesManager.getV1(eq(AuthHelper.VALID_UUID_TWO), any()))
         .thenReturn(Optional.of(
-            new VersionedProfile("1", name, null, null, null,
-                existingPaymentAddressOnProfile ? TestRandomUtil.nextBytes(582) : null,
+            new VersionedProfileV1("1", name, null, null, null,
+                existingPaymentAddressOnProfile,
                 phoneNumberSharing,
                 commitment.serialize())));
 
@@ -847,35 +862,45 @@ class ProfileControllerTest {
         .header("Authorization", AuthHelper.getAuthHeader(AuthHelper.VALID_UUID_TWO, AuthHelper.VALID_PASSWORD_TWO))
         .put(Entity.entity(
             new CreateProfileRequest(commitment, version, name,
-                null, null, paymentAddress, false, false,
+                null, null, requestPaymentAddress, false, false,
                 Optional.of(List.of()), null), MediaType.APPLICATION_JSON_TYPE))) {
 
-      if (existingPaymentAddressOnProfile) {
+      if (expectAllowed) {
         assertThat(response.getStatus()).isEqualTo(200);
         assertThat(response.hasEntity()).isFalse();
 
-        final ArgumentCaptor<VersionedProfile> profileArgumentCaptor = ArgumentCaptor.forClass(VersionedProfile.class);
+        final ArgumentCaptor<VersionedProfileV1> profileArgumentCaptor = ArgumentCaptor.forClass(VersionedProfileV1.class);
 
-        verify(profilesManager).get(eq(AuthHelper.VALID_UUID_TWO), eq(version));
-        verify(profilesManager).set(eq(AuthHelper.VALID_UUID_TWO), profileArgumentCaptor.capture());
+        verify(profilesManager).getV1(eq(AuthHelper.VALID_UUID_TWO), eq(version));
+        verify(profilesManager).setV1(eq(AuthHelper.VALID_UUID_TWO), profileArgumentCaptor.capture());
 
         verifyNoMoreInteractions(profilesManager);
 
-        final VersionedProfile profile = profileArgumentCaptor.getValue();
+        final VersionedProfileV1 profile = profileArgumentCaptor.getValue();
         assertThat(profile.commitment()).isEqualTo(commitment.serialize());
         assertThat(profile.avatar()).isNull();
         assertThat(profile.version()).isEqualTo(version);
         assertThat(profile.name()).isEqualTo(name);
         assertThat(profile.aboutEmoji()).isNull();
         assertThat(profile.about()).isNull();
-        assertThat(profile.paymentAddress()).isEqualTo(paymentAddress);
+        assertThat(profile.paymentAddress()).isEqualTo(requestPaymentAddress);
       } else {
         assertThat(response.getStatus()).isEqualTo(403);
         assertThat(response.hasEntity()).isFalse();
 
-        verify(profilesManager, never()).set(any(), any());
+        verify(profilesManager, never()).setV1(any(), any());
       }
     }
+  }
+
+  static Collection<Arguments> testSetProfilePaymentAddressCountryNotAllowedExistingPaymentAddress() {
+    return List.of(
+        Arguments.argumentSet("null existing payment address, empty new", null, new byte[0], true),
+        Arguments.argumentSet("null existing payment address", null, TestRandomUtil.nextBytes(582), false),
+        Arguments.argumentSet("empty existing payment address, empty new", new byte[0], new byte[0], true),
+        Arguments.argumentSet("empty existing payment address", new byte[0], TestRandomUtil.nextBytes(582), false),
+        Arguments.argumentSet("valid existing payment address", TestRandomUtil.nextBytes(582), TestRandomUtil.nextBytes(582), true)
+    );
   }
 
   @Test
@@ -897,10 +922,10 @@ class ProfileControllerTest {
       assertThat(response.getStatus()).isEqualTo(200);
       assertThat(response.hasEntity()).isFalse();
 
-      final ArgumentCaptor<VersionedProfile> profileArgumentCaptor = ArgumentCaptor.forClass(VersionedProfile.class);
+      final ArgumentCaptor<VersionedProfileV1> profileArgumentCaptor = ArgumentCaptor.forClass(VersionedProfileV1.class);
 
-      verify(profilesManager, times(1)).get(eq(AuthHelper.VALID_UUID_TWO), eq(version));
-      verify(profilesManager, times(1)).set(eq(AuthHelper.VALID_UUID_TWO), profileArgumentCaptor.capture());
+      verify(profilesManager, times(1)).getV1(eq(AuthHelper.VALID_UUID_TWO), eq(version));
+      verify(profilesManager, times(1)).setV1(eq(AuthHelper.VALID_UUID_TWO), profileArgumentCaptor.capture());
 
       verifyNoMoreInteractions(profilesManager);
 
@@ -921,7 +946,7 @@ class ProfileControllerTest {
     final byte[] phoneNumberSharing = TestRandomUtil.nextBytes(29);
 
     final String version = versionHex("validversion");
-    when(profilesManager.get(eq(AuthHelper.VALID_UUID_TWO), eq(version))).thenReturn(Optional.of(new VersionedProfile(
+    when(profilesManager.getV1(eq(AuthHelper.VALID_UUID_TWO), eq(version))).thenReturn(Optional.of(new VersionedProfileV1(
         version, name, "profiles/validavatar", emoji, about, null, phoneNumberSharing, "validcommitment".getBytes())));
 
     final VersionedProfileResponse profile = resources.getJerseyTest()
@@ -952,13 +977,14 @@ class ProfileControllerTest {
     final byte[] name = TestRandomUtil.nextBytes(81);
     final byte[] paymentAddress = TestRandomUtil.nextBytes(582);
 
-    final String version = versionHex("someversion");
+    final byte[] version = version("someversion");
+    final String versionHex = HexFormat.of().formatHex(version);
     try (final Response response = resources.getJerseyTest()
         .target("/v1/profile")
         .request()
         .header("Authorization", AuthHelper.getAuthHeader(AuthHelper.VALID_UUID_TWO, AuthHelper.VALID_PASSWORD_TWO))
         .put(Entity.entity(
-            new CreateProfileRequest(commitment, version, name, null, null, paymentAddress, false, false,
+            new CreateProfileRequest(commitment, versionHex, name, null, null, paymentAddress, false, false,
                 Optional.of(List.of()), null), MediaType.APPLICATION_JSON_TYPE))) {
 
       assertThat(response.getStatus()).isEqualTo(200);
@@ -971,13 +997,14 @@ class ProfileControllerTest {
   @Test
   void testGetProfileReturnsNoPaymentAddressIfCurrentVersionMismatch() {
     final byte[] paymentAddress = TestRandomUtil.nextBytes(582);
-    final String version = versionHex("validversion");
-    when(profilesManager.get(AuthHelper.VALID_UUID_TWO, version)).thenReturn(
-        Optional.of(new VersionedProfile(null, null, null, null, null, paymentAddress, null, null)));
+    final byte[] version = version("validversion");
+    final String versionHex = HexFormat.of().formatHex(version);
+    when(profilesManager.getV1(AuthHelper.VALID_UUID_TWO, versionHex)).thenReturn(
+        Optional.of(new VersionedProfileV1(versionHex, null, null, null, null, paymentAddress, null, null)));
 
     {
       final VersionedProfileResponse profile = resources.getJerseyTest()
-          .target("/v1/profile/" + AuthHelper.VALID_UUID_TWO + "/" + version)
+          .target("/v1/profile/" + AuthHelper.VALID_UUID_TWO + "/" + versionHex)
           .request()
           .header("Authorization", AuthHelper.getAuthHeader(AuthHelper.VALID_UUID, AuthHelper.VALID_PASSWORD))
           .get(VersionedProfileResponse.class);
@@ -989,7 +1016,7 @@ class ProfileControllerTest {
 
     {
       final VersionedProfileResponse profile = resources.getJerseyTest()
-          .target("/v1/profile/" + AuthHelper.VALID_UUID_TWO + "/" + version)
+          .target("/v1/profile/" + AuthHelper.VALID_UUID_TWO + "/" + versionHex)
           .request()
           .header("Authorization", AuthHelper.getAuthHeader(AuthHelper.VALID_UUID, AuthHelper.VALID_PASSWORD))
           .get(VersionedProfileResponse.class);
@@ -997,11 +1024,11 @@ class ProfileControllerTest {
       assertThat(profile.paymentAddress()).containsExactly(paymentAddress);
     }
 
-    when(profileAccount.getCurrentProfileVersion()).thenReturn(Optional.of(versionHex("someotherversion")));
+    when(profileAccount.getCurrentProfileVersion()).thenReturn(Optional.of(version("someotherversion")));
 
     {
       final VersionedProfileResponse profile = resources.getJerseyTest()
-          .target("/v1/profile/" + AuthHelper.VALID_UUID_TWO + "/" + version)
+          .target("/v1/profile/" + AuthHelper.VALID_UUID_TWO + "/" + versionHex)
           .request()
           .header("Authorization", AuthHelper.getAuthHeader(AuthHelper.VALID_UUID, AuthHelper.VALID_PASSWORD))
           .get(VersionedProfileResponse.class);
@@ -1013,14 +1040,15 @@ class ProfileControllerTest {
   @Test
   void testGetProfileWithExpiringProfileKeyCredentialVersionNotFound() throws VerificationFailedException {
     final Account account = mock(Account.class);
-    when(account.getUuid()).thenReturn(AuthHelper.VALID_UUID);
-    when(account.getCurrentProfileVersion()).thenReturn(Optional.of(versionHex("version")));
+    when(account.getAccountIdentifier()).thenReturn(AuthHelper.VALID_UUID);
+    when(account.getAccountIdentifier()).thenReturn(AuthHelper.VALID_UUID);
+    when(account.getCurrentProfileVersion()).thenReturn(Optional.of(version("version")));
 
     when(accountsManager.getByAccountIdentifier(AuthHelper.VALID_UUID)).thenReturn(Optional.of(account));
-    when(profilesManager.get(any(), any())).thenReturn(Optional.empty());
+    when(profilesManager.getV1(any(), any())).thenReturn(Optional.empty());
 
     final ExpiringProfileKeyCredentialProfileResponse profile = resources.getJerseyTest()
-        .target(String.format("/v1/profile/%s/%s/%s", AuthHelper.VALID_UUID, versionHex("version-that-does-not-exist"), "credential-request"))
+        .target(String.format("/v1/profile/%s/%s/%s", AuthHelper.VALID_UUID, HexFormat.of().formatHex(version("version-that-does-not-exist")), "credential-request"))
         .queryParam("credentialType", "expiringProfileKey")
         .request()
         .header("Authorization", AuthHelper.getAuthHeader(AuthHelper.VALID_UUID, AuthHelper.VALID_PASSWORD))
@@ -1044,12 +1072,13 @@ class ProfileControllerTest {
     final byte[] emoji = TestRandomUtil.nextBytes(60);
     final byte[] about = TestRandomUtil.nextBytes(156);
 
-    final String version = versionHex("anotherversion");
+    final byte[] version = version("anotherversion");
+    final String versionHex = HexFormat.of().formatHex(version);
     try (final Response response = resources.getJerseyTest()
         .target("/v1/profile/")
         .request()
         .header("Authorization", AuthHelper.getAuthHeader(AuthHelper.VALID_UUID_TWO, AuthHelper.VALID_PASSWORD_TWO))
-        .put(Entity.entity(new CreateProfileRequest(commitment, version, name, emoji, about, null, false, false,
+        .put(Entity.entity(new CreateProfileRequest(commitment, versionHex, name, emoji, about, null, false, false,
             Optional.of(List.of("TEST2")), null), MediaType.APPLICATION_JSON_TYPE))) {
 
       assertThat(response.getStatus()).isEqualTo(200);
@@ -1072,7 +1101,7 @@ class ProfileControllerTest {
         .target("/v1/profile/")
         .request()
         .header("Authorization", AuthHelper.getAuthHeader(AuthHelper.VALID_UUID_TWO, AuthHelper.VALID_PASSWORD_TWO))
-        .put(Entity.entity(new CreateProfileRequest(commitment, version, name, emoji, about, null, false, false,
+        .put(Entity.entity(new CreateProfileRequest(commitment, versionHex, name, emoji, about, null, false, false,
             Optional.of(List.of("TEST3", "TEST2")), null), MediaType.APPLICATION_JSON_TYPE))) {
 
       assertThat(response.getStatus()).isEqualTo(200);
@@ -1098,7 +1127,7 @@ class ProfileControllerTest {
         .target("/v1/profile/")
         .request()
         .header("Authorization", AuthHelper.getAuthHeader(AuthHelper.VALID_UUID_TWO, AuthHelper.VALID_PASSWORD_TWO))
-        .put(Entity.entity(new CreateProfileRequest(commitment, version, name, emoji, about, null, false, false,
+        .put(Entity.entity(new CreateProfileRequest(commitment, versionHex, name, emoji, about, null, false, false,
             Optional.of(List.of("TEST2", "TEST3")), null), MediaType.APPLICATION_JSON_TYPE))) {
 
       assertThat(response.getStatus()).isEqualTo(200);
@@ -1124,7 +1153,7 @@ class ProfileControllerTest {
         .target("/v1/profile/")
         .request()
         .header("Authorization", AuthHelper.getAuthHeader(AuthHelper.VALID_UUID_TWO, AuthHelper.VALID_PASSWORD_TWO))
-        .put(Entity.entity(new CreateProfileRequest(commitment, version, name, emoji, about, null, false, false,
+        .put(Entity.entity(new CreateProfileRequest(commitment, versionHex, name, emoji, about, null, false, false,
             Optional.of(List.of("TEST1")), null), MediaType.APPLICATION_JSON_TYPE))) {
 
       assertThat(response.getStatus()).isEqualTo(200);
@@ -1151,7 +1180,8 @@ class ProfileControllerTest {
     final byte[] name = TestRandomUtil.nextBytes(81);
     final byte[] emoji = TestRandomUtil.nextBytes(60);
     final byte[] about = TestRandomUtil.nextBytes(156);
-    final String version = versionHex("anotherversion");
+    final byte[] version = version("anotherversion");
+    final String versionHex = HexFormat.of().formatHex(version);
 
     clearInvocations(AuthHelper.VALID_ACCOUNT_TWO);
     reset(accountsManager);
@@ -1174,7 +1204,7 @@ class ProfileControllerTest {
         .target("/v1/profile/")
         .request()
         .header("Authorization", AuthHelper.getAuthHeader(AuthHelper.VALID_UUID_TWO, AuthHelper.VALID_PASSWORD_TWO))
-        .put(Entity.entity(new CreateProfileRequest(commitment, version, name, emoji, about, null, false, false,
+        .put(Entity.entity(new CreateProfileRequest(commitment, versionHex, name, emoji, about, null, false, false,
             Optional.of(List.of("TEST1")), null), MediaType.APPLICATION_JSON_TYPE))) {
 
       assertThat(response.getStatus()).isEqualTo(200);
@@ -1199,7 +1229,8 @@ class ProfileControllerTest {
   @MethodSource
   void testGetProfileWithExpiringProfileKeyCredential(final MultivaluedMap<String, Object> authHeaders)
       throws VerificationFailedException, InvalidInputException {
-    final String version = versionHex("version");
+    final byte[] version = version("version");
+    final String versionHex = HexFormat.of().formatHex(version);
 
     final ServerSecretParams serverSecretParams = ServerSecretParams.generate();
     final ServerPublicParams serverPublicParams = serverSecretParams.getPublicParams();
@@ -1212,7 +1243,7 @@ class ProfileControllerTest {
     final ProfileKey profileKey = new ProfileKey(profileKeyBytes);
     final ProfileKeyCommitment profileKeyCommitment = profileKey.getCommitment(new ServiceId.Aci(AuthHelper.VALID_UUID));
 
-    final VersionedProfile versionedProfile = mock(VersionedProfile.class);
+    final VersionedProfileV1 versionedProfile = mock(VersionedProfileV1.class);
     when(versionedProfile.commitment()).thenReturn(profileKeyCommitment.serialize());
 
     final ProfileKeyCredentialRequestContext profileKeyCredentialRequestContext =
@@ -1221,24 +1252,25 @@ class ProfileControllerTest {
     final ProfileKeyCredentialRequest credentialRequest = profileKeyCredentialRequestContext.getRequest();
 
     final Account account = mock(Account.class);
-    when(account.getUuid()).thenReturn(AuthHelper.VALID_UUID);
+    when(account.getAccountIdentifier()).thenReturn(AuthHelper.VALID_UUID);
+    when(account.getAccountIdentifier()).thenReturn(AuthHelper.VALID_UUID);
     when(account.getCurrentProfileVersion()).thenReturn(Optional.of(version));
     when(account.getUnidentifiedAccessKey()).thenReturn(Optional.of(UNIDENTIFIED_ACCESS_KEY));
     when(account.isIdentifiedBy(new AciServiceIdentifier(AuthHelper.VALID_UUID))).thenReturn(true);
 
-    final Instant expiration = Instant.now().plus(org.whispersystems.textsecuregcm.util.ProfileHelper.EXPIRING_PROFILE_KEY_CREDENTIAL_EXPIRATION)
+    final Instant expiration = Instant.now().plus(org.whispersystems.textsecuregcm.util.ProfileHelper.PROFILE_KEY_CREDENTIAL_EXPIRATION)
         .truncatedTo(ChronoUnit.DAYS);
 
     final ExpiringProfileKeyCredentialResponse credentialResponse =
         serverZkProfile.issueExpiringProfileKeyCredential(credentialRequest, new ServiceId.Aci(AuthHelper.VALID_UUID), profileKeyCommitment, expiration);
 
     when(accountsManager.getByServiceIdentifier(new AciServiceIdentifier(AuthHelper.VALID_UUID))).thenReturn(Optional.of(account));
-    when(profilesManager.get(AuthHelper.VALID_UUID, version)).thenReturn(Optional.of(versionedProfile));
+    when(profilesManager.getV1(AuthHelper.VALID_UUID, versionHex)).thenReturn(Optional.of(versionedProfile));
     when(zkProfileOperations.issueExpiringProfileKeyCredential(eq(credentialRequest), eq(new ServiceId.Aci(AuthHelper.VALID_UUID)), eq(profileKeyCommitment), any()))
         .thenReturn(credentialResponse);
 
     final ExpiringProfileKeyCredentialProfileResponse profile = resources.getJerseyTest()
-        .target(String.format("/v1/profile/%s/%s/%s", AuthHelper.VALID_UUID, version,
+        .target(String.format("/v1/profile/%s/%s/%s", AuthHelper.VALID_UUID, versionHex,
             HexFormat.of().formatHex(credentialRequest.serialize())))
         .queryParam("credentialType", "expiringProfileKey")
         .request()
@@ -1267,7 +1299,8 @@ class ProfileControllerTest {
   @Test
   void testGetProfileWithExpiringProfileKeyCredentialBadRequest()
       throws VerificationFailedException, InvalidInputException {
-    final String version = versionHex("version");
+    final byte[] version = version("version");
+    final String versionHex = HexFormat.of().formatHex(version);
 
     final ServerSecretParams serverSecretParams = ServerSecretParams.generate();
     final ServerPublicParams serverPublicParams = serverSecretParams.getPublicParams();
@@ -1279,7 +1312,7 @@ class ProfileControllerTest {
     final ProfileKey profileKey = new ProfileKey(profileKeyBytes);
     final ProfileKeyCommitment profileKeyCommitment = profileKey.getCommitment(new ServiceId.Aci(AuthHelper.VALID_UUID));
 
-    final VersionedProfile versionedProfile = mock(VersionedProfile.class);
+    final VersionedProfileV1 versionedProfile = mock(VersionedProfileV1.class);
     when(versionedProfile.commitment()).thenReturn(profileKeyCommitment.serialize());
 
     final ProfileKeyCredentialRequestContext profileKeyCredentialRequestContext =
@@ -1288,17 +1321,18 @@ class ProfileControllerTest {
     final ProfileKeyCredentialRequest credentialRequest = profileKeyCredentialRequestContext.getRequest();
 
     final Account account = mock(Account.class);
-    when(account.getUuid()).thenReturn(AuthHelper.VALID_UUID);
+    when(account.getAccountIdentifier()).thenReturn(AuthHelper.VALID_UUID);
     when(account.getUnidentifiedAccessKey()).thenReturn(Optional.of(UNIDENTIFIED_ACCESS_KEY));
     when(account.isIdentifiedBy(new AciServiceIdentifier(AuthHelper.VALID_UUID))).thenReturn(true);
+    when(account.getCurrentProfileVersion()).thenReturn(Optional.of(version));
 
     when(accountsManager.getByServiceIdentifier(new AciServiceIdentifier(AuthHelper.VALID_UUID))).thenReturn(Optional.of(account));
-    when(profilesManager.get(AuthHelper.VALID_UUID, version)).thenReturn(Optional.of(versionedProfile));
+    when(profilesManager.getV1(AuthHelper.VALID_UUID, versionHex)).thenReturn(Optional.of(versionedProfile));
     when(zkProfileOperations.issueExpiringProfileKeyCredential(any(), any(), any(), any()))
         .thenThrow(new VerificationFailedException());
 
     final Response response = resources.getJerseyTest()
-        .target(String.format("/v1/profile/%s/%s/%s", AuthHelper.VALID_UUID, version,
+        .target(String.format("/v1/profile/%s/%s/%s", AuthHelper.VALID_UUID, versionHex,
             HexFormat.of().formatHex(credentialRequest.serialize())))
         .queryParam("credentialType", "expiringProfileKey")
         .request()
@@ -1306,6 +1340,57 @@ class ProfileControllerTest {
         .get();
 
     assertEquals(400, response.getStatus());
+  }
+
+  @Test
+  void testGetProfileWithExpiringProfileKeyCredentialNonCurrentVersion()
+      throws VerificationFailedException, InvalidInputException {
+    final byte[] version = version("version");
+    final String versionHex = HexFormat.of().formatHex(version);
+
+    final ServerSecretParams serverSecretParams = ServerSecretParams.generate();
+    final ServerPublicParams serverPublicParams = serverSecretParams.getPublicParams();
+
+    final ClientZkProfileOperations clientZkProfile = new ClientZkProfileOperations(serverPublicParams);
+
+    final byte[] profileKeyBytes = TestRandomUtil.nextBytes(32);
+
+    final ProfileKey profileKey = new ProfileKey(profileKeyBytes);
+    final ProfileKeyCommitment profileKeyCommitment = profileKey.getCommitment(new ServiceId.Aci(AuthHelper.VALID_UUID));
+
+    final VersionedProfileV1 versionedProfile = mock(VersionedProfileV1.class);
+    when(versionedProfile.commitment()).thenReturn(profileKeyCommitment.serialize());
+    final String avatar = "avatar";
+    when(versionedProfile.avatar()).thenReturn(avatar);
+
+    final ProfileKeyCredentialRequestContext profileKeyCredentialRequestContext =
+        clientZkProfile.createProfileKeyCredentialRequestContext(new ServiceId.Aci(AuthHelper.VALID_UUID), profileKey);
+
+    final ProfileKeyCredentialRequest credentialRequest = profileKeyCredentialRequestContext.getRequest();
+
+    final Account account = mock(Account.class);
+    when(account.getAccountIdentifier()).thenReturn(AuthHelper.VALID_UUID);
+    when(account.getUnidentifiedAccessKey()).thenReturn(Optional.of(UNIDENTIFIED_ACCESS_KEY));
+    when(account.isIdentifiedBy(new AciServiceIdentifier(AuthHelper.VALID_UUID))).thenReturn(true);
+    when(account.getCurrentProfileVersion()).thenReturn(Optional.of(version("the-current-version")));
+
+    when(accountsManager.getByServiceIdentifier(new AciServiceIdentifier(AuthHelper.VALID_UUID))).thenReturn(Optional.of(account));
+    when(profilesManager.getV1(AuthHelper.VALID_UUID, versionHex)).thenReturn(Optional.of(versionedProfile));
+
+    final Response response = resources.getJerseyTest()
+        .target(String.format("/v1/profile/%s/%s/%s", AuthHelper.VALID_UUID, versionHex,
+            HexFormat.of().formatHex(credentialRequest.serialize())))
+        .queryParam("credentialType", "expiringProfileKey")
+        .request()
+        .headers(new MultivaluedHashMap<>(Map.of(HeaderUtils.UNIDENTIFIED_ACCESS_KEY, Base64.getEncoder().encodeToString(UNIDENTIFIED_ACCESS_KEY))))
+        .get();
+
+    assertEquals(200, response.getStatus());
+    final ExpiringProfileKeyCredentialProfileResponse expiringProfileKeyCredentialProfileResponse = response.readEntity(
+        ExpiringProfileKeyCredentialProfileResponse.class);
+
+    assertNull(expiringProfileKeyCredentialProfileResponse.getCredential());
+    assertEquals(avatar, expiringProfileKeyCredentialProfileResponse.getVersionedProfileResponse().avatar());
   }
 
   @Test
@@ -1529,11 +1614,15 @@ class ProfileControllerTest {
     }
   }
 
-  private static String versionHex(final String versionString) {
+  private static byte[] version(final String versionString) {
     try {
-      return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(versionString.getBytes(StandardCharsets.UTF_8)));
+      return MessageDigest.getInstance("SHA-256").digest(versionString.getBytes(StandardCharsets.UTF_8));
     } catch (NoSuchAlgorithmException e) {
       throw new AssertionError(e);
     }
+  }
+
+  private static String versionHex(final String versionString) {
+    return HexFormat.of().formatHex(version(versionString));
   }
 }

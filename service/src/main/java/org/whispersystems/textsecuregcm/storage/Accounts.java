@@ -4,13 +4,12 @@
  */
 package org.whispersystems.textsecuregcm.storage;
 
-import static com.codahale.metrics.MetricRegistry.name;
 import static java.util.Objects.requireNonNull;
+import static org.whispersystems.textsecuregcm.metrics.MetricsUtil.name;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectWriter;
 import com.google.common.annotations.VisibleForTesting;
-import com.google.common.base.Throwables;
 import io.micrometer.core.instrument.Metrics;
 import io.micrometer.core.instrument.Timer;
 import java.io.IOException;
@@ -26,11 +25,9 @@ import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
@@ -38,15 +35,16 @@ import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 import org.apache.commons.lang3.StringUtils;
 import org.signal.libsignal.zkgroup.backups.BackupCredentialType;
+import org.signal.libsignal.zkgroup.receipts.ReceiptCredentialPresentation;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.whispersystems.textsecuregcm.identity.IdentityType;
 import org.whispersystems.textsecuregcm.util.AsyncTimerUtil;
 import org.whispersystems.textsecuregcm.util.AttributeValues;
 import org.whispersystems.textsecuregcm.util.ExceptionUtils;
 import org.whispersystems.textsecuregcm.util.SystemMapper;
 import org.whispersystems.textsecuregcm.util.UUIDUtil;
 import org.whispersystems.textsecuregcm.util.Util;
+import org.whispersystems.textsecuregcm.util.logging.ImpossibleEvents;
 import reactor.core.publisher.Flux;
 import reactor.core.scheduler.Scheduler;
 import software.amazon.awssdk.core.SdkBytes;
@@ -70,6 +68,8 @@ import software.amazon.awssdk.services.dynamodb.model.TransactionCanceledExcepti
 import software.amazon.awssdk.services.dynamodb.model.TransactionConflictException;
 import software.amazon.awssdk.services.dynamodb.model.Update;
 import software.amazon.awssdk.services.dynamodb.model.UpdateItemRequest;
+import software.amazon.awssdk.services.dynamodb.model.UpdateItemResponse;
+import software.amazon.awssdk.services.dynamodb.paginators.ScanPublisher;
 import software.amazon.awssdk.utils.CompletableFutureUtils;
 
 /**
@@ -168,6 +168,7 @@ public class Accounts {
 
   private final DynamoDbClient dynamoDbClient;
   private final DynamoDbAsyncClient dynamoDbAsyncClient;
+  private final RedeemedReceiptsManager redeemedReceiptsManager;
 
   private final String phoneNumberConstraintTableName;
   private final String phoneNumberIdentifierConstraintTableName;
@@ -180,6 +181,7 @@ public class Accounts {
       final Clock clock,
       final DynamoDbClient dynamoDbClient,
       final DynamoDbAsyncClient dynamoDbAsyncClient,
+      final RedeemedReceiptsManager redeemedReceiptsManager,
       final String accountsTableName,
       final String phoneNumberConstraintTableName,
       final String phoneNumberIdentifierConstraintTableName,
@@ -190,6 +192,7 @@ public class Accounts {
     this.clock = clock;
     this.dynamoDbClient = dynamoDbClient;
     this.dynamoDbAsyncClient = dynamoDbAsyncClient;
+    this.redeemedReceiptsManager = redeemedReceiptsManager;
     this.phoneNumberConstraintTableName = phoneNumberConstraintTableName;
     this.phoneNumberIdentifierConstraintTableName = phoneNumberIdentifierConstraintTableName;
     this.accountsTableName = accountsTableName;
@@ -214,24 +217,27 @@ public class Accounts {
   boolean create(final Account account, final List<TransactWriteItem> additionalWriteItems)
       throws AccountAlreadyExistsException {
 
+    if (account.getNumber().isEmpty() || account.getPhoneNumberIdentifier().isEmpty()) {
+      throw new IllegalArgumentException("Phone number and phone number identifier must be set");
+    }
+
     final Timer.Sample sample = Timer.start();
 
     try {
-      final AttributeValue uuidAttr = AttributeValues.fromUUID(account.getUuid());
-      final AttributeValue numberAttr = AttributeValues.fromString(account.getNumber());
-      final AttributeValue pniUuidAttr = AttributeValues.fromUUID(account.getPhoneNumberIdentifier());
+      final AttributeValue uuidAttr = AttributeValues.fromUUID(account.getAccountIdentifier());
+      final AttributeValue numberAttr = AttributeValues.fromString(account.getNumber().get());
+      final AttributeValue pniUuidAttr = AttributeValues.fromUUID(account.getPhoneNumberIdentifier().get());
 
       final TransactWriteItem phoneNumberConstraintPut = buildConstraintTablePutIfAbsent(
           phoneNumberConstraintTableName, uuidAttr, ATTR_ACCOUNT_E164, numberAttr);
-
       final TransactWriteItem phoneNumberIdentifierConstraintPut = buildConstraintTablePutIfAbsent(
           phoneNumberIdentifierConstraintTableName, uuidAttr, ATTR_PNI_UUID, pniUuidAttr);
 
-      final TransactWriteItem accountPut = buildAccountPut(account, uuidAttr, numberAttr, pniUuidAttr);
+      final TransactWriteItem accountPut = buildAccountPut(account, uuidAttr, Optional.of(numberAttr), Optional.of(pniUuidAttr));
 
       // Clear any "recently deleted account" record for this number since, if it existed, we've used its old ACI for
       // the newly-created account.
-      final TransactWriteItem deletedAccountDelete = buildRemoveDeletedAccount(account.getPhoneNumberIdentifier());
+      final TransactWriteItem deletedAccountDelete = buildRemoveDeletedAccount(account.getPhoneNumberIdentifier().get());
 
       final Collection<TransactWriteItem> writeItems = new ArrayList<>(
           List.of(phoneNumberConstraintPut, phoneNumberIdentifierConstraintPut, accountPut, deletedAccountDelete));
@@ -292,6 +298,108 @@ public class Accounts {
     return true;
   }
 
+  /// Create an account record via a receipt presentation
+  ///
+  /// @param account                          The account to create
+  /// @param receiptCredentialPresentation    A presentation of a receipt credential that grants the ability to create
+  /// one account
+  /// @param accountRecoveryPasswordInRequest The account-recovery-password supplied in the request
+  /// @param additionalWriteItems             Additional items to include in the transaction
+  ///
+  /// @return true
+  /// @throws AccountAlreadyExistsException     An account was already created using this receipt
+  /// @throws ReceiptAlreadyRedeemedException   The receipt was already used to create an account and this creation
+  ///                                           request would require a new account
+  /// @throws AccountCreationConditionException One of the conditions in `additionalWriteItems` failed. The exception
+  ///                                           contains the index of the [TransactWriteItem] that failed
+  boolean create(final Account account,
+      final ReceiptCredentialPresentation receiptCredentialPresentation,
+      final byte[] accountRecoveryPasswordInRequest,
+      final List<TransactWriteItem> additionalWriteItems)
+      throws AccountAlreadyExistsException, ReceiptAlreadyRedeemedException, AccountCreationConditionException {
+
+    final Timer.Sample sample = Timer.start();
+
+    try {
+      final AttributeValue uuidAttr = AttributeValues.fromUUID(account.getAccountIdentifier());
+
+      final TransactWriteItem signalLoginReceiptConstraintPut =
+          redeemedReceiptsManager.buildTransactWriteItemForReceipt(
+              receiptCredentialPresentation.getReceiptSerial(),
+              Instant.ofEpochSecond(receiptCredentialPresentation.getReceiptExpirationTime()),
+              receiptCredentialPresentation.getReceiptLevel(),
+              account.getAccountIdentifier());
+      final TransactWriteItem accountPut = buildAccountPut(account, uuidAttr, Optional.empty(), Optional.empty());
+
+      final Collection<TransactWriteItem> writeItems = new ArrayList<>(
+          List.of(signalLoginReceiptConstraintPut, accountPut));
+
+      final int additionalWriteItemsStart = writeItems.size();
+      writeItems.addAll(additionalWriteItems);
+
+      final TransactWriteItemsRequest request = TransactWriteItemsRequest.builder()
+          .transactItems(writeItems)
+          .build();
+
+      try {
+        dynamoDbClient.transactWriteItems(request);
+      } catch (final TransactionCanceledException e) {
+
+        final CancellationReason receiptSerialConstraintCancellationReason = e.cancellationReasons().get(0);
+
+        if (conditionalCheckFailed(receiptSerialConstraintCancellationReason)) {
+          final UUID existingAccountUuid = UUIDUtil.fromByteBuffer(receiptSerialConstraintCancellationReason.item()
+              .get(RedeemedReceiptsManager.ATTR_ACCOUNT_UUID).b().asByteBuffer());
+          final Account existingAccount = getByAccountIdentifier(existingAccountUuid)
+              // The account was already deleted, and we don't allow re-registering with the same receipt
+              .orElseThrow(ReceiptAlreadyRedeemedException::new);
+
+          final boolean accountRecoveryPasswordMatches = existingAccount.getAccountRecoveryPassword()
+              .map(arp -> PhoneNumberRecoveryPasswordsManager.verify(arp, accountRecoveryPasswordInRequest))
+              .orElse(false);
+
+          // Determine if this request is safe to idempotently succeed. It's safe if:
+          // - The account recovery password in the request matches the existing account's
+          // - The existing account does not have any MFA keys. If MFA keys were added to the account the caller should
+          //   have used numberless account recovery rather than using their original receipt
+          //
+          // If either of these conditions are not met, the caller is incorrectly using an already redeemed receipt.
+          final boolean isRetry = accountRecoveryPasswordMatches && existingAccount.getMfaKeys().isEmpty();
+
+          if (!isRetry) {
+            throw new ReceiptAlreadyRedeemedException();
+          }
+
+          throw new AccountAlreadyExistsException(existingAccount);
+        }
+
+        for (int i = additionalWriteItemsStart; i < e.cancellationReasons().size(); i++) {
+          if (conditionalCheckFailed(e.cancellationReasons().get(i))) {
+            // Indicate the first caller-supplied TransactWriteItem that failed
+            throw new AccountCreationConditionException(i - additionalWriteItemsStart);
+          }
+        }
+
+        final CancellationReason accountCancellationReason = e.cancellationReasons().get(1);
+        if (conditionalCheckFailed(accountCancellationReason)) {
+          throw new IllegalStateException("Tried to create an account with an ACI that already exists " + account.getAccountIdentifier());
+        }
+
+        if (TRANSACTION_CONFLICT.equals(accountCancellationReason.code())) {
+          // this should only happen if two clients manage to make concurrent create() calls
+          throw new ContestedOptimisticLockException();
+        }
+
+        // this shouldn't happen
+        throw new RuntimeException("could not create account: " + extractCancellationReasonCodes(e));
+      }
+    } finally {
+      sample.stop(CREATE_TIMER);
+    }
+
+    return true;
+  }
+
   /**
    * Copies over any account attributes that should be preserved when a new account reclaims an account identifier.
    *
@@ -302,12 +410,14 @@ public class Accounts {
       final Account accountToCreate,
       final Collection<TransactWriteItem> additionalWriteItems) {
 
-    if (!existingAccount.getUuid().equals(accountToCreate.getUuid()) ||
+    if (!existingAccount.getAccountIdentifier().equals(accountToCreate.getAccountIdentifier()) ||
+        existingAccount.getNumber().isPresent() != accountToCreate.getNumber().isPresent() ||
         !existingAccount.getPhoneNumberIdentifier().equals(accountToCreate.getPhoneNumberIdentifier())) {
 
       log.error("Reclaimed accounts must match. Old account {}:{}:{}, New account {}:{}:{}",
-          existingAccount.getUuid(), redactPhoneNumber(existingAccount.getNumber()), existingAccount.getPhoneNumberIdentifier(),
-          accountToCreate.getUuid(), redactPhoneNumber(accountToCreate.getNumber()), accountToCreate.getPhoneNumberIdentifier());
+          existingAccount.getAccountIdentifier(), existingAccount.getNumber().map(Accounts::redactPhoneNumber), existingAccount.getPhoneNumberIdentifier(),
+          accountToCreate.getAccountIdentifier(), accountToCreate.getNumber().map(Accounts::redactPhoneNumber), accountToCreate.getPhoneNumberIdentifier());
+
       throw new IllegalArgumentException("reclaimed accounts must match");
     }
 
@@ -321,6 +431,20 @@ public class Accounts {
       accountToCreate.setBackupCredentialRequests(
           existingAccount.getBackupCredentialRequest(BackupCredentialType.MESSAGES).orElse(null),
           existingAccount.getBackupCredentialRequest(BackupCredentialType.MEDIA).orElse(null));
+
+      // Carry over the existing backup voucher to the new account
+      accountToCreate.setBackupVoucher(existingAccount.getBackupVoucher());
+
+      // Carry over any existing badges to the new account
+      accountToCreate.setBadges(clock, existingAccount.getBadges());
+
+      // Carry over the existing ZK credential key to the new account
+      accountToCreate.setZkCredentialKey(existingAccount.getZkCredentialKey().orElse(null));
+      accountToCreate.setZkCredentialKeyRotationId(existingAccount.getZkCredentialKeyRotationId());
+
+      // Carry over any existing MFA keys to the new account; we don't need to copy the pending TOTP key since that's
+      // just a temporary holding place for essentially ephemeral data
+      accountToCreate.setMfaKeys(new HashMap<>(existingAccount.getMfaKeys()));
 
       final List<TransactWriteItem> writeItems = new ArrayList<>();
 
@@ -352,7 +476,7 @@ public class Accounts {
                 .tableName(usernamesConstraintTableName)
                 .item(Map.of(
                     UsernameTable.KEY_USERNAME_HASH, AttributeValues.fromByteArray(usernameHash),
-                    UsernameTable.ATTR_ACCOUNT_UUID, AttributeValues.fromUUID(accountToCreate.getUuid()),
+                    UsernameTable.ATTR_ACCOUNT_UUID, AttributeValues.fromUUID(accountToCreate.getAccountIdentifier()),
                     UsernameTable.ATTR_TTL, AttributeValues.fromLong(expirationTime),
                     UsernameTable.ATTR_CONFIRMED, AttributeValues.fromBool(false),
                     UsernameTable.ATTR_RECLAIMABLE, AttributeValues.fromBool(true)))
@@ -363,22 +487,56 @@ public class Accounts {
                     "#uuid", UsernameTable.ATTR_ACCOUNT_UUID))
                 .expressionAttributeValues(Map.of(
                     ":now", AttributeValues.fromLong(clock.instant().getEpochSecond()),
-                    ":uuid", AttributeValues.fromUUID(accountToCreate.getUuid())))
+                    ":uuid", AttributeValues.fromUUID(accountToCreate.getAccountIdentifier())))
                 .returnValuesOnConditionCheckFailure(ReturnValuesOnConditionCheckFailure.ALL_OLD)
                 .build())
             .build());
       }
-      writeItems.add(UpdateAccountSpec.forAccount(accountsTableName, accountToCreate).transactItem());
+
+      // Phone number canonicalization means that a user can use a different phone number in the same equivalence class
+      // to reclaim the account.
+      if (!existingAccount.getNumber().equals(accountToCreate.getNumber())
+          && existingAccount.getNumber().isPresent()
+          && accountToCreate.getNumber().isPresent()) {
+        final String existingAccountNumber = existingAccount.getNumber().get();
+        final String accountToCreateNumber = accountToCreate.getNumber().get();
+        if (Util.getAlternateForms(existingAccountNumber).contains(accountToCreateNumber)) {
+          final AttributeValue uuidAttr = AttributeValues.fromUUID(existingAccount.getAccountIdentifier());
+          final AttributeValue numberAttr = AttributeValues.fromString(accountToCreateNumber);
+          final TransactWriteItem phoneNumberConstraintPut = buildConstraintTablePutIfAbsent(
+              phoneNumberConstraintTableName, uuidAttr, ATTR_ACCOUNT_E164, numberAttr);
+
+          writeItems.add(buildDelete(phoneNumberConstraintTableName, ATTR_ACCOUNT_E164, existingAccountNumber));
+          writeItems.add(phoneNumberConstraintPut);
+        } else {
+          throw new IllegalStateException(String.format("Reclaiming account with a non-equivalent phone number. Old account %s:%s:%s, new account %s:%s:%s",
+              existingAccount.getAccountIdentifier(), redactPhoneNumber(existingAccountNumber), existingAccount.getPhoneNumberIdentifier(),
+              accountToCreate.getAccountIdentifier(), redactPhoneNumber(accountToCreateNumber), accountToCreate.getPhoneNumberIdentifier()));
+        }
+      }
+
+      final int updateAccountItemIndex = writeItems.size();
+      writeItems.add(UpdateAccountSpec.forReclaimedAccount(accountsTableName, accountToCreate, existingAccount.getNumber()).transactItem());
       writeItems.addAll(additionalWriteItems);
 
       return dynamoDbAsyncClient.transactWriteItems(TransactWriteItemsRequest.builder().transactItems(writeItems).build())
-          .thenApply(response -> {
+          .thenApply(_ -> {
             accountToCreate.setVersion(accountToCreate.getVersion() + 1);
             return (Void) null;
           })
           .exceptionally(throwable -> {
             final Throwable unwrapped = ExceptionUtils.unwrap(throwable);
             if (unwrapped instanceof TransactionCanceledException te) {
+              if (Accounts.conditionalCheckFailed(te.cancellationReasons().get(updateAccountItemIndex))) {
+                final Map<String, AttributeValue> item = te.cancellationReasons().get(updateAccountItemIndex).item();
+                final Optional<String> existingNumber = Optional.ofNullable(AttributeValues.getString(item, Accounts.ATTR_ACCOUNT_E164, null));
+                if (!existingAccount.getNumber().equals(existingNumber)) {
+                  log.error("Failed to update account due to unexpected existing phone number. Account {}. Expected {}, got {}",
+                      existingAccount.getAccountIdentifier(), existingAccount.getNumber(), existingNumber);
+                  throw new UnexpectedExistingPhoneNumberException();
+                }
+              }
+
               if (te.cancellationReasons().stream().anyMatch(Accounts::conditionalCheckFailed)) {
                 throw new ContestedOptimisticLockException();
               }
@@ -409,8 +567,8 @@ public class Accounts {
       final Collection<TransactWriteItem> additionalWriteItems) {
 
     CHANGE_NUMBER_TIMER.record(() -> {
-      final String originalNumber = account.getNumber();
-      final UUID originalPni = account.getPhoneNumberIdentifier();
+      final String originalNumber = account.getNumber().orElseThrow(() -> new IllegalArgumentException("Account does not have a phone number"));
+      final UUID originalPni = account.getPhoneNumberIdentifier().orElseThrow(() -> new IllegalArgumentException("Account does not have a phone number"));
 
       boolean succeeded = false;
 
@@ -419,7 +577,7 @@ public class Accounts {
       int accountUpdateIndex = -1;
       try {
         final List<TransactWriteItem> writeItems = new ArrayList<>();
-        final AttributeValue uuidAttr = AttributeValues.fromUUID(account.getUuid());
+        final AttributeValue uuidAttr = AttributeValues.fromUUID(account.getAccountIdentifier());
         final AttributeValue numberAttr = AttributeValues.fromString(number);
         final AttributeValue pniAttr = AttributeValues.fromUUID(phoneNumberIdentifier);
 
@@ -491,18 +649,13 @@ public class Accounts {
     });
   }
 
-
-  /**
-   * Reserve a username hash under the account UUID
-   * @return a future that completes once the username hash has been reserved; may fail with an
-   * {@link ContestedOptimisticLockException} if the account has been updated or there are concurrent updates to the
-   * account or constraint records, and with an
-   * {@link UsernameHashNotAvailableException} if the username was taken by someone else
-   */
-  public CompletableFuture<Void> reserveUsernameHash(
-      final Account account,
-      final byte[] reservedUsernameHash,
-      final Duration ttl) {
+  /// Reserve a username hash under the account UUID
+  ///
+  /// @throws ContestedOptimisticLockException if the account has been updated or there are concurrent updates to the
+  /// account or constraint records, and with an
+  /// @throws UsernameHashNotAvailableException if the username was taken by someone else
+  public void reserveUsernameHash(final Account account, final byte[] reservedUsernameHash, final Duration ttl)
+          throws ContestedOptimisticLockException, UsernameHashNotAvailableException {
 
     final Timer.Sample sample = Timer.start();
 
@@ -517,19 +670,24 @@ public class Accounts {
     // What we'd really like to do is set expirationTime = max(oldExpirationTime, now + ttl), but dynamodb doesn't
     // support that. Instead, we'll set expiration if it's greater than the existing expiration, otherwise retry
     final long expirationTime = clock.instant().plus(ttl).getEpochSecond();
-    return tryReserveUsernameHash(account, reservedUsernameHash, expirationTime)
-        .exceptionallyCompose(ExceptionUtils.exceptionallyHandler(TtlConflictException.class, ttlConflict ->
-            // retry (once) with the returned expiration time
-            tryReserveUsernameHash(account, reservedUsernameHash, ttlConflict.getExistingExpirationSeconds())))
-        .whenComplete((response, throwable) -> {
-          sample.stop(RESERVE_USERNAME_TIMER);
+    boolean succeeded = false;
 
-          if (throwable == null) {
-            account.setVersion(account.getVersion() + 1);
-          } else {
-            account.setReservedUsernameHash(maybeOriginalReservation.orElse(null));
-          }
-        });
+    try {
+      tryReserveUsernameHash(account, reservedUsernameHash, expirationTime);
+      succeeded = true;
+    } catch (final TtlConflictException e) {
+      // retry (once) with the returned expiration time
+      tryReserveUsernameHash(account, reservedUsernameHash, e.getExistingExpirationSeconds());
+      succeeded = true;
+    } finally {
+      sample.stop(RESERVE_USERNAME_TIMER);
+
+      if (succeeded) {
+        account.setVersion(account.getVersion() + 1);
+      } else {
+        account.setReservedUsernameHash(maybeOriginalReservation.orElse(null));
+      }
+    }
   }
 
   private static class TtlConflictException extends ContestedOptimisticLockException {
@@ -544,23 +702,24 @@ public class Accounts {
     }
   }
 
-  /**
-   * Try to reserve the provided usernameHash
-   *
-   * @param updatedAccount        The account, already updated to reserve the provided usernameHash
-   * @param reservedUsernameHash  The usernameHash to reserve
-   * @param expirationTimeSeconds When the reservation should expire
-   * @return A future that completes successfully if the usernameHash was reserved
-   * @throws TtlConflictException if the usernameHash was already reserved but with a longer TTL. The operation should
-   *                              be retried with the returned {@link TtlConflictException#getExistingExpirationSeconds()}
-   */
-  private CompletableFuture<Void> tryReserveUsernameHash(
+  /// Try to reserve the provided usernameHash
+  ///
+  /// @param updatedAccount        The account, already updated to reserve the provided usernameHash
+  /// @param reservedUsernameHash  The usernameHash to reserve
+  /// @param expirationTimeSeconds When the reservation should expire
+  ///
+  /// @throws ContestedOptimisticLockException  in the event of concurrent modifications to the account
+  /// @throws UsernameHashNotAvailableException if the username hash is already taken
+  /// @throws TtlConflictException              if the usernameHash was already reserved but with a longer TTL. The
+  ///                                           operation should be retried with the returned
+  ///                                           {@link TtlConflictException#getExistingExpirationSeconds()}
+  private void tryReserveUsernameHash(
       final Account updatedAccount,
       final byte[] reservedUsernameHash,
-      final long expirationTimeSeconds) {
+      final long expirationTimeSeconds) throws ContestedOptimisticLockException, TtlConflictException, UsernameHashNotAvailableException {
 
     // Use account UUID as a "reservation token" - by providing this, the client proves ownership of the hash
-    final UUID uuid = updatedAccount.getUuid();
+    final UUID uuid = updatedAccount.getAccountIdentifier();
 
     final List<TransactWriteItem> writeItems = new ArrayList<>();
 
@@ -593,34 +752,31 @@ public class Accounts {
 
     writeItems.add(UpdateAccountSpec.forAccount(accountsTableName, updatedAccount).transactItem());
 
-    return dynamoDbAsyncClient
-        .transactWriteItems(TransactWriteItemsRequest.builder().transactItems(writeItems).build())
-        .thenRun(Util.NOOP)
-        .exceptionally(ExceptionUtils.exceptionallyHandler(TransactionCanceledException.class, e -> {
-          // If the constraint table update failed the condition check, the username's taken and we should stop
-          // trying. However,
-          if (conditionalCheckFailed(e.cancellationReasons().get(0))) {
-            // The constraint table update failed the condition check. It could be because the username was taken,
-            // or because we need to retry with a longer TTL
-            final Map<String, AttributeValue> item = e.cancellationReasons().getFirst().item();
-            final UUID existingOwner = AttributeValues.getUUID(item, UsernameTable.ATTR_ACCOUNT_UUID, null);
-            final boolean confirmed = AttributeValues.getBool(item, UsernameTable.ATTR_CONFIRMED, false);
-            final long existingTtl = AttributeValues.getLong(item, UsernameTable.ATTR_TTL, 0L);
-            if (uuid.equals(existingOwner) && !confirmed && existingTtl > expirationTimeSeconds) {
-              // We failed because we provided a shorter TTL than the one that exists on the reservation. The caller
-              // can retry with updated expiration time.
-              throw new TtlConflictException(existingTtl);
-            }
-            throw ExceptionUtils.wrap(new UsernameHashNotAvailableException());
-          } else if (conditionalCheckFailed(e.cancellationReasons().get(1)) ||
-              e.cancellationReasons().stream().anyMatch(Accounts::isTransactionConflict)) {
-            // The accounts table fails the conditional check or either table was concurrently updated, it's an
-            // optimistic locking failure and we should try again.
-            throw new ContestedOptimisticLockException();
-          } else {
-            throw ExceptionUtils.wrap(e);
-          }
-        }));
+    try {
+      dynamoDbClient.transactWriteItems(TransactWriteItemsRequest.builder().transactItems(writeItems).build());
+    } catch (final TransactionCanceledException e) {
+      if (conditionalCheckFailed(e.cancellationReasons().get(0))) {
+        // The constraint table update failed the condition check. It could be because the username was taken,
+        // or because we need to retry with a longer TTL
+        final Map<String, AttributeValue> item = e.cancellationReasons().getFirst().item();
+        final UUID existingOwner = AttributeValues.getUUID(item, UsernameTable.ATTR_ACCOUNT_UUID, null);
+        final boolean confirmed = AttributeValues.getBool(item, UsernameTable.ATTR_CONFIRMED, false);
+        final long existingTtl = AttributeValues.getLong(item, UsernameTable.ATTR_TTL, 0L);
+        if (uuid.equals(existingOwner) && !confirmed && existingTtl > expirationTimeSeconds) {
+          // We failed because we provided a shorter TTL than the one that exists on the reservation. The caller
+          // can retry with updated expiration time.
+          throw new TtlConflictException(existingTtl);
+        }
+        throw new UsernameHashNotAvailableException();
+      } else if (conditionalCheckFailed(e.cancellationReasons().get(1)) ||
+          e.cancellationReasons().stream().anyMatch(Accounts::isTransactionConflict)) {
+        // The accounts table fails the conditional check or either table was concurrently updated, it's an
+        // optimistic locking failure and we should try again.
+        throw new ContestedOptimisticLockException();
+      } else {
+        throw e;
+      }
+    }
   }
 
   /**
@@ -715,138 +871,133 @@ public class Accounts {
         .build()).build();
   }
 
-  /**
-   * Confirm (set) a previously reserved username hash
-   *
-   * @param account to update
-   * @param usernameHash believed to be available
-   * @param encryptedUsername the encrypted form of the previously reserved username; used for the username link
-   * @return a future that completes once the username hash has been confirmed; may fail with an
-   * {@link ContestedOptimisticLockException} if the account has been updated or there are concurrent updates to the
-   * account or constraint records, and with an
-   * {@link UsernameHashNotAvailableException} if the username was taken by someone else
-   */
-  public CompletableFuture<Void> confirmUsernameHash(final Account account, final byte[] usernameHash, @Nullable final byte[] encryptedUsername) {
+  /// Confirm (set) a previously reserved username hash
+  ///
+  /// @param account to update
+  /// @param usernameHash believed to be available
+  /// @param encryptedUsername the encrypted form of the previously reserved username; used for the username link
+  ///
+  /// @throws ContestedOptimisticLockException if the account has been updated or there are concurrent updates to the
+  /// account or constraint records
+  /// @throws UsernameHashNotAvailableException if the username was taken by someone else
+  public void confirmUsernameHash(final Account account, final byte[] usernameHash, @Nullable final byte[] encryptedUsername)
+      throws ContestedOptimisticLockException, UsernameHashNotAvailableException {
+
     final Timer.Sample sample = Timer.start();
     if (usernameHash == null) {
       throw new IllegalArgumentException("Cannot confirm a null usernameHash");
     }
 
-    return pickLinkHandle(account, usernameHash)
-        .thenCompose(linkHandle -> {
-          final Optional<byte[]> maybeOriginalUsernameHash = account.getUsernameHash();
-          final Account updatedAccount = AccountUtil.cloneAccountAsNotStale(account);
-          updatedAccount.setUsernameHash(usernameHash);
-          updatedAccount.setReservedUsernameHash(null);
-          updatedAccount.setUsernameLinkDetails(encryptedUsername == null ? null : linkHandle, encryptedUsername);
-          final Instant now = clock.instant();
-          final Optional<byte[]> holdToRemove = maybeOriginalUsernameHash
-              .flatMap(hold -> addToHolds(updatedAccount, hold, now));
+    final UUID linkHandle = pickLinkHandle(account, usernameHash);
 
-          final List<TransactWriteItem> writeItems = new ArrayList<>();
+    final Optional<byte[]> maybeOriginalUsernameHash = account.getUsernameHash();
+    final Account updatedAccount = AccountUtil.cloneAccountAsNotStale(account);
+    updatedAccount.setUsernameHash(usernameHash);
+    updatedAccount.setReservedUsernameHash(null);
+    updatedAccount.setUsernameLinkDetails(encryptedUsername == null ? null : linkHandle, encryptedUsername);
 
-          // 0: add the username hash to the constraint table, wiping out the ttl if we had already reserved the hash
-          writeItems.add(TransactWriteItem.builder().put(Put.builder()
-                  .tableName(usernamesConstraintTableName)
-                  .item(Map.of(
-                      UsernameTable.ATTR_ACCOUNT_UUID, AttributeValues.fromUUID(updatedAccount.getUuid()),
-                      UsernameTable.KEY_USERNAME_HASH, AttributeValues.fromByteArray(usernameHash),
-                      UsernameTable.ATTR_CONFIRMED, AttributeValues.fromBool(true)))
-                  // it's not in the constraint table OR it's expired OR it was reserved by us
-                  .conditionExpression("attribute_not_exists(#username_hash) OR #ttl < :now OR (#aci = :aci AND #confirmed = :confirmed)")
-                  .expressionAttributeNames(Map.of(
-                      "#username_hash", UsernameTable.KEY_USERNAME_HASH,
-                      "#ttl", UsernameTable.ATTR_TTL,
-                      "#aci", UsernameTable.ATTR_ACCOUNT_UUID,
-                      "#confirmed", UsernameTable.ATTR_CONFIRMED))
-                  .expressionAttributeValues(Map.of(
-                      ":now", AttributeValues.fromLong(clock.instant().getEpochSecond()),
-                      ":aci", AttributeValues.fromUUID(updatedAccount.getUuid()),
-                      ":confirmed", AttributeValues.fromBool(false)))
-                  .returnValuesOnConditionCheckFailure(ReturnValuesOnConditionCheckFailure.ALL_OLD)
-                  .build())
-              .build());
+    final Instant now = clock.instant();
+    final Optional<byte[]> holdToRemove =
+        maybeOriginalUsernameHash.flatMap(hold -> addToHolds(updatedAccount, hold, now));
 
-          // 1: update the account object (conditioned on the version increment)
-          writeItems.add(UpdateAccountSpec.forAccount(accountsTableName, updatedAccount).transactItem());
+    final List<TransactWriteItem> writeItems = new ArrayList<>();
 
-          // 2?: Add a temporary hold for the old username to stop others from claiming it
-          maybeOriginalUsernameHash.ifPresent(originalUsernameHash ->
-              writeItems.add(holdUsernameTransactItem(updatedAccount.getUuid(), originalUsernameHash, now)));
+    // 0: add the username hash to the constraint table, wiping out the ttl if we had already reserved the hash
+    writeItems.add(TransactWriteItem.builder().put(Put.builder()
+            .tableName(usernamesConstraintTableName)
+            .item(Map.of(
+                UsernameTable.ATTR_ACCOUNT_UUID, AttributeValues.fromUUID(updatedAccount.getAccountIdentifier()),
+                UsernameTable.KEY_USERNAME_HASH, AttributeValues.fromByteArray(usernameHash),
+                UsernameTable.ATTR_CONFIRMED, AttributeValues.fromBool(true)))
+            // it's not in the constraint table OR it's expired OR it was reserved by us
+            .conditionExpression("attribute_not_exists(#username_hash) OR #ttl < :now OR (#aci = :aci AND #confirmed = :confirmed)")
+            .expressionAttributeNames(Map.of(
+                "#username_hash", UsernameTable.KEY_USERNAME_HASH,
+                "#ttl", UsernameTable.ATTR_TTL,
+                "#aci", UsernameTable.ATTR_ACCOUNT_UUID,
+                "#confirmed", UsernameTable.ATTR_CONFIRMED))
+            .expressionAttributeValues(Map.of(
+                ":now", AttributeValues.fromLong(clock.instant().getEpochSecond()),
+                ":aci", AttributeValues.fromUUID(updatedAccount.getAccountIdentifier()),
+                ":confirmed", AttributeValues.fromBool(false)))
+            .returnValuesOnConditionCheckFailure(ReturnValuesOnConditionCheckFailure.ALL_OLD)
+            .build())
+        .build());
 
-          // 3?: Adding that hold may have caused our account to exceed our maximum holds. Release an old hold
-          holdToRemove.ifPresent(oldHold ->
-              writeItems.add(releaseHoldIfAllowedTransactItem(updatedAccount.getUuid(), oldHold, now)));
+    // 1: update the account object (conditioned on the version increment)
+    writeItems.add(UpdateAccountSpec.forAccount(accountsTableName, updatedAccount).transactItem());
 
-          return dynamoDbAsyncClient.transactWriteItems(TransactWriteItemsRequest.builder().transactItems(writeItems).build())
-              .thenApply(ignored -> updatedAccount);
-        })
-        .thenApply(updatedAccount -> {
-          account.setUsernameHash(usernameHash);
-          account.setReservedUsernameHash(null);
-          account.setUsernameLinkDetails(updatedAccount.getUsernameLinkHandle(), updatedAccount.getEncryptedUsername().orElse(null));
-          account.setUsernameHolds(updatedAccount.getUsernameHolds());
-          account.setVersion(account.getVersion() + 1);
-          return (Void) null;
-        })
-        .exceptionally(ExceptionUtils.exceptionallyHandler(TransactionCanceledException.class, e -> {
-          // If the constraint table update failed the condition check, the username's taken and we should stop
-          // trying. However, if the accounts table fails the conditional check or either table was concurrently
-          // updated, it's an optimistic locking failure and we should try again.
-          if (conditionalCheckFailed(e.cancellationReasons().get(0))) {
-            throw ExceptionUtils.wrap(new UsernameHashNotAvailableException());
-          } else if (conditionalCheckFailed(e.cancellationReasons().get(1)) // Account version conflict
-              // When we looked at the holds on our account, we thought we still held the corresponding username
-              // reservation. But it turned out that someone else has taken the reservation since. This means that the
-              // TTL on the hold must have just expired, so if we retry we should see that our hold is expired, and we
-              // won't try to remove it again.
-              || (e.cancellationReasons().size() > 3 && conditionalCheckFailed(e.cancellationReasons().get(3)))
-              // concurrent update on any table
-              || e.cancellationReasons().stream().anyMatch(Accounts::isTransactionConflict)) {
-            throw new ContestedOptimisticLockException();
-          } else {
-            throw ExceptionUtils.wrap(e);
-          }
-        }))
-        .whenComplete((ignored, throwable) -> sample.stop(SET_USERNAME_TIMER));
+    // 2?: Add a temporary hold for the old username to stop others from claiming it
+    maybeOriginalUsernameHash.ifPresent(originalUsernameHash ->
+        writeItems.add(holdUsernameTransactItem(updatedAccount.getAccountIdentifier(), originalUsernameHash, now)));
+
+    // 3?: Adding that hold may have caused our account to exceed our maximum holds. Release an old hold
+    holdToRemove.ifPresent(oldHold ->
+        writeItems.add(releaseHoldIfAllowedTransactItem(updatedAccount.getAccountIdentifier(), oldHold, now)));
+
+    try {
+      dynamoDbClient.transactWriteItems(TransactWriteItemsRequest.builder().transactItems(writeItems).build());
+
+      account.setUsernameHash(usernameHash);
+      account.setReservedUsernameHash(null);
+      account.setUsernameLinkDetails(updatedAccount.getUsernameLinkHandle(), updatedAccount.getEncryptedUsername().orElse(null));
+      account.setUsernameHolds(updatedAccount.getUsernameHolds());
+      account.setVersion(account.getVersion() + 1);
+    } catch (final TransactionCanceledException e) {
+      if (conditionalCheckFailed(e.cancellationReasons().get(0))) {
+        throw new UsernameHashNotAvailableException();
+      } else if (conditionalCheckFailed(e.cancellationReasons().get(1)) // Account version conflict
+          // When we looked at the holds on our account, we thought we still held the corresponding username
+          // reservation. But it turned out that someone else has taken the reservation since. This means that the
+          // TTL on the hold must have just expired, so if we retry we should see that our hold is expired, and we
+          // won't try to remove it again.
+          || (e.cancellationReasons().size() > 3 && conditionalCheckFailed(e.cancellationReasons().get(3)))
+          // concurrent update on any table
+          || e.cancellationReasons().stream().anyMatch(Accounts::isTransactionConflict)) {
+        throw new ContestedOptimisticLockException();
+      } else {
+        throw e;
+      }
+    } finally {
+      sample.stop(SET_USERNAME_TIMER);
+    }
   }
 
-  private CompletableFuture<UUID> pickLinkHandle(final Account account, final byte[] usernameHash) {
+  private UUID pickLinkHandle(final Account account, final byte[] usernameHash) {
     if (account.getUsernameLinkHandle() == null) {
       // There's no old link handle, so we can just use a randomly generated link handle
-      return CompletableFuture.completedFuture(UUID.randomUUID());
+      return UUID.randomUUID();
     }
 
     // Otherwise, there's an existing link handle. If this is the result of an account being re-registered, we should
     // preserve the link handle.
-    return dynamoDbAsyncClient.getItem(GetItemRequest.builder()
+    final GetItemResponse response = dynamoDbClient.getItem(GetItemRequest.builder()
             .tableName(usernamesConstraintTableName)
             .key(Map.of(UsernameTable.KEY_USERNAME_HASH, AttributeValues.b(usernameHash)))
-            .projectionExpression(UsernameTable.ATTR_RECLAIMABLE).build())
-        .thenApply(response -> {
-          if (response.hasItem() && AttributeValues.getBool(response.item(), UsernameTable.ATTR_RECLAIMABLE, false)) {
-            // this username reservation indicates it's a username waiting to be "reclaimed"
-            return account.getUsernameLinkHandle();
-          }
-          // There was no existing username reservation, or this was a standard "new" username. Either way, we should
-          // generate a new link handle.
-          return UUID.randomUUID();
-        });
+            .projectionExpression(UsernameTable.ATTR_RECLAIMABLE).build());
+
+    if (response.hasItem() && AttributeValues.getBool(response.item(), UsernameTable.ATTR_RECLAIMABLE, false)) {
+      // this username reservation indicates it's a username waiting to be "reclaimed"
+      return account.getUsernameLinkHandle();
+    }
+
+    // There was no existing username reservation, or this was a standard "new" username. Either way, we should
+    // generate a new link handle.
+    return UUID.randomUUID();
   }
 
-  /**
-   * Clear the username hash and link from the given account
-   *
-   * @param account to update
-   * @return a future that completes once the username data has been cleared;
-   * it can fail with a {@link ContestedOptimisticLockException} if there are concurrent updates
-   * to the account or username constraint records.
-   */
-  public CompletableFuture<Void> clearUsernameHash(final Account account) {
+  /// Clear the username hash and link from the given account
+  ///
+  /// @param account to update
+  ///
+  /// @throws ContestedOptimisticLockException if there are concurrent updates to the account or username constraint
+  /// records
+  public void clearUsernameHash(final Account account) throws ContestedOptimisticLockException {
     if (account.getUsernameHash().isEmpty()) {
       // no username to clear
-      return CompletableFuture.completedFuture(null);
+      return;
     }
+
     final byte[] usernameHash = account.getUsernameHash().get();
     final Timer.Sample sample = Timer.start();
 
@@ -863,33 +1014,65 @@ public class Accounts {
     items.add(UpdateAccountSpec.forAccount(accountsTableName, updatedAccount).transactItem());
 
     // 1: Un-confirm our username, adding a temporary hold for the old username to stop others from claiming it
-    items.add(holdUsernameTransactItem(updatedAccount.getUuid(), usernameHash, now));
+    items.add(holdUsernameTransactItem(updatedAccount.getAccountIdentifier(), usernameHash, now));
 
     // 2?: Adding that hold may have caused our account to exceed our maximum holds. Release an old hold
-    holdToRemove.ifPresent(oldHold -> items.add(releaseHoldIfAllowedTransactItem(updatedAccount.getUuid(), oldHold, now)));
+    holdToRemove.ifPresent(oldHold -> items.add(releaseHoldIfAllowedTransactItem(updatedAccount.getAccountIdentifier(), oldHold, now)));
 
-    return dynamoDbAsyncClient.transactWriteItems(TransactWriteItemsRequest.builder().transactItems(items).build())
-        .thenAccept(ignored -> {
-          account.setUsernameHash(null);
-          account.setUsernameLinkDetails(null, null);
-          account.setVersion(account.getVersion() + 1);
-          account.setUsernameHolds(updatedAccount.getUsernameHolds());
-        })
-        .exceptionally(ExceptionUtils.exceptionallyHandler(TransactionCanceledException.class, e -> {
-          if (conditionalCheckFailed(e.cancellationReasons().get(0)) // Account version conflict
-              // When we looked at the holds on our account, we thought we still held the corresponding username
-              // reservation. But it turned out that someone else has taken the reservation since. This means that the
-              // TTL on the hold must have just expired, so if we retry we should see that our hold is expired, and we
-              // won't try to remove it again.
-              || (e.cancellationReasons().size() > 2 && conditionalCheckFailed(e.cancellationReasons().get(2)))
-              // concurrent update on any table
-              || e.cancellationReasons().stream().anyMatch(Accounts::isTransactionConflict)) {
-            throw new ContestedOptimisticLockException();
-          } else {
-            throw ExceptionUtils.wrap(e);
-          }
-        }))
-        .whenComplete((ignored, throwable) -> sample.stop(CLEAR_USERNAME_HASH_TIMER));
+    try {
+      dynamoDbClient.transactWriteItems(TransactWriteItemsRequest.builder().transactItems(items).build());
+
+      account.setUsernameHash(null);
+      account.setUsernameLinkDetails(null, null);
+      account.setVersion(account.getVersion() + 1);
+      account.setUsernameHolds(updatedAccount.getUsernameHolds());
+    } catch (final TransactionCanceledException e) {
+      if (conditionalCheckFailed(e.cancellationReasons().get(0)) // Account version conflict
+          // When we looked at the holds on our account, we thought we still held the corresponding username
+          // reservation. But it turned out that someone else has taken the reservation since. This means that the
+          // TTL on the hold must have just expired, so if we retry we should see that our hold is expired, and we
+          // won't try to remove it again.
+          || (e.cancellationReasons().size() > 2 && conditionalCheckFailed(e.cancellationReasons().get(2)))
+          // concurrent update on any table
+          || e.cancellationReasons().stream().anyMatch(Accounts::isTransactionConflict)) {
+        throw new ContestedOptimisticLockException();
+      } else {
+        throw e;
+      }
+    } finally {
+      sample.stop(CLEAR_USERNAME_HASH_TIMER);
+    }
+  }
+
+  record UpdateExpression (List<String> setClauses, List<String> addClauses, List<String> removeClauses) {
+    public String toExpressionString() {
+      final StringBuilder updateExpressionBuilder = new StringBuilder();
+
+      if (!setClauses.isEmpty()) {
+        updateExpressionBuilder.append("SET ");
+        updateExpressionBuilder.append(String.join(", ", setClauses));
+      }
+
+      if (!removeClauses.isEmpty()) {
+        if (!updateExpressionBuilder.isEmpty()) {
+          updateExpressionBuilder.append(" ");
+        }
+
+        updateExpressionBuilder.append("REMOVE ");
+        updateExpressionBuilder.append(String.join(", ", removeClauses));
+      }
+
+      if (!addClauses.isEmpty()) {
+        if (!updateExpressionBuilder.isEmpty()) {
+          updateExpressionBuilder.append(" ");
+        }
+
+        updateExpressionBuilder.append("ADD ");
+        updateExpressionBuilder.append(String.join(", ", addClauses));
+      }
+
+      return updateExpressionBuilder.toString();
+    }
   }
 
   /**
@@ -900,13 +1083,13 @@ public class Accounts {
       Map<String, AttributeValue> key,
       Map<String, String> attrNames,
       Map<String, AttributeValue> attrValues,
-      String updateExpression,
+      UpdateExpression updateExpression,
       String conditionExpression) {
     UpdateItemRequest updateItemRequest() {
       return UpdateItemRequest.builder()
           .tableName(tableName)
           .key(key)
-          .updateExpression(updateExpression)
+          .updateExpression(updateExpression.toExpressionString())
           .conditionExpression(conditionExpression)
           .expressionAttributeNames(attrNames)
           .expressionAttributeValues(attrValues)
@@ -917,19 +1100,55 @@ public class Accounts {
       return TransactWriteItem.builder().update(Update.builder()
           .tableName(tableName)
           .key(key)
-          .updateExpression(updateExpression)
+          .updateExpression(updateExpression.toExpressionString())
           .conditionExpression(conditionExpression)
+          .returnValuesOnConditionCheckFailure(ReturnValuesOnConditionCheckFailure.ALL_OLD)
           .expressionAttributeNames(attrNames)
           .expressionAttributeValues(attrValues)
           .build()).build();
     }
 
+    static UpdateAccountSpec forReclaimedAccount(
+        final String accountTableName,
+        final Account account,
+        final Optional<String> maybeExpectedExistingE164) {
+      final UpdateAccountSpec base = forAccount(accountTableName, account);
+
+      final Map<String, String> attrNames = new HashMap<>(base.attrNames());
+      final Map<String, AttributeValue> attrValues = new HashMap<>(base.attrValues());
+      final UpdateExpression updateExpression = base.updateExpression();
+      final List<String> setClauses = new ArrayList<>(updateExpression.setClauses());
+
+      final String conditionExpression = account.getNumber()
+          .map(number -> {
+            attrNames.put("#number", ATTR_ACCOUNT_E164);
+            attrValues.put(":number", AttributeValues.fromString(number));
+            setClauses.add("#number = :number");
+
+            final MembershipExpression membershipExpression = maybeExpectedExistingE164
+                .map(e164 -> MembershipExpression.build(Util.getAlternateForms(e164)))
+                .orElseThrow(() -> new IllegalArgumentException("E164 must be present on existing account"));
+
+            attrValues.putAll(membershipExpression.values());
+            // Defensive check: if an e164 exists on the account, we should only update it to another e164 in the same equivalence class
+            return base.conditionExpression() + " AND #number IN %s".formatted(membershipExpression.expression());
+          })
+          .orElse(base.conditionExpression());
+
+      return new UpdateAccountSpec(
+          base.tableName(),
+          base.key(),
+          attrNames,
+          attrValues,
+          new UpdateExpression(setClauses, updateExpression.addClauses(), updateExpression.removeClauses()),
+          conditionExpression
+      );
+    }
+
     static UpdateAccountSpec forAccount(
         final String accountTableName,
         final Account account) {
-      // username, e164, and pni cannot be modified through this method
       final Map<String, String> attrNames = new HashMap<>(Map.of(
-          "#number", ATTR_ACCOUNT_E164,
           "#data", ATTR_ACCOUNT_DATA,
           "#cds", ATTR_CANONICALLY_DISCOVERABLE,
           "#version", ATTR_VERSION));
@@ -940,19 +1159,20 @@ public class Accounts {
           ":version", AttributeValues.fromInt(account.getVersion()),
           ":version_increment", AttributeValues.fromInt(1)));
 
-      final StringBuilder updateExpressionBuilder = new StringBuilder("SET #data = :data, #cds = :cds");
+      final List<String> setClauses = new ArrayList<>(List.of("#data = :data", "#cds = :cds"));
+
       if (account.getUnidentifiedAccessKey().isPresent()) {
         // if it's present in the account, also set the uak
         attrNames.put("#uak", ATTR_UAK);
         attrValues.put(":uak", AttributeValues.fromByteArray(account.getUnidentifiedAccessKey().get()));
-        updateExpressionBuilder.append(", #uak = :uak");
+        setClauses.add("#uak = :uak");
       }
 
       if (account.getUsernameHash().isPresent()) {
         // if it's present in the account, also set the username hash
         attrNames.put("#usernameHash", ATTR_USERNAME_HASH);
         attrValues.put(":usernameHash", AttributeValues.fromByteArray(account.getUsernameHash().get()));
-        updateExpressionBuilder.append(", #usernameHash = :usernameHash");
+        setClauses.add("#usernameHash = :usernameHash");
       }
 
       // If the account has a username/handle pair, we should add it to the top level attributes.
@@ -962,7 +1182,7 @@ public class Accounts {
       if (account.getEncryptedUsername().isPresent() && account.getUsernameLinkHandle() != null) {
         attrNames.put("#ul", ATTR_USERNAME_LINK_UUID);
         attrValues.put(":ul", AttributeValues.fromUUID(account.getUsernameLinkHandle()));
-        updateExpressionBuilder.append(", #ul = :ul");
+        setClauses.add("#ul = :ul");
       }
 
       // Some operations may remove the usernameLink or the usernameHash (re-registration, clear username link, and
@@ -977,104 +1197,79 @@ public class Accounts {
         attrNames.put("#username_hash", ATTR_USERNAME_HASH);
         removes.add("#username_hash");
       }
+
+      final List<String> removeClauses = new ArrayList<>();
       if (!removes.isEmpty()) {
-        updateExpressionBuilder.append(" REMOVE %s".formatted(String.join(",", removes)));
+        removeClauses.add(String.join(",", removes));
       }
-      updateExpressionBuilder.append(" ADD #version :version_increment");
+
+      final List<String> addClauses = List.of("#version :version_increment");
 
       return new UpdateAccountSpec(
           accountTableName,
-          Map.of(KEY_ACCOUNT_UUID, AttributeValues.fromUUID(account.getUuid())),
+          Map.of(KEY_ACCOUNT_UUID, AttributeValues.fromUUID(account.getAccountIdentifier())),
           attrNames,
           attrValues,
-          updateExpressionBuilder.toString(),
-          "attribute_exists(#number) AND #version = :version");
-    }
-  }
-
-  @Nonnull
-  public CompletionStage<Void> updateAsync(final Account account) {
-    return AsyncTimerUtil.record(UPDATE_TIMER, () -> {
-      final UpdateItemRequest updateItemRequest = UpdateAccountSpec
-          .forAccount(accountsTableName, account)
-          .updateItemRequest();
-
-      return dynamoDbAsyncClient.updateItem(updateItemRequest)
-          .thenApply(response -> {
-            account.setVersion(AttributeValues.getInt(response.attributes(), "V", account.getVersion() + 1));
-            return (Void) null;
-          })
-          .exceptionallyCompose(throwable -> {
-            final Throwable unwrapped = ExceptionUtils.unwrap(throwable);
-            if (unwrapped instanceof TransactionConflictException) {
-              throw new ContestedOptimisticLockException();
-            } else if (unwrapped instanceof ConditionalCheckFailedException e) {
-              // the exception doesn't give details about which condition failed,
-              // but we can infer it was an optimistic locking failure if the UUID is known
-              return getByAccountIdentifierAsync(account.getUuid())
-                  .thenAccept(refreshedAccount -> {
-                    throw refreshedAccount.isPresent() ? new ContestedOptimisticLockException() : e;
-                  });
-            } else {
-              // rethrow
-              throw CompletableFutureUtils.errorAsCompletionException(throwable);
-            }
-          });
-    });
-  }
-
-  private static void joinAndUnwrapUpdateFuture(CompletionStage<Void> future) {
-    try {
-      future.toCompletableFuture().join();
-    } catch (final CompletionException e) {
-      // unwrap CompletionExceptions, throw as long is it's unchecked
-      Throwables.throwIfUnchecked(ExceptionUtils.unwrap(e));
-
-      // if we otherwise somehow got a wrapped checked exception,
-      // rethrow the checked exception wrapped by the original CompletionException
-      log.error("Unexpected checked exception thrown from dynamo update", e);
-      throw e;
+          new UpdateExpression(setClauses, addClauses, removeClauses),
+          "#version = :version");
     }
   }
 
   public void update(final Account account) throws ContestedOptimisticLockException {
-    joinAndUnwrapUpdateFuture(updateAsync(account));
+    final Timer.Sample sample = Timer.start();
+
+    try {
+      final UpdateItemResponse response = dynamoDbClient.updateItem(UpdateAccountSpec
+          .forAccount(accountsTableName, account)
+          .updateItemRequest());
+
+      account.setVersion(AttributeValues.getInt(response.attributes(), "V", account.getVersion() + 1));
+    } catch (final TransactionConflictException _) {
+      throw new ContestedOptimisticLockException();
+    } catch (final ConditionalCheckFailedException e) {
+      // the exception doesn't give details about which condition failed,
+      // but we can infer it was an optimistic locking failure if the UUID is known
+      if (getByAccountIdentifier(account.getAccountIdentifier()).isPresent()) {
+        throw new ContestedOptimisticLockException();
+      } else {
+        throw e;
+      }
+    } finally {
+      sample.stop(UPDATE_TIMER);
+    }
   }
 
-  public CompletionStage<Void> updateTransactionallyAsync(final Account account,
-      final Collection<TransactWriteItem> additionalWriteItems) {
+  public void updateTransactionally(final Account account, final Collection<TransactWriteItem> additionalWriteItems)
+      throws ContestedOptimisticLockException {
 
-    return AsyncTimerUtil.record(UPDATE_TRANSACTIONALLY_TIMER, () -> {
+    final Timer.Sample sample = Timer.start();
+
+    try {
       final List<TransactWriteItem> writeItems = new ArrayList<>(additionalWriteItems.size() + 1);
       writeItems.add(UpdateAccountSpec.forAccount(accountsTableName, account).transactItem());
       writeItems.addAll(additionalWriteItems);
 
-      return dynamoDbAsyncClient.transactWriteItems(TransactWriteItemsRequest.builder()
-              .transactItems(writeItems)
-              .build())
-          .thenApply(response -> {
-            account.setVersion(account.getVersion() + 1);
-            return (Void) null;
-          })
-          .exceptionally(throwable -> {
-            final Throwable unwrapped = ExceptionUtils.unwrap(throwable);
+      dynamoDbClient.transactWriteItems(TransactWriteItemsRequest.builder()
+          .transactItems(writeItems)
+          .build());
 
-            if (unwrapped instanceof TransactionCanceledException transactionCanceledException) {
-              if (CONDITIONAL_CHECK_FAILED.equals(transactionCanceledException.cancellationReasons().getFirst().code())) {
-                throw new ContestedOptimisticLockException();
-              }
+      account.setVersion(account.getVersion() + 1);
+    } catch (final TransactionCanceledException transactionCanceledException) {
+      if (CONDITIONAL_CHECK_FAILED.equals(transactionCanceledException.cancellationReasons().getFirst().code())) {
+        throw new ContestedOptimisticLockException();
+      }
 
-              if (transactionCanceledException.cancellationReasons()
-                  .stream()
-                  .anyMatch(reason -> TRANSACTION_CONFLICT.equals(reason.code()))) {
+      if (transactionCanceledException.cancellationReasons()
+          .stream()
+          .anyMatch(reason -> TRANSACTION_CONFLICT.equals(reason.code()))) {
 
-                throw new ContestedOptimisticLockException();
-              }
-            }
+        throw new ContestedOptimisticLockException();
+      }
 
-            throw CompletableFutureUtils.errorAsCompletionException(throwable);
-          });
-    });
+      throw transactionCanceledException;
+    } finally {
+      sample.stop(UPDATE_TRANSACTIONALLY_TIMER);
+    }
   }
 
   public TransactWriteItem buildTransactWriteItemForLinkDevice(final String linkDeviceToken, final Duration tokenTtl) {
@@ -1138,7 +1333,7 @@ public class Accounts {
 
     return itemByGsiKeyAsync(accountsTableName, USERNAME_LINK_TO_UUID_INDEX, ATTR_USERNAME_LINK_UUID, AttributeValues.fromUUID(usernameLinkHandle))
         .thenApply(maybeItem -> maybeItem.map(Accounts::fromItem))
-        .whenComplete((account, throwable) -> sample.stop(GET_BY_USERNAME_LINK_HANDLE_TIMER));
+        .whenComplete((_, _) -> sample.stop(GET_BY_USERNAME_LINK_HANDLE_TIMER));
   }
 
   @Nonnull
@@ -1146,6 +1341,16 @@ public class Accounts {
     return requireNonNull(GET_BY_UUID_TIMER.record(() ->
         itemByKey(accountsTableName, KEY_ACCOUNT_UUID, AttributeValues.fromUUID(uuid))
             .map(Accounts::fromItem)));
+  }
+
+  boolean accountExists(final UUID aci) {
+    final GetItemResponse response = dynamoDbClient.getItem(GetItemRequest.builder()
+        .tableName(accountsTableName)
+        .key(Map.of(KEY_ACCOUNT_UUID, AttributeValues.fromUUID(aci)))
+        .projectionExpression(KEY_ACCOUNT_UUID)
+        .consistentRead(true)
+        .build());
+    return response.hasItem() && !response.item().isEmpty();
   }
 
   private TransactWriteItem buildPutDeletedAccount(final UUID aci, final UUID pni) {
@@ -1165,6 +1370,18 @@ public class Accounts {
         .delete(Delete.builder()
             .tableName(deletedAccountsTableName)
             .key(Map.of(DELETED_ACCOUNTS_KEY_ACCOUNT_PNI, AttributeValues.fromString(pni.toString())))
+            .build())
+        .build();
+  }
+
+  private TransactWriteItem buildConditionalDeleteAccount(final Account account) {
+    return TransactWriteItem.builder()
+        .delete(Delete.builder()
+            .tableName(accountsTableName)
+            .key(Map.of(KEY_ACCOUNT_UUID, AttributeValues.fromUUID(account.getAccountIdentifier())))
+            .conditionExpression("#version = :version")
+            .expressionAttributeNames(Map.of("#version", ATTR_VERSION))
+            .expressionAttributeValues(Map.of(":version", AttributeValues.fromInt(account.getVersion())))
             .build())
         .build();
   }
@@ -1207,30 +1424,61 @@ public class Accounts {
         .map(UUID::fromString);
   }
 
-  public CompletableFuture<Void> delete(final UUID uuid, final List<TransactWriteItem> additionalWriteItems) {
+  public void delete(final UUID uuid, final List<TransactWriteItem> additionalWriteItems) {
     final Timer.Sample sample = Timer.start();
+    int tries = 0;
+    final int maxTries = 3;
 
-    return getByAccountIdentifierAsync(uuid)
-        .thenCompose(maybeAccount -> maybeAccount.map(account -> {
-              final List<TransactWriteItem> transactWriteItems = new ArrayList<>(List.of(
-                  buildDelete(phoneNumberConstraintTableName, ATTR_ACCOUNT_E164, account.getNumber()),
-                  buildDelete(accountsTableName, KEY_ACCOUNT_UUID, uuid),
-                  buildDelete(phoneNumberIdentifierConstraintTableName, ATTR_PNI_UUID, account.getPhoneNumberIdentifier()),
-                  buildPutDeletedAccount(uuid, account.getPhoneNumberIdentifier())
-              ));
+    try {
+      while (tries < maxTries) {
+        try {
+          final Account account;
+          {
+            final Optional<Account> maybeAccount = getByAccountIdentifier(uuid);
 
-              account.getUsernameHash().ifPresent(usernameHash -> transactWriteItems.add(
-                  buildDelete(usernamesConstraintTableName, UsernameTable.KEY_USERNAME_HASH, usernameHash)));
+            if (maybeAccount.isEmpty()) {
+              return;
+            }
 
-              transactWriteItems.addAll(additionalWriteItems);
+            account = maybeAccount.get();
+          }
 
-              return dynamoDbAsyncClient.transactWriteItems(TransactWriteItemsRequest.builder()
-                  .transactItems(transactWriteItems)
-                  .build())
-                  .thenRun(Util.NOOP);
-            })
-            .orElseGet(() -> CompletableFuture.completedFuture(null)))
-            .thenRun(() -> sample.stop(DELETE_TIMER));
+
+          final List<TransactWriteItem> transactWriteItems = new ArrayList<>();
+          transactWriteItems.add(buildConditionalDeleteAccount(account));
+
+          account.getNumber().ifPresent(e164 -> transactWriteItems.add(
+              buildDelete(phoneNumberConstraintTableName, ATTR_ACCOUNT_E164, e164)));
+
+          account.getPhoneNumberIdentifier().ifPresent(pni -> {
+            transactWriteItems.add(buildDelete(phoneNumberIdentifierConstraintTableName, ATTR_PNI_UUID, pni));
+            transactWriteItems.add(buildPutDeletedAccount(uuid, pni));
+          });
+
+          account.getUsernameHash().ifPresent(usernameHash -> transactWriteItems.add(
+              buildDelete(usernamesConstraintTableName, UsernameTable.KEY_USERNAME_HASH, usernameHash)));
+
+          transactWriteItems.addAll(additionalWriteItems);
+
+          dynamoDbClient.transactWriteItems(TransactWriteItemsRequest.builder()
+              .transactItems(transactWriteItems)
+              .build());
+          return;
+        } catch (final TransactionCanceledException e) {
+          final CancellationReason cancellationReason = e.cancellationReasons().get(0);
+          if (conditionalCheckFailed(cancellationReason) || isTransactionConflict(cancellationReason)) {
+            // This means that either the optimistic delete failed because something else changed the account from under us,
+            // or there is an ongoing transaction for the account item. Either way, retry until the max attempts.
+            tries++;
+          } else {
+            throw new RuntimeException("Account deletion transaction canceled", e);
+          }
+        }
+      }
+      throw new OptimisticLockRetryLimitExceededException();
+    } finally {
+      sample.stop(DELETE_TIMER);
+    }
   }
 
   Flux<Account> getAll(final int segments, final Scheduler scheduler) {
@@ -1241,14 +1489,16 @@ public class Accounts {
     return Flux.range(0, segments)
         .parallel()
         .runOn(scheduler)
-        .flatMap(segment -> dynamoDbAsyncClient.scanPaginator(ScanRequest.builder()
-                .tableName(accountsTableName)
-                .consistentRead(true)
-                .segment(segment)
-                .totalSegments(segments)
-                .build())
-            .items()
-            .map(Accounts::fromItem))
+        .flatMap(segment -> {
+          final ScanPublisher scanPublisher = dynamoDbAsyncClient.scanPaginator(ScanRequest.builder()
+              .tableName(accountsTableName)
+              .consistentRead(true)
+              .segment(segment)
+              .totalSegments(segments)
+              .build());
+
+          return Flux.from(scanPublisher.items()).map(Accounts::fromItem);
+        })
         .sequential();
   }
 
@@ -1278,7 +1528,7 @@ public class Accounts {
       final String tableName,
       final String keyName,
       final AttributeValue keyValue) {
-    return getByIndirectLookup(timer, tableName, keyName, keyValue, i -> true);
+    return getByIndirectLookup(timer, tableName, keyName, keyValue, _ -> true);
   }
 
   @Nonnull
@@ -1288,7 +1538,7 @@ public class Accounts {
       final String keyName,
       final AttributeValue keyValue) {
 
-    return getByIndirectLookupAsync(timer, tableName, keyName, keyValue, i -> true);
+    return getByIndirectLookupAsync(timer, tableName, keyName, keyValue, _ -> true);
   }
 
   @Nonnull
@@ -1377,13 +1627,14 @@ public class Accounts {
   private TransactWriteItem buildAccountPut(
       final Account account,
       final AttributeValue uuidAttr,
-      final AttributeValue numberAttr,
-      final AttributeValue pniUuidAttr) {
+      final Optional<AttributeValue> maybeNumberAttr,
+      final Optional<AttributeValue> maybePniUuidAttr) {
+    if (maybeNumberAttr.isPresent() != maybePniUuidAttr.isPresent()) {
+      throw new IllegalArgumentException("Number and PNI attribute values must both be provided together or not at all");
+    }
 
     final Map<String, AttributeValue> item = new HashMap<>(Map.of(
         KEY_ACCOUNT_UUID, uuidAttr,
-        ATTR_ACCOUNT_E164, numberAttr,
-        ATTR_PNI_UUID, pniUuidAttr,
         ATTR_ACCOUNT_DATA, accountDataAttributeValue(account),
         ATTR_VERSION, AttributeValues.fromInt(account.getVersion()),
         ATTR_CANONICALLY_DISCOVERABLE, AttributeValues.fromBool(account.isDiscoverableByPhoneNumber())));
@@ -1393,14 +1644,26 @@ public class Accounts {
         .map(AttributeValues::fromByteArray)
         .ifPresent(uak -> item.put(ATTR_UAK, uak));
 
-    return TransactWriteItem.builder()
-        .put(Put.builder()
-            .conditionExpression("attribute_not_exists(#pni) OR #pni = :pni")
-            .expressionAttributeNames(Map.of("#pni", ATTR_PNI_UUID))
-            .expressionAttributeValues(Map.of(":pni", pniUuidAttr))
+    final Put put = maybeNumberAttr.map(numberAttr -> {
+          item.put(ATTR_ACCOUNT_E164, numberAttr);
+          item.put(ATTR_PNI_UUID, maybePniUuidAttr.get());
+          return Put.builder()
+              .tableName(accountsTableName)
+              .item(item)
+              .conditionExpression("attribute_not_exists(#pni) OR #pni = :pni")
+              .expressionAttributeNames(Map.of("#pni", ATTR_PNI_UUID))
+              .expressionAttributeValues(Map.of(":pni", maybePniUuidAttr.get()))
+              .build();
+        })
+        .orElseGet(() -> Put.builder()
             .tableName(accountsTableName)
             .item(item)
-            .build())
+            .conditionExpression("attribute_not_exists(#uuid)")
+            .expressionAttributeNames(Map.of("#uuid", KEY_ACCOUNT_UUID))
+            .build());
+
+    return TransactWriteItem.builder()
+        .put(put)
         .build();
   }
 
@@ -1477,23 +1740,25 @@ public class Accounts {
   CompletableFuture<Void> regenerateConstraints(final Account account) {
     final List<CompletableFuture<?>> constraintFutures = new ArrayList<>();
 
-    constraintFutures.add(writeConstraint(phoneNumberConstraintTableName,
-        account.getIdentifier(IdentityType.ACI),
-        ATTR_ACCOUNT_E164,
-        AttributeValues.fromString(account.getNumber())));
+    account.getNumber().ifPresent(phoneNumber ->
+        constraintFutures.add(writeConstraint(phoneNumberConstraintTableName,
+            account.getAccountIdentifier(),
+            ATTR_ACCOUNT_E164,
+            AttributeValues.fromString(phoneNumber))));
 
-    constraintFutures.add(writeConstraint(phoneNumberIdentifierConstraintTableName,
-        account.getIdentifier(IdentityType.ACI),
-        ATTR_PNI_UUID,
-        AttributeValues.fromUUID(account.getPhoneNumberIdentifier())));
+    account.getPhoneNumberIdentifier().ifPresent(phoneNumberIdentifier ->
+        constraintFutures.add(writeConstraint(phoneNumberIdentifierConstraintTableName,
+            account.getAccountIdentifier(),
+            ATTR_PNI_UUID,
+            AttributeValues.fromUUID(phoneNumberIdentifier))));
 
     account.getUsernameHash().ifPresent(usernameHash ->
-        constraintFutures.add(writeUsernameConstraint(account.getIdentifier(IdentityType.ACI),
+        constraintFutures.add(writeUsernameConstraint(account.getAccountIdentifier(),
             usernameHash,
             Optional.empty())));
 
     account.getUsernameHolds().forEach(usernameHold ->
-        constraintFutures.add(writeUsernameConstraint(account.getIdentifier(IdentityType.ACI),
+        constraintFutures.add(writeUsernameConstraint(account.getAccountIdentifier(),
             usernameHold.usernameHash(),
             Optional.of(Instant.ofEpochSecond(usernameHold.expirationSecs())))));
 
@@ -1547,7 +1812,6 @@ public class Accounts {
   @Nonnull
   static Account fromItem(final Map<String, AttributeValue> item) {
     if (!item.containsKey(ATTR_ACCOUNT_DATA)
-        || !item.containsKey(ATTR_ACCOUNT_E164)
         || !item.containsKey(KEY_ACCOUNT_UUID)
         || !item.containsKey(ATTR_CANONICALLY_DISCOVERABLE)) {
       throw new RuntimeException("item missing values");
@@ -1558,15 +1822,20 @@ public class Accounts {
       final UUID accountIdentifier = UUIDUtil.fromByteBuffer(item.get(KEY_ACCOUNT_UUID).b().asByteBuffer());
       final UUID phoneNumberIdentifierFromAttribute = AttributeValues.getUUID(item, ATTR_PNI_UUID, null);
 
-      if (account.getPhoneNumberIdentifier() == null || phoneNumberIdentifierFromAttribute == null ||
-          !Objects.equals(account.getPhoneNumberIdentifier(), phoneNumberIdentifierFromAttribute)) {
-
-        log.warn("Missing or mismatched PNIs for account {}. From JSON: {}; from attribute: {}",
+      if (!account.getPhoneNumberIdentifier().equals(Optional.ofNullable(phoneNumberIdentifierFromAttribute))) {
+        log.warn("Mismatched PNIs for account {}. From JSON: {}; from attribute: {}",
             accountIdentifier, account.getPhoneNumberIdentifier(), phoneNumberIdentifierFromAttribute);
       }
 
-      account.setNumber(item.get(ATTR_ACCOUNT_E164).s(), phoneNumberIdentifierFromAttribute);
-      account.setUuid(accountIdentifier);
+      final String attributeNumber = AttributeValues.getString(item, ATTR_ACCOUNT_E164, null);
+      if (!account.getNumber().equals(Optional.ofNullable(attributeNumber))) {
+        ImpossibleEvents.logImpossible(log,
+            "Mismatched phone numbers for account {}. From JSON: {}; from attribute: {}",
+            accountIdentifier, account.getNumber(), attributeNumber);
+      }
+
+      account.setNumber(attributeNumber, phoneNumberIdentifierFromAttribute);
+      account.setAccountIdentifier(accountIdentifier);
       account.setUsernameHash(AttributeValues.getByteArray(item, ATTR_USERNAME_HASH, null));
       account.setUsernameLinkHandle(AttributeValues.getUUID(item, ATTR_USERNAME_LINK_UUID, null));
       account.setVersion(Integer.parseInt(item.get(ATTR_VERSION).n()));
@@ -1601,7 +1870,29 @@ public class Accounts {
     sb.append("???");
     sb.append(StringUtils.length(phoneNumber) < 3
         ? ""
-        : phoneNumber.substring(phoneNumber.length() - 2, phoneNumber.length()));
+        : phoneNumber.substring(phoneNumber.length() - 2));
     return sb.toString();
+  }
+
+  record MembershipExpression(String expression, Map<String, AttributeValue> values) {
+    public static MembershipExpression build(final Collection<String> values) {
+      if (values.isEmpty()) {
+        throw new IllegalArgumentException("must have at least one value");
+      }
+
+      final Map<String, AttributeValue> expressionValues = new HashMap<>();
+      final List<String> placeholders = new ArrayList<>();
+      final String prefix = "val";
+      int i = 0;
+      for (final String value : values) {
+        String key = ":" + prefix + i;
+        placeholders.add(key);
+        expressionValues.put(key, AttributeValues.fromString(value));
+        i++;
+      }
+
+      final String expression = "(" + String.join(", ", placeholders) + ")";
+      return new MembershipExpression(expression, expressionValues);
+    }
   }
 }

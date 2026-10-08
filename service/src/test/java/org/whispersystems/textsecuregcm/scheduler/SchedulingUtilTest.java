@@ -4,7 +4,6 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
-import com.google.i18n.phonenumbers.PhoneNumberToTimeZonesMapper;
 import com.google.i18n.phonenumbers.PhoneNumberUtil;
 import java.time.Clock;
 import java.time.Instant;
@@ -13,66 +12,65 @@ import java.time.LocalTime;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
-import java.util.List;
-import java.util.Objects;
 import java.util.Optional;
 import com.google.i18n.phonenumbers.Phonenumber;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.NullSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.whispersystems.textsecuregcm.storage.Account;
-import org.whispersystems.textsecuregcm.storage.Device;
 import org.whispersystems.textsecuregcm.util.TestClock;
+import javax.annotation.Nullable;
 
 class SchedulingUtilTest {
 
   @Test
   void getNextRecommendedNotificationTime() {
-    {
-      final Account account = mock(Account.class);
+    final Account account = mock(Account.class);
 
-      // The account has a phone number that can be resolved to a region with known timezones
-      when(account.getNumber()).thenReturn(PhoneNumberUtil.getInstance().format(
-          PhoneNumberUtil.getInstance().getExampleNumber("DE"), PhoneNumberUtil.PhoneNumberFormat.E164));
+    // The account has a phone number that can be resolved to a region with known timezones
+    when(account.getNumber()).thenReturn(Optional.of(PhoneNumberUtil.getInstance().format(
+        PhoneNumberUtil.getInstance().getExampleNumber("DE"), PhoneNumberUtil.PhoneNumberFormat.E164)));
 
-      final ZoneId berlinZoneId = ZoneId.of("Europe/Berlin");
-      final ZonedDateTime beforeNotificationTime = ZonedDateTime.now(berlinZoneId).with(LocalTime.of(13, 0));
+    final ZoneId berlinZoneId = ZoneId.of("Europe/Berlin");
+    final ZonedDateTime beforeNotificationTime = ZonedDateTime.now(berlinZoneId).with(LocalTime.of(13, 0));
 
-      assertEquals(
-          beforeNotificationTime.with(LocalTime.of(14, 0)).toInstant(),
-          SchedulingUtil.getNextRecommendedNotificationTime(account, LocalTime.of(14, 0),
-              Clock.fixed(beforeNotificationTime.toInstant(), berlinZoneId)));
+    assertEquals(
+        beforeNotificationTime.with(LocalTime.of(14, 0)).toInstant(),
+        SchedulingUtil.getNextRecommendedNotificationTime(account, LocalTime.of(14, 0),
+            Clock.fixed(beforeNotificationTime.toInstant(), berlinZoneId)));
 
-      final ZonedDateTime afterNotificationTime = ZonedDateTime.now(berlinZoneId).with(LocalTime.of(15, 0));
+    final ZonedDateTime afterNotificationTime = ZonedDateTime.now(berlinZoneId).with(LocalTime.of(15, 0));
 
-      assertEquals(
-          afterNotificationTime.with(LocalTime.of(14, 0)).plusDays(1).toInstant(),
-          SchedulingUtil.getNextRecommendedNotificationTime(account, LocalTime.of(14, 0),
-              Clock.fixed(afterNotificationTime.toInstant(), berlinZoneId)));
-    }
+    assertEquals(
+        afterNotificationTime.with(LocalTime.of(14, 0)).plusDays(1).toInstant(),
+        SchedulingUtil.getNextRecommendedNotificationTime(account, LocalTime.of(14, 0),
+            Clock.fixed(afterNotificationTime.toInstant(), berlinZoneId)));
+  }
 
-    {
-      final Account account = mock(Account.class);
-      final Device primaryDevice = mock(Device.class);
+  @ParameterizedTest
+  @NullSource
+  @ValueSource(strings = {"Not a parseable number"})
+  void getNextRecommendedNotificationTimeDefaultsToPreferredTime(@Nullable final String number) {
+    final Account account = mock(Account.class);
 
-      // The account does not have a phone number that can be connected to a region/time zone
-      when(account.getNumber()).thenReturn("Not a parseable number");
-      when(account.getPrimaryDevice()).thenReturn(primaryDevice);
-      when(primaryDevice.getCreated())
-          .thenReturn(ZonedDateTime.of(2024, 7, 10, 9, 53, 12, 0, ZoneId.systemDefault()).toInstant().toEpochMilli());
+    // The account does not have a phone number that can be connected to a region/time zone
+    when(account.getNumber()).thenReturn(Optional.ofNullable(number));
 
-      final ZonedDateTime beforeNotificationTime = ZonedDateTime.now(ZoneId.systemDefault()).with(LocalTime.of(9, 0));
+    final ZonedDateTime beforeNotificationTime = ZonedDateTime.now(ZoneId.systemDefault()).with(LocalTime.of(13, 59));
+    final LocalTime preferredNotificationTime = LocalTime.of(14, 0);
 
-      assertEquals(
-          beforeNotificationTime.with(LocalTime.of(9, 53, 12)).toInstant(),
-          SchedulingUtil.getNextRecommendedNotificationTime(account, LocalTime.of(14, 0),
-              Clock.fixed(beforeNotificationTime.toInstant(), ZoneId.systemDefault())));
+    assertEquals(
+        beforeNotificationTime.with(preferredNotificationTime).toInstant(),
+        SchedulingUtil.getNextRecommendedNotificationTime(account, preferredNotificationTime,
+            Clock.fixed(beforeNotificationTime.toInstant(), ZoneId.systemDefault())));
 
-      final ZonedDateTime afterNotificationTime = ZonedDateTime.now(ZoneId.systemDefault()).with(LocalTime.of(10, 0));
+    final ZonedDateTime afterNotificationTime = ZonedDateTime.now(ZoneId.systemDefault()).with(LocalTime.of(14, 1));
 
-      assertEquals(
-          afterNotificationTime.with(LocalTime.of(9, 53, 12)).plusDays(1).toInstant(),
-          SchedulingUtil.getNextRecommendedNotificationTime(account, LocalTime.of(14, 0),
-              Clock.fixed(afterNotificationTime.toInstant(), ZoneId.systemDefault())));
-    }
+    assertEquals(
+        afterNotificationTime.with(preferredNotificationTime).plusDays(1).toInstant(),
+        SchedulingUtil.getNextRecommendedNotificationTime(account, preferredNotificationTime,
+            Clock.fixed(afterNotificationTime.toInstant(), ZoneId.systemDefault())));
   }
 
   @Test
@@ -80,8 +78,8 @@ class SchedulingUtilTest {
     final Account account = mock(Account.class);
 
     // The account has a phone number that can be resolved to a region with known timezones
-    when(account.getNumber()).thenReturn(PhoneNumberUtil.getInstance().format(
-        PhoneNumberUtil.getInstance().getExampleNumber("DE"), PhoneNumberUtil.PhoneNumberFormat.E164));
+    when(account.getNumber()).thenReturn(Optional.of(PhoneNumberUtil.getInstance().format(
+        PhoneNumberUtil.getInstance().getExampleNumber("DE"), PhoneNumberUtil.PhoneNumberFormat.E164)));
 
     final LocalDateTime afterNotificationTime = LocalDateTime.of(2025, 3, 29, 15, 0);
     final ZoneId berlinZoneId = ZoneId.of("Europe/Berlin");
@@ -99,33 +97,42 @@ class SchedulingUtilTest {
 
   @Test
   void zoneIdSelectionSingleOffset() {
-    final Account account = mock(Account.class);
     final Phonenumber.PhoneNumber phoneNumber = PhoneNumberUtil.getInstance().getExampleNumber("DE");
-
-    when(account.getNumber())
-        .thenReturn(PhoneNumberUtil.getInstance().format(phoneNumber , PhoneNumberUtil.PhoneNumberFormat.E164));
+    final String e164 = PhoneNumberUtil.getInstance().format(phoneNumber, PhoneNumberUtil.PhoneNumberFormat.E164);
 
     final Instant now = Instant.now();
 
     assertEquals(
         ZoneId.of("Europe/Berlin").getRules().getOffset(now),
-        SchedulingUtil.getZoneId(account, TestClock.pinned(now)).orElseThrow().getRules().getOffset(now));
+        SchedulingUtil.getZoneId(e164, TestClock.pinned(now)).orElseThrow().getRules().getOffset(now));
   }
 
   @Test
   void zoneIdSelectionMultipleOffsets() {
-    final Account account = mock(Account.class);
-
-    // A US VOIP number spans multiple time zones, we should pick a 'middle' one
+    // A US toll-free number spans multiple time zones, we should pick a 'middle' one
     final Phonenumber.PhoneNumber phoneNumber =
-        PhoneNumberUtil.getInstance().getExampleNumberForType("US", PhoneNumberUtil.PhoneNumberType.VOIP);
-    when(account.getNumber())
-        .thenReturn(PhoneNumberUtil.getInstance().format(phoneNumber, PhoneNumberUtil.PhoneNumberFormat.E164));
+        PhoneNumberUtil.getInstance().getExampleNumberForType("US", PhoneNumberUtil.PhoneNumberType.TOLL_FREE);
+    final String e164 = PhoneNumberUtil.getInstance().format(phoneNumber, PhoneNumberUtil.PhoneNumberFormat.E164);
 
     final Instant now = Instant.now();
 
     assertEquals(
         ZoneId.of("America/Chicago").getRules().getOffset(now),
-        SchedulingUtil.getZoneId(account, TestClock.pinned(now)).orElseThrow().getRules().getOffset(now));
+        SchedulingUtil.getZoneId(e164, TestClock.pinned(now)).orElseThrow().getRules().getOffset(now));
+  }
+
+  @Test
+  void zoneIdSelectionUnknownNumber() {
+    // An invalid number will fall back to a geographical lookup. Even if that is not technically correct for the number,
+    // it will give a time zone for the region, rather than an Optional.empty() result
+    final Phonenumber.PhoneNumber phoneNumber =
+        PhoneNumberUtil.getInstance().getInvalidExampleNumber("US");
+    final String e164 = PhoneNumberUtil.getInstance().format(phoneNumber, PhoneNumberUtil.PhoneNumberFormat.E164);
+
+    final Instant now = Instant.now();
+
+    assertEquals(
+        ZoneId.of("America/New_York").getRules().getOffset(now),
+        SchedulingUtil.getZoneId(e164, TestClock.pinned(now)).orElseThrow().getRules().getOffset(now));
   }
 }

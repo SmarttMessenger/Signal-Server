@@ -5,7 +5,6 @@
 
 package org.whispersystems.textsecuregcm.controllers;
 
-import com.google.common.annotations.VisibleForTesting;
 import com.google.protobuf.ByteString;
 import io.dropwizard.auth.Auth;
 import io.grpc.Status;
@@ -29,12 +28,13 @@ import jakarta.ws.rs.ServerErrorException;
 import jakarta.ws.rs.WebApplicationException;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
-import java.time.Duration;
 import java.util.Optional;
 import org.glassfish.jersey.server.ManagedAsync;
 import org.signal.keytransparency.client.AciMonitorRequest;
 import org.signal.keytransparency.client.E164MonitorRequest;
 import org.signal.keytransparency.client.E164SearchRequest;
+import org.signal.keytransparency.client.MonitorResponseV2;
+import org.signal.keytransparency.client.SearchResponseV2;
 import org.signal.keytransparency.client.UsernameHashMonitorRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -75,9 +75,11 @@ public class KeyTransparencyController {
           """
   )
   @ApiResponse(responseCode = "200", description = "The ACI was found and its mapped value matched the provided ACI identity key", useReturnTypeSchema = true)
-  @ApiResponse(responseCode = "400", description = "Invalid request. See response for any available details.")
-  @ApiResponse(responseCode = "403", description = "The ACI was found but its mapped value did not match the provided ACI identity key")
-  @ApiResponse(responseCode = "404", description = "The ACI was not found in the log")
+  @ApiResponse(responseCode = "400", description = "Request was authenticated but endpoint requires unauthenticated access.")
+  @ApiResponse(responseCode = "403", description = """
+      The ACI was found but its mapped value did not match the provided ACI identity key
+      or the ACI was not found in the log.
+      """)
   @ApiResponse(responseCode = "422", description = "Invalid request format")
   @ApiResponse(responseCode = "429", description = "Rate-limited")
   @POST
@@ -101,15 +103,23 @@ public class KeyTransparencyController {
                   .build()
           ));
 
-      return new KeyTransparencySearchResponse(
-          keyTransparencyServiceClient.search(
-              ByteString.copyFrom(request.aci().toCompactByteArray()),
-              ByteString.copyFrom(request.aciIdentityKey().serialize()),
-              request.usernameHash().map(ByteString::copyFrom),
-              maybeE164SearchRequest,
-              request.lastTreeHeadSize(),
-              request.distinguishedTreeHeadSize())
-          .toByteArray());
+      final SearchResponseV2 searchResponse =  keyTransparencyServiceClient.search(
+          ByteString.copyFrom(request.aci().toCompactByteArray()),
+          ByteString.copyFrom(request.aciIdentityKey().serialize()),
+          request.usernameHash().map(ByteString::copyFrom),
+          maybeE164SearchRequest,
+          request.lastTreeHeadSize(),
+          request.distinguishedTreeHeadSize());
+
+      if (searchResponse.hasPermissionDenied()) {
+        throw new StatusRuntimeException(Status.PERMISSION_DENIED);
+      }
+
+      if (!searchResponse.hasSearchResponse()) {
+        throw new StatusRuntimeException(Status.UNAVAILABLE.withDescription("Missing search response"));
+      }
+
+      return new KeyTransparencySearchResponse(searchResponse.getSearchResponse().toByteArray());
     } catch (final StatusRuntimeException exception) {
       handleKeyTransparencyServiceError(exception);
     }
@@ -125,7 +135,7 @@ public class KeyTransparencyController {
           """
   )
   @ApiResponse(responseCode = "200", description = "All identifiers exist in the log", useReturnTypeSchema = true)
-  @ApiResponse(responseCode = "400", description = "Invalid request. See response for any available details.")
+  @ApiResponse(responseCode = "400", description = "Request was authenticated but endpoint requires unauthenticated access.")
   @ApiResponse(responseCode = "403", description = "One or more of the provided commitment indexes did not match")
   @ApiResponse(responseCode = "404", description = "At least one identifier was not found")
   @ApiResponse(responseCode = "429", description = "Rate-limited")
@@ -163,13 +173,22 @@ public class KeyTransparencyController {
               .setCommitmentIndex(ByteString.copyFrom(e164.commitmentIndex()))
               .build());
 
-      return new KeyTransparencyMonitorResponse(keyTransparencyServiceClient.monitor(
+      final MonitorResponseV2 monitorResponse = keyTransparencyServiceClient.monitor(
           aciMonitorRequest,
           usernameHashMonitorRequest,
           e164MonitorRequest,
           request.lastNonDistinguishedTreeHeadSize(),
-          request.lastDistinguishedTreeHeadSize())
-          .toByteArray());
+          request.lastDistinguishedTreeHeadSize());
+
+      if (monitorResponse.hasPermissionDenied()) {
+        throw new StatusRuntimeException(Status.PERMISSION_DENIED);
+      }
+
+      if (!monitorResponse.hasMonitorResponse()) {
+        throw new StatusRuntimeException(Status.UNAVAILABLE.withDescription("Missing monitor response"));
+      }
+
+      return new KeyTransparencyMonitorResponse(monitorResponse.getMonitorResponse().toByteArray());
     } catch (final StatusRuntimeException exception) {
       handleKeyTransparencyServiceError(exception);
     }
@@ -186,7 +205,7 @@ public class KeyTransparencyController {
           """
   )
   @ApiResponse(responseCode = "200", description = "The `distinguished` search key exists in the log", useReturnTypeSchema = true)
-  @ApiResponse(responseCode = "400", description = "Invalid request. See response for any available details.")
+  @ApiResponse(responseCode = "400", description = "Request was authenticated but endpoint requires unauthenticated access.")
   @ApiResponse(responseCode = "422", description = "Invalid request format")
   @ApiResponse(responseCode = "429", description = "Rate-limited")
   @GET

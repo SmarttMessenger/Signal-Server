@@ -42,6 +42,7 @@ public class Cdn3RemoteStorageManager implements RemoteStorageManager {
   private final String clientId;
   private final String clientSecret;
   private final Map<Integer, String> sourceSchemes;
+  private final Duration usageRequestTimeout;
 
   static final String CLIENT_ID_HEADER = "CF-Access-Client-Id";
   static final String CLIENT_SECRET_HEADER = "CF-Access-Client-Secret";
@@ -67,17 +68,15 @@ public class Cdn3RemoteStorageManager implements RemoteStorageManager {
     this.clientSecret = configuration.clientSecret().value();
 
     // Client used for calls to storage-manager
-    this.storageManagerHttpClient = FaultTolerantHttpClient.newBuilder()
-        .withName("cdn3-storage-manager")
-        .withCircuitBreaker(configuration.circuitBreaker())
-        .withExecutor(httpExecutor)
-        .withRetryExecutor(retryExecutor)
-        .withRetry(configuration.retry())
+    this.storageManagerHttpClient = FaultTolerantHttpClient.newBuilder("cdn3-storage-manager", httpExecutor)
+        .withCircuitBreaker(configuration.circuitBreakerConfigurationName())
+        .withRetry(configuration.retryConfigurationName(), retryExecutor)
         .withConnectTimeout(Duration.ofSeconds(10))
         .withVersion(HttpClient.Version.HTTP_2)
         .withNumClients(configuration.numHttpClients())
         .build();
     this.sourceSchemes = configuration.sourceSchemes();
+    this.usageRequestTimeout = configuration.usageRequestTimeout();
   }
 
   @Override
@@ -89,7 +88,7 @@ public class Cdn3RemoteStorageManager implements RemoteStorageManager {
   public CompletionStage<Void> copy(
       final int sourceCdn,
       final String sourceKey,
-      final int expectedSourceLength,
+      final long expectedSourceLength,
       final MediaEncryptionParameters encryptionParameters,
       final String destinationKey) {
     final String sourceScheme = this.sourceSchemes.get(sourceCdn);
@@ -135,10 +134,10 @@ public class Cdn3RemoteStorageManager implements RemoteStorageManager {
    */
   record Cdn3CopyRequest(
       String encryptionKey, String hmacKey,
-      SourceDescriptor source, int expectedSourceLength,
+      SourceDescriptor source, long expectedSourceLength,
       String dst) {
 
-    Cdn3CopyRequest(MediaEncryptionParameters parameters, SourceDescriptor source, int expectedSourceLength,
+    Cdn3CopyRequest(MediaEncryptionParameters parameters, SourceDescriptor source, long expectedSourceLength,
         String dst) {
       this(Base64.getEncoder().encodeToString(parameters.aesEncryptionKey().getEncoded()),
           Base64.getEncoder().encodeToString(parameters.hmacSHA256Key().getEncoded()),
@@ -234,6 +233,7 @@ public class Cdn3RemoteStorageManager implements RemoteStorageManager {
             HttpUtils.queryParamString(Map.of("prefix", prefix).entrySet()))))
         .header(CLIENT_ID_HEADER, clientId)
         .header(CLIENT_SECRET_HEADER, clientSecret)
+        .timeout(usageRequestTimeout)
         .build();
     return this.storageManagerHttpClient.sendAsync(request, HttpResponse.BodyHandlers.ofInputStream())
         .thenApply(response -> {

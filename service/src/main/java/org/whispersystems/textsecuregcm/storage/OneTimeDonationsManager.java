@@ -5,20 +5,23 @@
 
 package org.whispersystems.textsecuregcm.storage;
 
-import static com.codahale.metrics.MetricRegistry.name;
+import static org.whispersystems.textsecuregcm.metrics.MetricsUtil.name;
 
 import io.micrometer.core.instrument.Metrics;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Map;
 import java.util.Objects;
-import java.util.concurrent.CompletableFuture;
 import javax.annotation.Nonnull;
+import io.micrometer.core.instrument.Tags;
+import org.whispersystems.textsecuregcm.purchases.PaymentProvider;
 import org.whispersystems.textsecuregcm.util.AttributeValues;
-import software.amazon.awssdk.services.dynamodb.DynamoDbAsyncClient;
+import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
 import software.amazon.awssdk.services.dynamodb.model.GetItemRequest;
+import software.amazon.awssdk.services.dynamodb.model.GetItemResponse;
 import software.amazon.awssdk.services.dynamodb.model.PutItemRequest;
 
+/// Tracks when a payment intent actually becomes paid. May be updated externally by a webhook from the payment provider.
 public class OneTimeDonationsManager {
   public static final String KEY_PAYMENT_ID = "P"; // S
   public static final String ATTR_PAID_AT = "A"; // N
@@ -27,18 +30,18 @@ public class OneTimeDonationsManager {
   private static final String ONETIME_DONATION_NOT_FOUND_COUNTER_NAME = name(OneTimeDonationsManager.class, "onetimeDonationNotFound");
   private final String table;
   private final Duration ttl;
-  private final DynamoDbAsyncClient dynamoDbAsyncClient;
+  private final DynamoDbClient dynamoDbClient;
 
   public OneTimeDonationsManager(
-      @Nonnull String table,
-      @Nonnull Duration ttl,
-      @Nonnull DynamoDbAsyncClient dynamoDbAsyncClient) {
+      @Nonnull final String table,
+      @Nonnull final Duration ttl,
+      @Nonnull final DynamoDbClient dynamoDbClient) {
     this.table = Objects.requireNonNull(table);
     this.ttl = Objects.requireNonNull(ttl);
-    this.dynamoDbAsyncClient = Objects.requireNonNull(dynamoDbAsyncClient);
+    this.dynamoDbClient = Objects.requireNonNull(dynamoDbClient);
   }
 
-  public CompletableFuture<Instant> getPaidAt(final String paymentId, final Instant fallbackTimestamp) {
+  public Instant getPaidAt(final PaymentProvider paymentProvider, final String paymentId, final Instant fallbackTimestamp) {
     final GetItemRequest getItemRequest = GetItemRequest.builder()
         .consistentRead(Boolean.TRUE)
         .tableName(table)
@@ -46,24 +49,24 @@ public class OneTimeDonationsManager {
         .projectionExpression(ATTR_PAID_AT)
         .build();
 
-    return dynamoDbAsyncClient.getItem(getItemRequest).thenApply(getItemResponse -> {
-      if (!getItemResponse.hasItem()) {
-        Metrics.counter(ONETIME_DONATION_NOT_FOUND_COUNTER_NAME).increment();
-        return fallbackTimestamp;
-      }
+    final GetItemResponse getItemResponse = dynamoDbClient.getItem(getItemRequest);
+    if (!getItemResponse.hasItem()) {
+      // This can happen if the upstream call races the asynchronous webhook that notifies of payment success,
+      // and usually the `paidAt` will be within a few seconds of the fallback
+      Metrics.counter(ONETIME_DONATION_NOT_FOUND_COUNTER_NAME, Tags.of("processor", paymentProvider.name())).increment();
+      return fallbackTimestamp;
+    }
 
-      return Instant.ofEpochSecond(AttributeValues.getLong(getItemResponse.item(), ATTR_PAID_AT, fallbackTimestamp.getEpochSecond()));
-    });
+    return Instant.ofEpochSecond(AttributeValues.getLong(getItemResponse.item(), ATTR_PAID_AT, fallbackTimestamp.getEpochSecond()));
   }
 
-  public CompletableFuture<String> putPaidAt(final String paymentId, final Instant paidAt) {
-    return dynamoDbAsyncClient.putItem(PutItemRequest.builder()
+  public void putPaidAt(final String paymentId, final Instant paidAt) {
+    dynamoDbClient.putItem(PutItemRequest.builder()
             .tableName(table)
             .item(Map.of(
                 KEY_PAYMENT_ID, AttributeValues.fromString(paymentId),
                 ATTR_PAID_AT, AttributeValues.fromLong(paidAt.getEpochSecond()),
                 ATTR_TTL, AttributeValues.fromLong(paidAt.plus(ttl).getEpochSecond())))
-            .build())
-        .thenApply(unused -> paymentId);
+            .build());
   }
 }

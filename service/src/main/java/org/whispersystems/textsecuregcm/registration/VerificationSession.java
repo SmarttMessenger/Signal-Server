@@ -7,10 +7,10 @@ package org.whispersystems.textsecuregcm.registration;
 
 import com.fasterxml.jackson.annotation.JsonProperty;
 import java.time.Instant;
-import java.util.ArrayList;
 import java.util.List;
 import javax.annotation.Nullable;
 import org.whispersystems.textsecuregcm.storage.SerializedExpireableJsonDynamoStore;
+import org.whispersystems.textsecuregcm.telephony.CarrierData;
 
 /**
  * Server-internal stored session object. Primarily used by
@@ -18,7 +18,9 @@ import org.whispersystems.textsecuregcm.storage.SerializedExpireableJsonDynamoSt
  * requesting codes from Registration Service, in order to get a verified session to be provided to
  * {@link org.whispersystems.textsecuregcm.controllers.RegistrationController}.
  *
+ * @param sessionId               the session ID returned by Registration Service
  * @param pushChallenge           the value of a push challenge sent to a client, after it submitted a push token
+ * @param carrierData             information about the phone number's carrier if available
  * @param requestedInformation    information requested that a client send to the server
  * @param submittedInformation    information that a client has submitted and that the server has verified
  * @param smsSenderOverride       if present, indicates a sender override argument that should be forwarded to the
@@ -35,7 +37,9 @@ import org.whispersystems.textsecuregcm.storage.SerializedExpireableJsonDynamoSt
  * @see org.whispersystems.textsecuregcm.entities.VerificationSessionResponse
  */
 public record VerificationSession(
+    String sessionId,
     @Nullable String pushChallenge,
+    @Nullable CarrierData carrierData,
     List<Information> requestedInformation,
     List<Information> submittedInformation,
     @Nullable String smsSenderOverride,

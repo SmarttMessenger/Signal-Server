@@ -36,7 +36,8 @@ public class SmarttHeldMessageDeliverySchedulerFactory implements JobSchedulerFa
 
     final MessageSender messageSender = new MessageSender(
         deps.messagesManager(),
-        deps.pushNotificationManager());
+        deps.pushNotificationManager(),
+        deps.dynamicConfigurationManager());
 
     // The resolved table names are worth a line: config.yml carries no `smarttCommunicationWindow`
     // block, so these come from defaults, and a wrong table looks exactly like "the worker runs but

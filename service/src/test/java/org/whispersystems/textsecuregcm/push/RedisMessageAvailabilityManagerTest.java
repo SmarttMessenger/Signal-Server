@@ -5,7 +5,10 @@
 
 package org.whispersystems.textsecuregcm.push;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
@@ -13,16 +16,20 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import io.lettuce.core.RedisException;
 import io.lettuce.core.cluster.SlotHash;
+import io.lettuce.core.cluster.api.async.RedisAdvancedClusterAsyncCommands;
 import io.lettuce.core.cluster.event.ClusterTopologyChangedEvent;
 import io.lettuce.core.cluster.models.partitions.RedisClusterNode;
 import io.lettuce.core.cluster.pubsub.api.async.RedisClusterPubSubAsyncCommands;
 import io.lettuce.core.cluster.pubsub.api.sync.RedisClusterPubSubCommands;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.IntStream;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
@@ -62,7 +69,7 @@ class RedisMessageAvailabilityManagerTest {
     }
 
     @Override
-    public void handleConflictingMessageReader() {
+    public void handleConflictingMessageConsumer() {
     }
   }
 
@@ -108,15 +115,19 @@ class RedisMessageAvailabilityManagerTest {
 
     final AtomicBoolean secondListenerDisplaced = new AtomicBoolean(false);
 
-    localEventManager.handleClientConnected(accountIdentifier, deviceId, new MessageAvailabilityAdapter() {
+    final AtomicReference<MessageAvailabilityAdapter> firstListener = new AtomicReference<>();
+    firstListener.set(new MessageAvailabilityAdapter() {
       @Override
-      public void handleConflictingMessageReader() {
+      public void handleConflictingMessageConsumer() {
         synchronized (firstListenerDisplaced) {
+          localEventManager.handleClientDisconnected(accountIdentifier, deviceId, firstListener.get());
           firstListenerDisplaced.set(true);
           firstListenerDisplaced.notifyAll();
         }
       }
-    }).toCompletableFuture().join();
+    });
+
+    localEventManager.handleClientConnected(accountIdentifier, deviceId, firstListener.get()).toCompletableFuture().join();
 
     assertFalse(firstListenerDisplaced.get());
     assertFalse(secondListenerDisplaced.get());
@@ -126,7 +137,7 @@ class RedisMessageAvailabilityManagerTest {
 
     displacingManager.handleClientConnected(accountIdentifier, deviceId, new MessageAvailabilityAdapter() {
       @Override
-      public void handleConflictingMessageReader() {
+      public void handleConflictingMessageConsumer() {
         secondListenerDisplaced.set(true);
       }
     }).toCompletableFuture().join();
@@ -139,6 +150,7 @@ class RedisMessageAvailabilityManagerTest {
 
     assertTrue(firstListenerDisplaced.get());
     assertFalse(secondListenerDisplaced.get());
+    assertTrue(displacingManager.isLocallyPresent(accountIdentifier, deviceId));
   }
 
   @Test
@@ -149,14 +161,15 @@ class RedisMessageAvailabilityManagerTest {
     assertFalse(localEventManager.isLocallyPresent(accountIdentifier, deviceId));
     assertFalse(remoteEventManager.isLocallyPresent(accountIdentifier, deviceId));
 
-    localEventManager.handleClientConnected(accountIdentifier, deviceId, new MessageAvailabilityAdapter())
+    final MessageAvailabilityAdapter localListener = new MessageAvailabilityAdapter();
+    localEventManager.handleClientConnected(accountIdentifier, deviceId, localListener)
         .toCompletableFuture()
         .join();
 
     assertTrue(localEventManager.isLocallyPresent(accountIdentifier, deviceId));
     assertFalse(remoteEventManager.isLocallyPresent(accountIdentifier, deviceId));
 
-    localEventManager.handleClientDisconnected(accountIdentifier, deviceId)
+    localEventManager.handleClientDisconnected(accountIdentifier, deviceId, localListener)
         .toCompletableFuture()
         .join();
 
@@ -177,6 +190,7 @@ class RedisMessageAvailabilityManagerTest {
     final FaultTolerantRedisClusterClient clusterClient = RedisClusterHelper.builder()
         .binaryPubSubCommands(pubSubCommands)
         .binaryPubSubAsyncCommands(pubSubAsyncCommands)
+        .binaryAsyncCommands(buildBinaryAsyncCommands())
         .build();
 
     final RedisMessageAvailabilityManager eventManager = new RedisMessageAvailabilityManager(
@@ -243,6 +257,7 @@ class RedisMessageAvailabilityManagerTest {
 
     final FaultTolerantRedisClusterClient clusterClient = RedisClusterHelper.builder()
         .binaryPubSubAsyncCommands(pubSubAsyncCommands)
+        .binaryAsyncCommands(buildBinaryAsyncCommands())
         .build();
 
     final RedisMessageAvailabilityManager eventManager = new RedisMessageAvailabilityManager(
@@ -273,5 +288,83 @@ class RedisMessageAvailabilityManagerTest {
 
     verify(pubSubAsyncCommands)
         .sunsubscribe(RedisMessageAvailabilityManager.getClientEventChannel(noListenerAccountIdentifier, noListenerDeviceId));
+  }
+
+  @Test
+  void handleClientConnectedSubscribeFailure() {
+    @SuppressWarnings("unchecked") final RedisClusterPubSubAsyncCommands<byte[], byte[]> pubSubAsyncCommands =
+        mock(RedisClusterPubSubAsyncCommands.class);
+
+    final RedisException exception = new RedisException("Currently not connected. Commands are rejected.");
+    when(pubSubAsyncCommands.ssubscribe(any()))
+        .thenReturn(MockRedisFuture.failedFuture(exception));
+
+    final RedisAdvancedClusterAsyncCommands<byte[], byte[]> binaryAsyncCommands = buildBinaryAsyncCommands();
+
+    final FaultTolerantRedisClusterClient clusterClient = RedisClusterHelper.builder()
+        .binaryPubSubAsyncCommands(pubSubAsyncCommands)
+        .binaryAsyncCommands(binaryAsyncCommands)
+        .build();
+
+    final RedisMessageAvailabilityManager eventManager = new RedisMessageAvailabilityManager(
+        clusterClient,
+        Runnable::run,
+        Runnable::run);
+
+    eventManager.start();
+
+    final CompletionException completionException = assertThrows(CompletionException.class, () ->
+        eventManager.handleClientConnected(UUID.randomUUID(), Device.PRIMARY_ID, new MessageAvailabilityAdapter())
+            .toCompletableFuture()
+            .join());
+
+    assertEquals(exception, completionException.getCause());
+
+    // We shouldn't announce a client connection if we couldn't subscribe to events for that client
+    verify(binaryAsyncCommands, never()).spublish(any(), any());
+  }
+
+  @Test
+  void handleClientConnectedPublishFailure() {
+    @SuppressWarnings("unchecked") final RedisClusterPubSubAsyncCommands<byte[], byte[]> pubSubAsyncCommands =
+        mock(RedisClusterPubSubAsyncCommands.class);
+
+    when(pubSubAsyncCommands.ssubscribe(any())).thenReturn(MockRedisFuture.completedFuture(null));
+
+    @SuppressWarnings("unchecked") final RedisAdvancedClusterAsyncCommands<byte[], byte[]> binaryAsyncCommands =
+        mock(RedisAdvancedClusterAsyncCommands.class);
+
+    when(binaryAsyncCommands.spublish(any(), any()))
+        .thenReturn(MockRedisFuture.failedFuture(new RedisException("Currently not connected. Commands are rejected.")));
+
+    final FaultTolerantRedisClusterClient clusterClient = RedisClusterHelper.builder()
+        .binaryPubSubAsyncCommands(pubSubAsyncCommands)
+        .binaryAsyncCommands(binaryAsyncCommands)
+        .build();
+
+    final RedisMessageAvailabilityManager eventManager = new RedisMessageAvailabilityManager(
+        clusterClient,
+        Runnable::run,
+        Runnable::run);
+
+    eventManager.start();
+
+    final UUID accountIdentifier = UUID.randomUUID();
+    final byte deviceId = Device.PRIMARY_ID;
+
+    assertDoesNotThrow(() -> eventManager.handleClientConnected(accountIdentifier, deviceId, new MessageAvailabilityAdapter())
+        .toCompletableFuture()
+        .join());
+
+    assertTrue(eventManager.isLocallyPresent(accountIdentifier, deviceId));
+  }
+
+  private static RedisAdvancedClusterAsyncCommands<byte[], byte[]> buildBinaryAsyncCommands() {
+    @SuppressWarnings("unchecked") final RedisAdvancedClusterAsyncCommands<byte[], byte[]> binaryAsyncCommands =
+        mock(RedisAdvancedClusterAsyncCommands.class);
+
+    when(binaryAsyncCommands.spublish(any(), any())).thenReturn(MockRedisFuture.completedFuture(0L));
+
+    return binaryAsyncCommands;
   }
 }

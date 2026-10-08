@@ -15,7 +15,6 @@ import jakarta.ws.rs.core.HttpHeaders;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import org.apache.commons.lang3.RandomStringUtils;
-import org.eclipse.jetty.websocket.server.config.JettyWebSocketServletContainerInitializer;
 import org.glassfish.jersey.server.ManagedAsync;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -34,8 +33,7 @@ public class BufferingInterceptorIntegrationTest {
       final TestController testController = new TestController();
       environment.jersey().register(testController);
       environment.jersey().register(new BufferingInterceptor());
-      environment.jersey().register(new VirtualExecutorServiceProvider("virtual-thread-"));
-      JettyWebSocketServletContainerInitializer.configure(environment.getApplicationContext(), null);
+      environment.jersey().register(new VirtualExecutorServiceProvider("virtual-thread-", 10));
     }
   }
 

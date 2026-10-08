@@ -7,29 +7,25 @@ package org.whispersystems.textsecuregcm.configuration;
 
 import com.fasterxml.jackson.annotation.JsonProperty;
 import jakarta.validation.constraints.NotEmpty;
-import org.whispersystems.textsecuregcm.subscriptions.PaymentProvider;
-import org.whispersystems.textsecuregcm.util.EnumMapUtil;
-import java.time.Duration;
 import java.util.EnumMap;
 import java.util.Map;
+import org.whispersystems.textsecuregcm.purchases.PaymentProvider;
+import org.whispersystems.textsecuregcm.util.EnumMapUtil;
 
-public class IssuedReceiptsTableConfiguration extends DynamoDbTables.TableWithExpiration {
+public class IssuedReceiptsTableConfiguration extends DynamoDbTables.Table {
 
   private final byte[] generator;
 
-  /**
-   * The maximum number of issued receipts the issued receipt manager should issue for a particular itemId
-   */
-  private final EnumMap<PaymentProvider, Integer> maxIssuedReceiptsPerPaymentId;
+  /// The maximum number of receipts that may be issued for a single subscription payment.
+  private final EnumMap<PaymentProvider, Integer> maxReceiptsPerSubscriptionPayment;
 
   public IssuedReceiptsTableConfiguration(
       @JsonProperty("tableName") final String tableName,
-      @JsonProperty("expiration") final Duration expiration,
       @JsonProperty("generator") final byte[] generator,
-      @JsonProperty("maxIssuedReceiptsPerPaymentId") final Map<PaymentProvider, Integer> maxIssuedReceiptsPerPaymentId) {
-    super(tableName, expiration);
+      @JsonProperty("maxReceiptsPerSubscriptionPayment") final Map<PaymentProvider, Integer> maxReceiptsPerSubscriptionPayment) {
+    super(tableName);
     this.generator = generator;
-    this.maxIssuedReceiptsPerPaymentId = EnumMapUtil.toCompleteEnumMap(PaymentProvider.class, maxIssuedReceiptsPerPaymentId);
+    this.maxReceiptsPerSubscriptionPayment = EnumMapUtil.toCompleteEnumMap(PaymentProvider.class, maxReceiptsPerSubscriptionPayment);
   }
 
   @NotEmpty
@@ -37,7 +33,7 @@ public class IssuedReceiptsTableConfiguration extends DynamoDbTables.TableWithEx
     return generator;
   }
 
-  public EnumMap<PaymentProvider, Integer> getmaxIssuedReceiptsPerPaymentId() {
-    return maxIssuedReceiptsPerPaymentId;
+  public EnumMap<PaymentProvider, Integer> getMaxReceiptsPerSubscriptionPayment() {
+    return maxReceiptsPerSubscriptionPayment;
   }
 }
